@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 const FACTORIALS: [u64; 21] = [
     1,
     1,
@@ -22,8 +24,124 @@ const FACTORIALS: [u64; 21] = [
     2432902008176640000,
 ];
 
+/// Generates the truncated Baker-Campbell-Hausdorff series of a Lyndon basis
+/// with the given truncation depth `n` and alphabet size `2`.
+fn generate_bch_series_2(n: usize) -> Vec<f64> {
+    let mut t_n = generate_lyndon_basis(n, 2);
+    let m_n = t_n.len();
+    let mut s = Vec::with_capacity(m_n);
+    let bernoulli = bernoulli_sequence(n);
+    let mut prime = Vec::with_capacity(m_n);
+    let mut dprime = Vec::with_capacity(m_n);
+    let mut degree = Vec::with_capacity(m_n);
+    let mut word_t_n_map = HashMap::<Vec<usize>, usize>::new();
+    for (i, word) in t_n.iter().enumerate() {
+        word_t_n_map.insert(word.to_vec(), i);
+    }
+    let mut i = 0;
+    while i < t_n.len() {
+        let word = &t_n[i].clone();
+        degree.push(word.len());
+        let mut s_ui = Vec::new();
+        if word.len() == 1 {
+            s.push(s_ui);
+            i += 1;
+            continue;
+        }
+        let (v, w) = standard_factorization(word);
+        if !word_t_n_map.contains_key(v) {
+            t_n.push(v.to_vec());
+            word_t_n_map.insert(v.to_vec(), t_n.len() - 1);
+        }
+        if !word_t_n_map.contains_key(w) {
+            t_n.push(w.to_vec());
+            word_t_n_map.insert(w.to_vec(), t_n.len() - 1);
+        }
+        prime.push(word_t_n_map[v]);
+        dprime.push(word_t_n_map[w]);
+
+        s_ui.push((word_t_n_map[w], word_t_n_map[v]));
+        for p in 1..v.len() {
+            let v_root = &v[..p];
+            let v_comp_w = [(&v[p..]).to_vec(), w.to_vec()].concat();
+            if !word_t_n_map.contains_key(v_root) {
+                t_n.push(v_root.to_vec());
+                word_t_n_map.insert(v_root.to_vec(), t_n.len() - 1);
+            }
+            if !word_t_n_map.contains_key(&v_comp_w) {
+                t_n.push(v_comp_w.clone());
+                word_t_n_map.insert(v_comp_w.clone(), t_n.len() - 1);
+            }
+            s_ui.push((word_t_n_map[v_root], word_t_n_map[&v_comp_w]));
+        }
+        for q in 1..w.len() {
+            let w_root = &w[..q];
+            let w_comp_v = [(&w[q..]).to_vec(), v.to_vec()].concat();
+            if !word_t_n_map.contains_key(w_root) {
+                t_n.push(w_root.to_vec());
+                word_t_n_map.insert(w_root.to_vec(), t_n.len() - 1);
+            }
+            if !word_t_n_map.contains_key(&w_comp_v) {
+                t_n.push(w_comp_v.clone());
+                word_t_n_map.insert(w_comp_v.clone(), t_n.len() - 1);
+            }
+            s_ui.push((word_t_n_map[w_root], word_t_n_map[&w_comp_v]));
+        }
+        s.push(s_ui);
+        i += 1;
+    }
+    let tm_n = t_n.len();
+    let mut z_ui = Vec::<f64>::with_capacity(tm_n);
+    let mut x_minus_y = vec![0.; tm_n];
+    x_minus_y[0] = 1.;
+    x_minus_y[1] = -1.;
+    let x_minus_y = x_minus_y;
+    let mut x_plus_y = vec![0.; tm_n];
+    x_plus_y[0] = 1.;
+    x_plus_y[1] = 1.;
+    let x_plus_y = x_plus_y;
+    for i in 0..m_n {
+        if i == 0 || i == 1 {
+            z_ui.push(1.);
+            continue;
+        }
+        // 1/2 [X-Y, Z] (u_i)
+        let s_ui = &s[i];
+        let left_term = 0.5 * lie_bracket(&x_minus_y, &z_ui, s_ui);
+
+        // Bernoulli term
+        let mut bernoulli_term = 0.0;
+        let mut beta = x_plus_y.clone();
+        for p in 1..(n / 2) {
+            let bernoulli_coef = bernoulli[2 * p] / FACTORIALS[2 * p] as f64;
+            for _ in 2..2 * p {
+                let mut beta_new = vec![0.; tm_n];
+                for x in 0..tm_n {
+                    let s_ux = &s[x];
+                    beta_new[x] = lie_bracket(&z_ui, &beta, &s_ux);
+                }
+                beta = beta_new;
+            }
+            todo!();
+        }
+    }
+
+    todo!()
+}
+
+/// Computes the Lie bracket [alpha, beta] (u_i)
+fn lie_bracket(alpha: &[f64], beta: &[f64], s_ui: &[(usize, usize)]) -> f64 {
+    let mut sum = 0.0;
+    for &(j, k) in s_ui.iter() {
+        sum += alpha[j] * beta[k] - alpha[k] * beta[j];
+    }
+
+    sum
+}
+
 /// Implements the Fredricksen-Kessler-Maiorana algorithm to generate
 /// Lyndon words.
+/// `n` is the maximum word length, and `k` is the alphabet size.
 fn generate_lyndon_basis(n: usize, k: usize) -> Vec<Vec<usize>> {
     let mut basis = Vec::new();
     if k == 0 {
@@ -242,5 +360,10 @@ mod test {
                 0.0757575757575662,
             ]
         );
+    }
+
+    #[test]
+    fn test_bch_series() {
+        let series = generate_bch_series_2(5);
     }
 }
