@@ -26,8 +26,8 @@ const FACTORIALS: [u64; 21] = [
 
 /// Generates the truncated Baker-Campbell-Hausdorff series of a Lyndon basis
 /// with the given truncation depth `n` and alphabet size `2`.
-fn generate_bch_series_2(n: usize) -> Vec<f64> {
-    let mut t_n = generate_lyndon_basis(n, 2);
+pub fn generate_bch_series_2(n: usize) -> Vec<f64> {
+    let mut t_n = generate_lyndon_basis(2, n);
     let m_n = t_n.len();
     let mut s = Vec::with_capacity(m_n);
     let bernoulli = bernoulli_sequence(n);
@@ -48,7 +48,7 @@ fn generate_bch_series_2(n: usize) -> Vec<f64> {
             i += 1;
             continue;
         }
-        let (v, w) = standard_factorization(word);
+        let (w, v) = standard_factorization(word);
         if !word_t_n_map.contains_key(v) {
             t_n.push(v.to_vec());
             word_t_n_map.insert(v.to_vec(), t_n.len() - 1);
@@ -76,7 +76,7 @@ fn generate_bch_series_2(n: usize) -> Vec<f64> {
         }
         for q in 1..w.len() {
             let w_root = &w[..q];
-            let w_comp_v = [(&w[q..]).to_vec(), v.to_vec()].concat();
+            let w_comp_v = [v.to_vec(), (&w[q..]).to_vec()].concat();
             if !word_t_n_map.contains_key(w_root) {
                 t_n.push(w_root.to_vec());
                 word_t_n_map.insert(w_root.to_vec(), t_n.len() - 1);
@@ -91,7 +91,7 @@ fn generate_bch_series_2(n: usize) -> Vec<f64> {
         i += 1;
     }
     let tm_n = t_n.len();
-    let mut z_ui = Vec::<f64>::with_capacity(tm_n);
+    let mut z_ui = vec![0.; tm_n];
     let mut x_minus_y = vec![0.; tm_n];
     x_minus_y[0] = 1.;
     x_minus_y[1] = -1.;
@@ -102,11 +102,13 @@ fn generate_bch_series_2(n: usize) -> Vec<f64> {
     let x_plus_y = x_plus_y;
     for i in 0..m_n {
         if i == 0 || i == 1 {
-            z_ui.push(1.);
+            z_ui[i] = 1.;
             continue;
         }
         // 1/2 [X-Y, Z] (u_i)
         let s_ui = &s[i];
+        dbg!(i);
+        dbg!(&s_ui);
         let left_term = 0.5 * lie_bracket(&x_minus_y, &z_ui, s_ui);
 
         // Bernoulli term
@@ -114,7 +116,7 @@ fn generate_bch_series_2(n: usize) -> Vec<f64> {
         let mut beta = x_plus_y.clone();
         for p in 1..(n / 2) {
             let bernoulli_coef = bernoulli[2 * p] / FACTORIALS[2 * p] as f64;
-            for _ in 2..2 * p {
+            for _ in 1..2 * p {
                 let mut beta_new = vec![0.; tm_n];
                 for x in 0..tm_n {
                     let s_ux = &s[x];
@@ -122,9 +124,11 @@ fn generate_bch_series_2(n: usize) -> Vec<f64> {
                 }
                 beta = beta_new;
             }
-            todo!();
+            bernoulli_term += bernoulli_coef * lie_bracket(&z_ui, &beta, &s_ui);
         }
+        z_ui[i] = (left_term + bernoulli_term) / degree[i] as f64;
     }
+    dbg!(&z_ui);
 
     todo!()
 }
@@ -141,55 +145,41 @@ fn lie_bracket(alpha: &[f64], beta: &[f64], s_ui: &[(usize, usize)]) -> f64 {
 
 /// Implements the Fredricksen-Kessler-Maiorana algorithm to generate
 /// Lyndon words.
-/// `n` is the maximum word length, and `k` is the alphabet size.
+/// `n` is the alphabet size, and `k` is the maximum word length.
 fn generate_lyndon_basis(n: usize, k: usize) -> Vec<Vec<usize>> {
     let mut basis = Vec::new();
     if k == 0 {
         return basis;
     }
-    let mut w = vec![0];
+    let mut w = vec![];
 
-    while !w.is_empty() {
-        *w.last_mut().unwrap() += 1;
-        let m = w.len();
-        if m <= n && w.iter().all(|&x| x >= 1) {
+    loop {
+        if w.is_empty() {
+            w = vec![0];
+        } else {
+            *w.last_mut().unwrap() += 1;
+        }
+
+        if !w.is_empty() && w.len() <= k && *w.last().unwrap() < n {
             basis.push(w.clone());
-        }
 
-        while w.len() < k {
-            w.push(w[w.len() % m]);
-        }
-
-        while !w.is_empty() && *w.last().unwrap() == n {
-            w.pop();
-        }
-    }
-    basis.sort_by_key(|word| (word.len(), word.clone()));
-    basis
-}
-
-fn bch_series(max_n: usize) -> Vec<f64> {
-    let mut series = vec![1., 1.];
-    let mut degree = vec![1, 1];
-    let mut prime = vec![1, 1];
-    let mut dprime = vec![0, 0];
-
-    let mut i = 3;
-    for n in 2..=max_n {
-        for j in 1..i {
-            for k in j + 1..i {
-                if degree[j - 1] + degree[k - 1] != n || j < dprime[k - 1] {
-                    continue;
-                }
-                dprime.push(j);
-                prime.push(k);
-                degree.push(n);
-                i += 1;
+            let m = w.len();
+            while w.len() < k {
+                w.push(w[w.len() % m]);
             }
         }
+
+        while !w.is_empty() && *w.last().unwrap() >= n {
+            w.pop();
+        }
+
+        if w.is_empty() {
+            break;
+        }
     }
-    series.truncate(max_n);
-    series
+
+    basis.sort_by_key(|word| (word.len(), word.clone()));
+    basis
 }
 
 fn binomial(n: usize, k: usize) -> f64 {
@@ -288,7 +278,6 @@ fn is_lyndon(word: &[usize]) -> bool {
 fn standard_factorization(word: &[usize]) -> (&[usize], &[usize]) {
     let n = word.len();
     assert!(n > 1, "Word length must be greater than 1.");
-    assert!(is_lyndon(&word));
 
     for split in 1..n {
         if is_lyndon(&word[split..]) {
