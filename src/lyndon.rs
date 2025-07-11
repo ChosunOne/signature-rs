@@ -7,6 +7,8 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(feature = "progress")]
+use pbr::ProgressBar;
 use thiserror::Error;
 
 pub trait Generator:
@@ -188,7 +190,17 @@ pub struct LyndonBasis<const N: usize, T: Generator> {
 }
 
 impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
-    pub fn generate_basis(k: usize) -> Vec<LyndonWord<N, T>> {
+    pub fn generate_basis(max_length: usize) -> Vec<LyndonWord<N, T>> {
+        let total_words: usize = Self::number_of_words_per_degree(max_length).iter().sum();
+
+        #[cfg(feature = "progress")]
+        let mut pb = ProgressBar::new(total_words as u64);
+        #[cfg(feature = "progress")]
+        {
+            pb.message("Generating Lyndon Basis ");
+            pb.tick();
+        }
+
         let alphabet = T::alphabet::<N>();
         let letter_index: HashMap<_, _> = alphabet
             .iter()
@@ -196,8 +208,8 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
             .enumerate()
             .map(|(i, v)| (v, i))
             .collect();
-        let mut unsorted_basis = Vec::new();
-        if k == 0 {
+        let mut unsorted_basis = Vec::with_capacity(total_words);
+        if max_length == 0 {
             return unsorted_basis;
         }
         let mut w = vec![];
@@ -209,12 +221,15 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                 *w.last_mut().unwrap() = alphabet[letter_index[w.last().unwrap()] + 1];
             }
 
-            if !w.is_empty() && w.len() <= k && *w.last().unwrap() <= alphabet[N - 1] {
+            if !w.is_empty() && w.len() <= max_length && *w.last().unwrap() <= alphabet[N - 1] {
                 unsorted_basis
                     .push(LyndonWord::try_from(w.clone()).expect("To make a lyndon word"));
 
+                #[cfg(feature = "progress")]
+                pb.inc();
+
                 let m = w.len();
-                while w.len() < k as usize {
+                while w.len() < max_length as usize {
                     w.push(w[w.len() % m]);
                 }
             }
@@ -231,7 +246,17 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
         let mut basis = Vec::with_capacity(unsorted_basis.len());
         let mut sorted_basis_index = HashMap::new();
 
-        for level in 1..=k {
+        #[cfg(feature = "progress")]
+        pb.finish();
+        #[cfg(feature = "progress")]
+        let mut pb = ProgressBar::new(max_length as u64);
+        #[cfg(feature = "progress")]
+        {
+            pb.message("Performing Topological Sort ");
+            pb.tick();
+        }
+
+        for level in 1..=max_length {
             let mut unsorted_words_by_level = unsorted_basis
                 .iter()
                 .filter(|word| word.len() == level)
@@ -244,6 +269,9 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                     sorted_basis_index.insert(word.clone(), basis.len());
                     basis.push(word.clone());
                 }
+                #[cfg(feature = "progress")]
+                pb.inc();
+
                 continue;
             }
 
@@ -256,10 +284,51 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                 sorted_basis_index.insert(word.clone(), basis.len());
                 basis.push(word.clone());
             }
+            #[cfg(feature = "progress")]
+            pb.inc();
         }
+        #[cfg(feature = "progress")]
+        pb.finish();
 
         basis
     }
+
+    pub fn number_of_words_per_degree(max_degree: usize) -> Vec<usize> {
+        let mu = moebius_mu(max_degree);
+        let mut words_per_degree = vec![0; max_degree];
+        for n in 1..=max_degree {
+            let mut d = 1_i64;
+            let mut h = 0_i64;
+            while d * d < n as i64 {
+                let quot = n as i64 / d;
+                let rem = n as i64 % d;
+                if rem == 0 {
+                    h += mu[(d - 1) as usize] * (N as i64).pow(quot as u32)
+                        + mu[(quot - 1) as usize] * (N as i64).pow(d as u32);
+                }
+                d += 1;
+            }
+            if d * d == n as i64 {
+                h += mu[(d - 1) as usize] * (N as i64).pow(d as u32);
+            }
+            words_per_degree[n - 1] = h as usize / n;
+        }
+
+        words_per_degree
+    }
+}
+
+pub fn moebius_mu(max_degree: usize) -> Vec<i64> {
+    let mut mu = vec![0; max_degree];
+    mu[0] = 1;
+    for n in 1..=max_degree / 2 {
+        let mu_n = mu[n - 1];
+        for i in (2 * n - 1..max_degree).step_by(n) {
+            mu[i] -= mu_n;
+        }
+    }
+
+    mu
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -428,7 +497,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn it_makes_a_lyndon_word() -> Result<(), LyndonWordError> {
+    fn test_make_a_lyndon_word() -> Result<(), LyndonWordError> {
         let letters = "XXY";
         let word = letters.parse::<LyndonWord<2, char>>()?;
         assert_eq!(&format!("{word}"), "XXY");
@@ -436,7 +505,7 @@ mod test {
     }
 
     #[test]
-    fn it_factorizes_a_lyndon_word() -> Result<(), LyndonWordError> {
+    fn test_factorize_a_lyndon_word() -> Result<(), LyndonWordError> {
         let letters = "XXXXXY";
         let word = letters.parse::<LyndonWord<2, char>>()?;
         let (v, w) = word.factorize();
@@ -446,7 +515,7 @@ mod test {
     }
 
     #[test]
-    fn it_grafts_two_lyndon_words() -> Result<(), LyndonWordError> {
+    fn test_graft_two_lyndon_words() -> Result<(), LyndonWordError> {
         let letters = "XXY";
         let a = letters.parse::<LyndonWord<2, char>>()?;
         let letters = "XY";
@@ -457,7 +526,7 @@ mod test {
     }
 
     #[test]
-    fn it_generates_a_lyndon_basis_1() {
+    fn test_generate_a_lyndon_basis_1() {
         let basis = LyndonBasis::<5, u8>::generate_basis(5);
         assert_eq!(basis.len(), 829);
         for word in &basis {
@@ -466,7 +535,7 @@ mod test {
     }
 
     #[test]
-    fn it_generates_a_lyndon_basis_2() -> Result<(), LyndonWordError> {
+    fn test_generate_a_lyndon_basis_2() -> Result<(), LyndonWordError> {
         let basis = LyndonBasis::<2, u8>::generate_basis(5);
         let expected_basis = vec![
             LyndonWord::try_from(vec![0])?,
@@ -497,7 +566,7 @@ mod test {
     #[case("XYYY", vec![3, 1])]
     #[case("XYXYY", vec![2, 1, 1, 1])]
     #[case("XXYXY", vec![2, 1, 1, 1])]
-    fn it_generates_goldberg_partitions(
+    fn test_generate_goldberg_partitions(
         #[case] word: &str,
         #[case] expected_partition: Vec<usize>,
     ) -> Result<(), LyndonWordError> {
@@ -512,7 +581,7 @@ mod test {
     #[case("XXXY", vec!["XXXY", "XXY", "XY", "Y"])]
     #[case("XXYXY", vec![])]
     #[case("XYXYY", vec![])]
-    fn it_generates_right_factors(
+    fn test_generate_right_factors(
         #[case] word: &str,
         #[case] expected_factors: Vec<&str>,
     ) -> Result<(), LyndonWordError> {
@@ -529,5 +598,40 @@ mod test {
             assert_eq!(factor, expected_factor);
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_moebius_function() {
+        let mu = moebius_mu(50);
+        let expected_mu = vec![
+            1, -1, -1, 0, -1, 1, -1, 0, 0, 1, // 10
+            -1, 0, -1, 1, 1, 0, -1, 0, -1, 0, // 20
+            1, 1, -1, 0, 0, 1, 0, 0, -1, -1, // 30
+            -1, 0, 1, 1, 1, 0, -1, 1, 1, 0, // 40
+            -1, -1, -1, 0, 0, 1, -1, 0, 0, 0, // 50
+        ];
+        assert_eq!(mu.len(), expected_mu.len());
+        for (i, (term, expected_term)) in mu.iter().zip(expected_mu.iter()).enumerate() {
+            dbg!(i);
+            assert_eq!(term, expected_term);
+        }
+    }
+
+    #[test]
+    fn test_number_of_lyndon_words_per_degree() {
+        let num_words_per_degree = LyndonBasis::<2, char>::number_of_words_per_degree(5);
+        let expected_num_words_per_degree = vec![2, 1, 2, 3, 6];
+        assert_eq!(
+            num_words_per_degree.len(),
+            expected_num_words_per_degree.len()
+        );
+        for (i, (term, expected_term)) in num_words_per_degree
+            .iter()
+            .zip(expected_num_words_per_degree.iter())
+            .enumerate()
+        {
+            dbg!(i);
+            assert_eq!(term, expected_term);
+        }
     }
 }

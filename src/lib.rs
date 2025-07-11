@@ -4,15 +4,39 @@ use std::{
 };
 
 use bitvec::prelude::*;
-use num_rational::Rational64;
+use num_rational::Ratio;
+#[cfg(feature = "progress")]
+use pbr::ProgressBar;
 
 use crate::{
     lyndon::{Generator, LyndonBasis},
     rooted_tree::RootedTree,
 };
 pub mod bch;
+pub mod lie_series;
 pub mod lyndon;
 pub mod rooted_tree;
+
+#[cfg(feature = "bigint")]
+type Rational = BigRational;
+
+#[cfg(feature = "bigint")]
+use num_rational::BigRational;
+
+#[cfg(feature = "rat128")]
+type Rational = Ratio<i128>;
+
+#[cfg(feature = "rat64")]
+type Rational = Ratio<i64>;
+
+#[cfg(feature = "rat32")]
+type Rational = Ratio<i32>;
+
+#[cfg(feature = "rat16")]
+type Rational = Ratio<i16>;
+
+#[cfg(feature = "rat8")]
+type Rational = Ratio<i8>;
 
 pub const FACTORIALS: [u64; 21] = [
     1,
@@ -45,16 +69,17 @@ pub const PRIMES: [usize; 25] = [
 pub struct BCHCoefficientGenerator<T: Generator<Letter = T>> {
     graph_partition_table: GraphPartitionTable<T>,
     is_computed_z: BitVec,
-    z: Vec<Rational64>,
-    bernoulli: Vec<Rational64>,
-    x_minus_y: Vec<Rational64>,
-    x_plus_y: Vec<Rational64>,
+    z: Vec<Rational>,
+    bernoulli: Vec<Rational>,
+    x_minus_y: Vec<Rational>,
+    x_plus_y: Vec<Rational>,
     prime: Vec<usize>,
     d_prime: Vec<usize>,
     sigma: Vec<usize>,
     kappa: Vec<usize>,
     m_n: usize,
-    adjoint_cache: HashMap<(usize, usize), Rational64>,
+    adjoint_cache: HashMap<(usize, usize), Rational>,
+    progress: u64,
 }
 
 impl<T: Generator<Letter = T>> BCHCoefficientGenerator<T> {
@@ -67,13 +92,13 @@ impl<T: Generator<Letter = T>> BCHCoefficientGenerator<T> {
         let graph_partition_table = GraphPartitionTable::new(t_n);
         let is_computed_z = bitvec![0; graph_partition_table.tm_n()];
         let bernoulli = bernoulli_sequence(n);
-        let z = vec![Rational64::default(); graph_partition_table.tm_n()];
-        let mut x_minus_y = vec![Rational64::default(); graph_partition_table.tm_n()];
-        x_minus_y[0] = Rational64::new(1, 1);
-        x_minus_y[1] = Rational64::new(-1, 1);
-        let mut x_plus_y = vec![Rational64::default(); graph_partition_table.tm_n()];
-        x_plus_y[0] = Rational64::new(1, 1);
-        x_plus_y[1] = Rational64::new(1, 1);
+        let z = vec![Rational::default(); graph_partition_table.tm_n()];
+        let mut x_minus_y = vec![Rational::default(); graph_partition_table.tm_n()];
+        x_minus_y[0] = Rational::new(1.into(), 1.into());
+        x_minus_y[1] = Rational::new((-1).into(), 1.into());
+        let mut x_plus_y = vec![Rational::default(); graph_partition_table.tm_n()];
+        x_plus_y[0] = Rational::new(1.into(), 1.into());
+        x_plus_y[1] = Rational::new(1.into(), 1.into());
         let prime = vec![0; m_n];
         let d_prime = vec![0; m_n];
         let mut sigma = vec![0_usize; m_n];
@@ -97,31 +122,32 @@ impl<T: Generator<Letter = T>> BCHCoefficientGenerator<T> {
             kappa,
             m_n,
             adjoint_cache,
+            progress: 0,
         }
     }
 
-    fn lie_bracket(&self, alpha: &[Rational64], beta: &[Rational64], i: usize) -> Rational64 {
-        let mut sum = Rational64::default();
+    fn lie_bracket(&self, alpha: &[Rational], beta: &[Rational], i: usize) -> Rational {
+        let mut sum = Rational::default();
         for &(j, k) in self.graph_partition_table.partitions(i).partitions.iter() {
-            sum += alpha[j] * beta[k] - alpha[k] * beta[j];
+            sum += &alpha[j] * &beta[k] - &alpha[k] * &beta[j];
         }
 
         sum
     }
 
-    fn adjoint_operator(&mut self, i: usize, power: usize) -> Rational64 {
+    fn adjoint_operator(&mut self, i: usize, power: usize) -> Rational {
         if power == 0 {
-            return self.x_plus_y[i];
+            return self.x_plus_y[i].clone();
         }
-        if let Some(&v) = self.adjoint_cache.get(&(i, power)) {
-            return v;
+        if let Some(v) = self.adjoint_cache.get(&(i, power)) {
+            return v.clone();
         }
         if power == 1 {
             let result = self.lie_bracket(&self.z, &self.x_plus_y, i);
-            self.adjoint_cache.insert((i, power), result);
+            self.adjoint_cache.insert((i, power), result.clone());
             return result;
         }
-        let mut sum = Rational64::default();
+        let mut sum = Rational::default();
         let partitions = self
             .graph_partition_table
             .partitions(i)
@@ -130,18 +156,18 @@ impl<T: Generator<Letter = T>> BCHCoefficientGenerator<T> {
             .copied()
             .collect::<Vec<_>>();
         for (j, k) in partitions {
-            sum += self.z[j] * self.adjoint_operator(k, power - 1)
-                - self.z[k] * self.adjoint_operator(j, power - 1);
+            sum += self.z[j].clone() * self.adjoint_operator(k, power - 1)
+                - self.z[k].clone() * self.adjoint_operator(j, power - 1);
         }
-        self.adjoint_cache.insert((i, power), sum);
+        self.adjoint_cache.insert((i, power), sum.clone());
 
         sum
     }
 
-    fn compute_z(&mut self, i: usize) -> Rational64 {
+    fn compute_z(&mut self, i: usize) -> Rational {
         if i == 0 || i == 1 {
             self.is_computed_z.set(i, true);
-            return Rational64::new(1, 1);
+            return Rational::new(1.into(), 1.into());
         }
         // 1/2 [X-Y, Z] (u_i)
         let s_ui = self.graph_partition_table.partitions(i).clone();
@@ -149,33 +175,47 @@ impl<T: Generator<Letter = T>> BCHCoefficientGenerator<T> {
             // Check if there are any Z_u terms that we need to complete first
             if !self.is_computed_z[j] {
                 self.z[j] = self.compute_z(j);
+                self.progress += 1;
             }
             if !self.is_computed_z[k] {
                 self.z[k] = self.compute_z(k);
+                self.progress += 1;
             }
         }
-        let left_term = Rational64::new(1, 2) * self.lie_bracket(&self.x_minus_y, &self.z, i);
+        let left_term =
+            Rational::new(1.into(), 2.into()) * self.lie_bracket(&self.x_minus_y, &self.z, i);
 
         // Bernoulli term
-        let mut bernoulli_term = Rational64::default();
+        let mut bernoulli_term = Rational::default();
         let degree = self.graph_partition_table.degree(i);
         for p in 1..=((degree - 1) / 2) {
             let bernoulli_coef =
-                self.bernoulli[2 * p] * Rational64::new(1, FACTORIALS[2 * p] as i64);
+                &self.bernoulli[2 * p] * Rational::new(1.into(), (FACTORIALS[2 * p]).into());
             let adjoint_term = self.adjoint_operator(i, 2 * p);
             bernoulli_term += bernoulli_coef * adjoint_term;
         }
         self.is_computed_z.set(i, true);
         let result = (left_term + bernoulli_term)
-            * Rational64::new(1, self.graph_partition_table.degree(i) as i64);
+            * Rational::new(
+                1.into(),
+                (self.graph_partition_table.degree(i) as i8).into(),
+            );
         result
     }
 
     /// Generates the truncated Baker-Campbell-Hausdorff series of a Lyndon basis
-    pub fn generate_coefficients(&mut self) -> Vec<Rational64> {
+    pub fn generate_coefficients(&mut self) -> Vec<Rational> {
+        #[cfg(feature = "progress")]
+        let mut pb = ProgressBar::new(self.graph_partition_table.tm_n() as u64);
+        #[cfg(feature = "progress")]
+        {
+            pb.message("Generating BCH Coefficients ");
+            pb.tick();
+        }
         for i in 0..self.m_n {
             if !self.is_computed_z[i] {
                 self.z[i] = self.compute_z(i);
+                self.progress += 1;
                 if i > 1 {
                     self.prime[i] = self.graph_partition_table.partitions(i)[0].0;
                     self.d_prime[i] = self.graph_partition_table.partitions(i)[0].1;
@@ -190,12 +230,17 @@ impl<T: Generator<Letter = T>> BCHCoefficientGenerator<T> {
                         self.kappa[i] * self.sigma[self.prime[i]] * self.sigma[self.d_prime[i]];
                 }
             }
+
+            #[cfg(feature = "progress")]
+            pb.set(self.progress);
         }
+        #[cfg(feature = "progress")]
+        pb.finish();
 
         self.z[..self.m_n]
             .iter()
             .zip(self.sigma.iter())
-            .map(|(&z, &sig)| z * Rational64::new(1, sig as i64))
+            .map(|(z, &sig)| z * Rational::new(1.into(), (sig as u64).into()))
             .collect()
     }
 }
@@ -228,6 +273,14 @@ pub struct GraphPartitionTable<T: Generator<Letter = T>> {
 
 impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
     pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
+        #[cfg(feature = "progress")]
+        let mut pb = ProgressBar::new(t_n.len() as u64);
+        #[cfg(feature = "progress")]
+        {
+            pb.message("Generating Partition Table ");
+            pb.tick();
+        }
+
         let mut degree = Vec::with_capacity(t_n.len());
         let mut tree_t_n_map = HashMap::<RootedTree<T>, usize>::new();
         for (i, tree) in t_n.iter().enumerate() {
@@ -240,6 +293,9 @@ impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
             let tree = &t_n[i];
             let Some((v, w)) = tree.factorize() else {
                 i += 1;
+                #[cfg(feature = "progress")]
+                pb.inc();
+
                 continue;
             };
             let v_idx = tree_t_n_map[&v];
@@ -252,6 +308,11 @@ impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
                 v_root_w.graft(w.clone());
                 let v_comp = t_n[s_v[p].1].clone();
                 if !tree_t_n_map.contains_key(&v_root_w) {
+                    #[cfg(feature = "progress")]
+                    {
+                        pb.total += 1;
+                        pb.inc();
+                    }
                     t_n.push(v_root_w.clone());
                     degree.push(v_root_w.degree());
                     tree_t_n_map.insert(v_root_w.clone(), t_n.len() - 1);
@@ -267,6 +328,11 @@ impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
                 v_w_root.graft(w_root);
                 let w_comp = t_n[s_w[q].1].clone();
                 if !tree_t_n_map.contains_key(&v_w_root) {
+                    #[cfg(feature = "progress")]
+                    {
+                        pb.total += 1;
+                        pb.inc();
+                    }
                     t_n.push(v_w_root.clone());
                     degree.push(v_w_root.degree());
                     tree_t_n_map.insert(v_w_root.clone(), t_n.len() - 1);
@@ -276,7 +342,12 @@ impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
                     .push((tree_t_n_map[&v_w_root], tree_t_n_map[&w_comp]));
             }
             i += 1;
+            #[cfg(feature = "progress")]
+            pb.inc();
         }
+
+        #[cfg(feature = "progress")]
+        pb.finish();
 
         Self { degree, t_n, s }
     }
@@ -298,44 +369,44 @@ impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
     }
 }
 
-fn binomial(n: usize, k: usize) -> Rational64 {
+fn binomial(n: usize, k: usize) -> Rational {
     if k == 0 {
-        return Rational64::new(1, 1);
+        return Rational::new(1.into(), 1.into());
     }
 
     let k = k.min(n - k);
-    let mut result = Rational64::new(1, 1);
+    let mut result = Rational::new(1.into(), 1.into());
 
     for i in 0..k {
-        result *= Rational64::new((n - i) as i64, (i + 1) as i64);
+        result *= Rational::new(((n - i) as u64).into(), (i as u64 + 1).into());
     }
 
     result
 }
 
-pub fn bernoulli_sequence(max_n: usize) -> Vec<Rational64> {
-    let mut b = vec![Rational64::default(); max_n + 1];
+pub fn bernoulli_sequence(max_n: usize) -> Vec<Rational> {
+    let mut b = vec![Rational::default(); max_n + 1];
 
-    b[0] = Rational64::new(1, 1);
+    b[0] = Rational::new(1.into(), 1.into());
     if max_n > 0 {
-        b[1] = Rational64::new(-1, 2);
+        b[1] = Rational::new((-1).into(), 2.into());
     }
 
     for n in 2..=max_n {
         if n % 2 == 1 {
             continue;
         }
-        let mut sum = Rational64::default();
+        let mut sum = Rational::default();
         for k in 0..n {
-            sum += binomial(n + 1, k) * b[k];
+            sum += binomial(n + 1, k) * &b[k];
         }
 
-        b[n] = -sum * Rational64::new(1, (n + 1) as i64);
+        b[n] = -sum * Rational::new(1.into(), (n as u64 + 1).into());
     }
 
     // Use positive sign convention
     if max_n > 0 {
-        b[1] = Rational64::new(1, 2);
+        b[1] = Rational::new(1.into(), 2.into());
     }
 
     b
@@ -349,20 +420,20 @@ mod test {
     fn test_bernoulli_sequence() {
         let seq = bernoulli_sequence(10);
         let expected_seq = vec![
-            Rational64::new(1, 1),
-            Rational64::new(1, 2),
-            Rational64::new(1, 6),
-            Rational64::default(),
-            Rational64::new(-1, 30),
-            Rational64::default(),
-            Rational64::new(1, 42),
-            Rational64::default(),
-            Rational64::new(-1, 30),
-            Rational64::default(),
-            Rational64::new(5, 66),
+            Rational::new(1.into(), 1.into()),
+            Rational::new(1.into(), 2.into()),
+            Rational::new(1.into(), 6.into()),
+            Rational::default(),
+            Rational::new((-1).into(), 30.into()),
+            Rational::default(),
+            Rational::new(1.into(), 42.into()),
+            Rational::default(),
+            Rational::new((-1).into(), 30.into()),
+            Rational::default(),
+            Rational::new(5.into(), 66.into()),
         ];
         assert_eq!(seq.len(), expected_seq.len());
-        for (&term, &expected_term) in seq.iter().zip(&expected_seq) {
+        for (term, expected_term) in seq.iter().zip(&expected_seq) {
             assert_eq!(term, expected_term);
         }
     }
@@ -415,22 +486,22 @@ mod test {
         let mut generator = BCHCoefficientGenerator::<char>::new(5);
         let series = generator.generate_coefficients();
         let expected_z_ui_series = vec![
-            Rational64::new(1, 1),
-            Rational64::new(1, 1),
-            Rational64::new(1, 2),
-            Rational64::new(1, 12),
-            Rational64::new(1, 12),
-            Rational64::default(),
-            Rational64::new(1, 24),
-            Rational64::default(),
-            Rational64::new(-1, 720),
-            Rational64::new(1, 360),
-            Rational64::new(1, 120),
-            Rational64::new(1, 180),
-            Rational64::new(1, 180),
-            Rational64::new(-1, 720),
+            Rational::new(1.into(), 1.into()),
+            Rational::new(1.into(), 1.into()),
+            Rational::new(1.into(), 2.into()),
+            Rational::new(1.into(), 12.into()),
+            Rational::new(1.into(), 12.into()),
+            Rational::default(),
+            Rational::new(1.into(), 24.into()),
+            Rational::default(),
+            Rational::new((-1).into(), 720.into()),
+            Rational::new(1.into(), 360.into()),
+            Rational::new(1.into(), 120.into()),
+            Rational::new(1.into(), 180.into()),
+            Rational::new(1.into(), 180.into()),
+            Rational::new((-1).into(), 720.into()),
         ];
-        for (&term, &expected_term) in series.iter().zip(&expected_z_ui_series) {
+        for (term, expected_term) in series.iter().zip(&expected_z_ui_series) {
             assert_eq!(term, expected_term);
         }
     }

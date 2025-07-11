@@ -1,6 +1,4 @@
-use num_rational::Rational64;
-
-use crate::{FACTORIALS, PRIMES};
+use crate::{FACTORIALS, PRIMES, Rational};
 
 pub fn p_adic_expansion(n: usize, p: usize) -> Vec<usize> {
     let mut num = n;
@@ -34,7 +32,7 @@ pub fn bch_denominator(n: usize) -> usize {
     prod
 }
 
-pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> Rational64 {
+pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> Rational {
     let n = q.iter().sum();
     let d = FACTORIALS[n] * bch_denominator(n) as u64;
     let m = q.len();
@@ -75,16 +73,19 @@ pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> Rational64 {
         }
         a_current = !a_current;
     }
-    let mut sum = Rational64::default();
+    let mut sum = Rational::default();
     for k in 1..=n {
         let denom = if k % 2 != 0 {
             k as isize
         } else {
             -(k as isize)
         };
-        sum += Rational64::new(c[k - 1 + n * (n - 1)] as i64, denom as i64);
+        sum += Rational::new(
+            (c[k - 1 + n * (n - 1)] as i128).into(),
+            (denom as i8).into(),
+        );
     }
-    sum * Rational64::new(1, d as i64)
+    sum * Rational::new(1.into(), d.into())
 }
 
 #[cfg(test)]
@@ -117,19 +118,19 @@ mod test {
     }
 
     #[rstest]
-    #[case(vec![1], true, Rational64::new(1, 1))]
-    #[case(vec![1], false, Rational64::new(1, 1))]
-    #[case(vec![1, 1], true, Rational64::new(1, 2))]
-    #[case(vec![2, 1], true, Rational64::new(1, 12))]
-    #[case(vec![2, 2], true, Rational64::new(1,24))]
-    #[case(vec![3, 1], true, Rational64::default())]
-    #[case(vec![3, 2], true, Rational64::new(1, 180))]
-    #[case(vec![4, 1], true, Rational64::new(-1, 720))]
-    #[case(vec![2, 1, 1, 1], true, Rational64::new(-1, 120))]
+    #[case(vec![1], true, Rational::new(1.into(), 1.into()))]
+    #[case(vec![1], false, Rational::new(1.into(), 1.into()))]
+    #[case(vec![1, 1], true, Rational::new(1.into(), 2.into()))]
+    #[case(vec![2, 1], true, Rational::new(1.into(), 12.into()))]
+    #[case(vec![2, 2], true, Rational::new(1.into(), 24.into()))]
+    #[case(vec![3, 1], true, Rational::default())]
+    #[case(vec![3, 2], true, Rational::new(1.into(), 180.into()))]
+    #[case(vec![4, 1], true, Rational::new((-1).into(), 720.into()))]
+    #[case(vec![2, 1, 1, 1], true, Rational::new((-1).into(), 120.into()))]
     fn test_goldberg_coeff(
         #[case] q_m: Vec<usize>,
         #[case] a_first: bool,
-        #[case] expected_coeff: Rational64,
+        #[case] expected_coeff: Rational,
     ) {
         dbg!(&q_m);
         dbg!(a_first);

@@ -7,6 +7,17 @@ edition = "2024"
 thiserror = "^2.0.12"
 num-rational = "^0.4.2"
 bitvec = "^1.0.1"
+pbr = {version = "^1.1.1", optional = true}
 
 [dev-dependencies]
 rstest = "^0.25.0"
+
+[features]
+default = ["rat128"]
+progress = ["pbr"]
+bigint = []
+rat128 = []
+rat64 = []
+rat32 = []
+rat16 = []
+rat8 = []
