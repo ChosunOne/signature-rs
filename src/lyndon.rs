@@ -190,7 +190,6 @@ pub struct LyndonBasis<const N: usize, T: Generator> {
 impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
     pub fn generate_basis(k: usize) -> Vec<LyndonWord<N, T>> {
         let alphabet = T::alphabet::<N>();
-        dbg!(&alphabet);
         let letter_index: HashMap<_, _> = alphabet
             .iter()
             .copied()

@@ -1,3 +1,5 @@
+use num_rational::Rational64;
+
 use crate::{FACTORIALS, PRIMES};
 
 pub fn p_adic_expansion(n: usize, p: usize) -> Vec<usize> {
@@ -32,42 +34,31 @@ pub fn bch_denominator(n: usize) -> usize {
     prod
 }
 
-pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> f64 {
+pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> Rational64 {
     let n = q.iter().sum();
     let d = FACTORIALS[n] * bch_denominator(n) as u64;
     let m = q.len();
-    dbg!(n);
-    dbg!(d);
-    dbg!(m);
     let mut c = vec![0isize; n * n];
     let mut a_current = a_first;
     if m % 2 == 0 {
         a_current = !a_first;
     }
-    dbg!(a_current);
     let mut l = 0;
     for i in (0..m).rev() {
-        dbg!(i);
         for r in 1..=q[i] {
-            dbg!(r);
             l += 1;
-            dbg!(l);
             let mut h = 0;
             if i == m - 1 {
                 h = (d / FACTORIALS[l]) as isize;
             } else if a_current && i == m - 2 {
                 h = (d / (FACTORIALS[r] * FACTORIALS[q[i + 1]])) as isize;
             }
-            dbg!(h);
             c[(l - 1) * n] = h;
             for k in 2..l {
-                dbg!(k);
                 h = 0;
                 for j in 1..=r {
-                    dbg!(j);
                     if l > j && c[k - 2 + n * (l - j - 1)] != 0 {
                         h += c[k - 2 + n * (l - j - 1)] / FACTORIALS[j] as isize;
-                        dbg!(h);
                     }
                 }
                 if a_current && i <= m - 2 {
@@ -75,7 +66,6 @@ pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> f64 {
                         if l > r + j && c[k - 2 + n * (l - r - j - 1)] != 0 {
                             h += c[k - 2 + n * (l - r - j - 1)]
                                 / (FACTORIALS[r] * FACTORIALS[j]) as isize;
-                            dbg!(h);
                         }
                     }
                 }
@@ -84,23 +74,17 @@ pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> f64 {
             c[l - 1 + n * (l - 1)] = d as isize;
         }
         a_current = !a_current;
-        dbg!(a_current);
     }
-    let mut sum = 0;
+    let mut sum = Rational64::default();
     for k in 1..=n {
         let denom = if k % 2 != 0 {
             k as isize
         } else {
             -(k as isize)
         };
-        dbg!(k);
-        dbg!(denom);
-        dbg!(c[k - 1 + n * (n - 1)]);
-        sum += c[k - 1 + n * (n - 1)] / denom;
-        dbg!(sum);
+        sum += Rational64::new(c[k - 1 + n * (n - 1)] as i64, denom as i64);
     }
-    dbg!(sum);
-    (sum as f64) / (d as f64)
+    sum * Rational64::new(1, d as i64)
 }
 
 #[cfg(test)]
@@ -133,19 +117,19 @@ mod test {
     }
 
     #[rstest]
-    #[case(vec![1], true, 1.)]
-    #[case(vec![1], false, 1.)]
-    #[case(vec![1, 1], true, 0.5)]
-    #[case(vec![2, 1], true, 1. / 12.)]
-    #[case(vec![2, 2], true, 1. / 24.)]
-    #[case(vec![3, 1], true, 0.)]
-    #[case(vec![3, 2], true, 1. / 180.)]
-    #[case(vec![4, 1], true, -1. / 720.)]
-    #[case(vec![2, 1, 1, 1], true, -1. / 120.)]
+    #[case(vec![1], true, Rational64::new(1, 1))]
+    #[case(vec![1], false, Rational64::new(1, 1))]
+    #[case(vec![1, 1], true, Rational64::new(1, 2))]
+    #[case(vec![2, 1], true, Rational64::new(1, 12))]
+    #[case(vec![2, 2], true, Rational64::new(1,24))]
+    #[case(vec![3, 1], true, Rational64::default())]
+    #[case(vec![3, 2], true, Rational64::new(1, 180))]
+    #[case(vec![4, 1], true, Rational64::new(-1, 720))]
+    #[case(vec![2, 1, 1, 1], true, Rational64::new(-1, 120))]
     fn test_goldberg_coeff(
         #[case] q_m: Vec<usize>,
         #[case] a_first: bool,
-        #[case] expected_coeff: f64,
+        #[case] expected_coeff: Rational64,
     ) {
         dbg!(&q_m);
         dbg!(a_first);

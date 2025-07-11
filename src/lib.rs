@@ -1,6 +1,15 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ops::{Index, IndexMut},
+};
 
-use crate::{lyndon::LyndonBasis, rooted_tree::RootedTree};
+use bitvec::prelude::*;
+use num_rational::Rational64;
+
+use crate::{
+    lyndon::{Generator, LyndonBasis},
+    rooted_tree::RootedTree,
+};
 pub mod bch;
 pub mod lyndon;
 pub mod rooted_tree;
@@ -33,250 +42,300 @@ pub const PRIMES: [usize; 25] = [
     97,
 ];
 
-/// Generates the truncated Baker-Campbell-Hausdorff series of a Lyndon basis
-/// with the given truncation depth `n` and alphabet size `2`.
-pub fn generate_bch_series_2(n: usize) -> Vec<f64> {
-    let mut t_n = LyndonBasis::<2, u8>::generate_basis(n)
-        .into_iter()
-        .map(|w| RootedTree::from(w))
-        .collect::<Vec<_>>();
-    let m_n = t_n.len();
-    let bernoulli = bernoulli_sequence(n);
-    let mut degree = Vec::with_capacity(m_n);
-    let mut tree_t_n_map = HashMap::<RootedTree<u8>, usize>::new();
-    for (i, tree) in t_n.iter().enumerate() {
-        degree.push(tree.degree());
-        tree_t_n_map.insert(tree.clone(), i);
-    }
-    let s = build_s(&mut t_n, &mut tree_t_n_map, &mut degree);
-    let tm_n = t_n.len();
-    let mut z_ui = vec![0.; tm_n];
-    let mut is_computed_z_ui = vec![false; tm_n];
-    let mut x_minus_y = vec![0.; tm_n];
-    x_minus_y[0] = 1.;
-    x_minus_y[1] = -1.;
-    let x_minus_y = x_minus_y;
-    let mut x_plus_y = vec![0.; tm_n];
-    x_plus_y[0] = 1.;
-    x_plus_y[1] = 1.;
-    let x_plus_y = x_plus_y;
-    let mut prime = vec![0; m_n];
-    let mut d_prime = vec![0; m_n];
-    let mut sigma = vec![0_usize; m_n];
-    sigma[0] = 1;
-    sigma[1] = 1;
-    let mut kappa = vec![0; m_n];
-    kappa[0] = 1;
-    kappa[1] = 1;
-    for i in 0..m_n {
-        z_ui[i] = compute_z_ui(
-            i,
-            &s,
-            &x_minus_y,
-            &x_plus_y,
-            &bernoulli,
-            &degree,
-            &mut is_computed_z_ui,
-            &mut z_ui,
-        );
+pub struct BCHCoefficientGenerator<T: Generator<Letter = T>> {
+    graph_partition_table: GraphPartitionTable<T>,
+    is_computed_z: BitVec,
+    z: Vec<Rational64>,
+    bernoulli: Vec<Rational64>,
+    x_minus_y: Vec<Rational64>,
+    x_plus_y: Vec<Rational64>,
+    prime: Vec<usize>,
+    d_prime: Vec<usize>,
+    sigma: Vec<usize>,
+    kappa: Vec<usize>,
+    m_n: usize,
+    adjoint_cache: HashMap<(usize, usize), Rational64>,
+}
 
-        if i > 1 {
-            prime[i] = s[i][0].0;
-            d_prime[i] = s[i][0].1;
-            kappa[i] = {
-                if d_prime[prime[i]] != d_prime[i] {
-                    1
-                } else {
-                    kappa[prime[i]] + 1
+impl<T: Generator<Letter = T>> BCHCoefficientGenerator<T> {
+    pub fn new(n: usize) -> Self {
+        let t_n = LyndonBasis::<2, T>::generate_basis(n)
+            .into_iter()
+            .map(|w| RootedTree::from(w))
+            .collect::<Vec<_>>();
+        let m_n = t_n.len();
+        let graph_partition_table = GraphPartitionTable::new(t_n);
+        let is_computed_z = bitvec![0; graph_partition_table.tm_n()];
+        let bernoulli = bernoulli_sequence(n);
+        let z = vec![Rational64::default(); graph_partition_table.tm_n()];
+        let mut x_minus_y = vec![Rational64::default(); graph_partition_table.tm_n()];
+        x_minus_y[0] = Rational64::new(1, 1);
+        x_minus_y[1] = Rational64::new(-1, 1);
+        let mut x_plus_y = vec![Rational64::default(); graph_partition_table.tm_n()];
+        x_plus_y[0] = Rational64::new(1, 1);
+        x_plus_y[1] = Rational64::new(1, 1);
+        let prime = vec![0; m_n];
+        let d_prime = vec![0; m_n];
+        let mut sigma = vec![0_usize; m_n];
+        sigma[0] = 1;
+        sigma[1] = 1;
+        let mut kappa = vec![0; m_n];
+        kappa[0] = 1;
+        kappa[1] = 1;
+        let adjoint_cache = HashMap::new();
+
+        Self {
+            graph_partition_table,
+            is_computed_z,
+            bernoulli,
+            z,
+            x_minus_y,
+            x_plus_y,
+            prime,
+            d_prime,
+            sigma,
+            kappa,
+            m_n,
+            adjoint_cache,
+        }
+    }
+
+    fn lie_bracket(&self, alpha: &[Rational64], beta: &[Rational64], i: usize) -> Rational64 {
+        let mut sum = Rational64::default();
+        for &(j, k) in self.graph_partition_table.partitions(i).partitions.iter() {
+            sum += alpha[j] * beta[k] - alpha[k] * beta[j];
+        }
+
+        sum
+    }
+
+    fn adjoint_operator(&mut self, i: usize, power: usize) -> Rational64 {
+        if power == 0 {
+            return self.x_plus_y[i];
+        }
+        if let Some(&v) = self.adjoint_cache.get(&(i, power)) {
+            return v;
+        }
+        if power == 1 {
+            let result = self.lie_bracket(&self.z, &self.x_plus_y, i);
+            self.adjoint_cache.insert((i, power), result);
+            return result;
+        }
+        let mut sum = Rational64::default();
+        let partitions = self
+            .graph_partition_table
+            .partitions(i)
+            .partitions
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for (j, k) in partitions {
+            sum += self.z[j] * self.adjoint_operator(k, power - 1)
+                - self.z[k] * self.adjoint_operator(j, power - 1);
+        }
+        self.adjoint_cache.insert((i, power), sum);
+
+        sum
+    }
+
+    fn compute_z(&mut self, i: usize) -> Rational64 {
+        if i == 0 || i == 1 {
+            self.is_computed_z.set(i, true);
+            return Rational64::new(1, 1);
+        }
+        // 1/2 [X-Y, Z] (u_i)
+        let s_ui = self.graph_partition_table.partitions(i).clone();
+        for &(j, k) in &s_ui.partitions {
+            // Check if there are any Z_u terms that we need to complete first
+            if !self.is_computed_z[j] {
+                self.z[j] = self.compute_z(j);
+            }
+            if !self.is_computed_z[k] {
+                self.z[k] = self.compute_z(k);
+            }
+        }
+        let left_term = Rational64::new(1, 2) * self.lie_bracket(&self.x_minus_y, &self.z, i);
+
+        // Bernoulli term
+        let mut bernoulli_term = Rational64::default();
+        let degree = self.graph_partition_table.degree(i);
+        for p in 1..=((degree - 1) / 2) {
+            let bernoulli_coef =
+                self.bernoulli[2 * p] * Rational64::new(1, FACTORIALS[2 * p] as i64);
+            let adjoint_term = self.adjoint_operator(i, 2 * p);
+            bernoulli_term += bernoulli_coef * adjoint_term;
+        }
+        self.is_computed_z.set(i, true);
+        let result = (left_term + bernoulli_term)
+            * Rational64::new(1, self.graph_partition_table.degree(i) as i64);
+        result
+    }
+
+    /// Generates the truncated Baker-Campbell-Hausdorff series of a Lyndon basis
+    pub fn generate_coefficients(&mut self) -> Vec<Rational64> {
+        for i in 0..self.m_n {
+            if !self.is_computed_z[i] {
+                self.z[i] = self.compute_z(i);
+                if i > 1 {
+                    self.prime[i] = self.graph_partition_table.partitions(i)[0].0;
+                    self.d_prime[i] = self.graph_partition_table.partitions(i)[0].1;
+                    self.kappa[i] = {
+                        if self.d_prime[self.prime[i]] != self.d_prime[i] {
+                            1
+                        } else {
+                            self.kappa[self.prime[i]] + 1
+                        }
+                    };
+                    self.sigma[i] =
+                        self.kappa[i] * self.sigma[self.prime[i]] * self.sigma[self.d_prime[i]];
                 }
+            }
+        }
+
+        self.z[..self.m_n]
+            .iter()
+            .zip(self.sigma.iter())
+            .map(|(&z, &sig)| z * Rational64::new(1, sig as i64))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EdgePartitions {
+    pub partitions: Vec<(usize, usize)>,
+}
+
+impl Index<usize> for EdgePartitions {
+    type Output = (usize, usize);
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.partitions[index]
+    }
+}
+
+impl IndexMut<usize> for EdgePartitions {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.partitions[index]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphPartitionTable<T: Generator<Letter = T>> {
+    t_n: Vec<RootedTree<T>>,
+    degree: Vec<usize>,
+    s: Vec<EdgePartitions>,
+}
+
+impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
+    pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
+        let mut degree = Vec::with_capacity(t_n.len());
+        let mut tree_t_n_map = HashMap::<RootedTree<T>, usize>::new();
+        for (i, tree) in t_n.iter().enumerate() {
+            degree.push(tree.degree());
+            tree_t_n_map.insert(tree.clone(), i);
+        }
+        let mut s = vec![EdgePartitions::default(); t_n.len()];
+        let mut i = 0;
+        while i < t_n.len() {
+            let tree = &t_n[i];
+            let Some((v, w)) = tree.factorize() else {
+                i += 1;
+                continue;
             };
-            sigma[i] = kappa[i] * sigma[prime[i]] * sigma[d_prime[i]];
-        }
-    }
-    z_ui[..m_n]
-        .iter()
-        .zip(sigma.iter())
-        .map(|(&z, &sig)| z / sig as f64)
-        .collect()
-}
+            let v_idx = tree_t_n_map[&v];
+            let w_idx = tree_t_n_map[&w];
+            s[i].partitions.push((v_idx, w_idx));
 
-fn build_s(
-    t_n: &mut Vec<RootedTree<u8>>,
-    tree_t_n_map: &mut HashMap<RootedTree<u8>, usize>,
-    degree: &mut Vec<usize>,
-) -> Vec<Vec<(usize, usize)>> {
-    let mut s = vec![vec![]; t_n.len()];
-    let mut i = 0;
-    while i < t_n.len() {
-        let tree = &t_n[i];
-        let Some((v, w)) = tree.factorize() else {
+            for p in 0..v.degree() - 1 {
+                let s_v = &s[v_idx];
+                let mut v_root_w = t_n[s_v[p].0].clone();
+                v_root_w.graft(w.clone());
+                let v_comp = t_n[s_v[p].1].clone();
+                if !tree_t_n_map.contains_key(&v_root_w) {
+                    t_n.push(v_root_w.clone());
+                    degree.push(v_root_w.degree());
+                    tree_t_n_map.insert(v_root_w.clone(), t_n.len() - 1);
+                    s.push(EdgePartitions::default());
+                }
+                s[i].partitions
+                    .push((tree_t_n_map[&v_root_w], tree_t_n_map[&v_comp]));
+            }
+            for q in 0..w.degree() - 1 {
+                let s_w = &s[w_idx];
+                let mut v_w_root = v.clone();
+                let w_root = t_n[s_w[q].0].clone();
+                v_w_root.graft(w_root);
+                let w_comp = t_n[s_w[q].1].clone();
+                if !tree_t_n_map.contains_key(&v_w_root) {
+                    t_n.push(v_w_root.clone());
+                    degree.push(v_w_root.degree());
+                    tree_t_n_map.insert(v_w_root.clone(), t_n.len() - 1);
+                    s.push(EdgePartitions::default());
+                }
+                s[i].partitions
+                    .push((tree_t_n_map[&v_w_root], tree_t_n_map[&w_comp]));
+            }
             i += 1;
-            continue;
-        };
-        let v_idx = tree_t_n_map[&v];
-        let w_idx = tree_t_n_map[&w];
-        s[i].push((v_idx, w_idx));
+        }
 
-        for p in 0..v.degree() - 1 {
-            let s_v = &s[v_idx];
-            let mut v_root_w = t_n[s_v[p].0].clone();
-            v_root_w.graft(w.clone());
-            let v_comp = t_n[s_v[p].1].clone();
-            if !tree_t_n_map.contains_key(&v_root_w) {
-                t_n.push(v_root_w.clone());
-                degree.push(v_root_w.degree());
-                tree_t_n_map.insert(v_root_w.clone(), t_n.len() - 1);
-                s.push(vec![]);
-            }
-            s[i].push((tree_t_n_map[&v_root_w], tree_t_n_map[&v_comp]));
-        }
-        for q in 0..w.degree() - 1 {
-            let s_w = &s[w_idx];
-            let mut v_w_root = v.clone();
-            let w_root = t_n[s_w[q].0].clone();
-            v_w_root.graft(w_root);
-            let w_comp = t_n[s_w[q].1].clone();
-            if !tree_t_n_map.contains_key(&v_w_root) {
-                t_n.push(v_w_root.clone());
-                degree.push(v_w_root.degree());
-                tree_t_n_map.insert(v_w_root.clone(), t_n.len() - 1);
-                s.push(vec![]);
-            }
-            s[i].push((tree_t_n_map[&v_w_root], tree_t_n_map[&w_comp]));
-        }
-        i += 1;
+        Self { degree, t_n, s }
     }
 
-    s
+    pub fn partitions(&self, i: usize) -> &EdgePartitions {
+        &self.s[i]
+    }
+
+    pub fn degree(&self, i: usize) -> usize {
+        self.degree[i]
+    }
+
+    pub fn tree(&self, i: usize) -> &RootedTree<T> {
+        &self.t_n[i]
+    }
+
+    pub fn tm_n(&self) -> usize {
+        self.t_n.len()
+    }
 }
 
-fn compute_z_ui(
-    i: usize,
-    s: &[Vec<(usize, usize)>],
-    x_minus_y: &[f64],
-    x_plus_y: &[f64],
-    bernoulli: &[f64],
-    degree: &[usize],
-    is_computed_z_ui: &mut [bool],
-    z_ui: &mut [f64],
-) -> f64 {
-    if i == 0 || i == 1 {
-        is_computed_z_ui[i] = true;
-        return 1.;
-    }
-    // 1/2 [X-Y, Z] (u_i)
-    let s_ui = &s[i];
-    for &(j, k) in s_ui {
-        // Check if there are any Z_u terms that we need to complete first
-        if !is_computed_z_ui[j] {
-            z_ui[j] = compute_z_ui(
-                j,
-                s,
-                x_minus_y,
-                x_plus_y,
-                bernoulli,
-                degree,
-                is_computed_z_ui,
-                z_ui,
-            );
-        }
-        if !is_computed_z_ui[k] {
-            z_ui[k] = compute_z_ui(
-                k,
-                s,
-                x_minus_y,
-                x_plus_y,
-                bernoulli,
-                degree,
-                is_computed_z_ui,
-                z_ui,
-            );
-        }
-    }
-    let left_term = 0.5 * lie_bracket(&x_minus_y, &z_ui, s_ui);
-
-    // Bernoulli term
-    let mut bernoulli_term = 0.0;
-    for p in 1..=((degree[i] - 1) / 2) {
-        let bernoulli_coef = bernoulli[2 * p] / FACTORIALS[2 * p] as f64;
-        let adjoint_term = adjoint_operator(&z_ui, &x_plus_y, s, i, 2 * p);
-        bernoulli_term += bernoulli_coef * adjoint_term;
-    }
-    is_computed_z_ui[i] = true;
-    let result = (left_term + bernoulli_term) / degree[i] as f64;
-    result
-}
-
-/// Computes the Lie bracket [alpha, beta] (u_i)
-fn lie_bracket(alpha: &[f64], beta: &[f64], s_ui: &[(usize, usize)]) -> f64 {
-    let mut sum = 0.0;
-    for &(j, k) in s_ui.iter() {
-        sum += alpha[j] * beta[k] - alpha[k] * beta[j];
-    }
-
-    sum
-}
-
-fn adjoint_operator(
-    alpha: &[f64],
-    beta: &[f64],
-    s: &[Vec<(usize, usize)>],
-    i: usize,
-    power: usize,
-) -> f64 {
-    if power == 0 {
-        return beta[i];
-    }
-    if power == 1 {
-        return lie_bracket(alpha, beta, &s[i]);
-    }
-    let mut sum = 0.0;
-    for &(j, k) in s[i].iter() {
-        sum += alpha[j] * adjoint_operator(alpha, beta, s, k, power - 1)
-            - alpha[k] * adjoint_operator(alpha, beta, s, j, power - 1);
-    }
-
-    sum
-}
-
-fn binomial(n: usize, k: usize) -> f64 {
+fn binomial(n: usize, k: usize) -> Rational64 {
     if k == 0 {
-        return 1.0;
+        return Rational64::new(1, 1);
     }
 
     let k = k.min(n - k);
-    let mut result = 1.0;
+    let mut result = Rational64::new(1, 1);
 
     for i in 0..k {
-        result *= (n - i) as f64 / (i + 1) as f64;
+        result *= Rational64::new((n - i) as i64, (i + 1) as i64);
     }
 
     result
 }
 
-pub fn bernoulli_sequence(max_n: usize) -> Vec<f64> {
-    let mut b = vec![0f64; max_n + 1];
+pub fn bernoulli_sequence(max_n: usize) -> Vec<Rational64> {
+    let mut b = vec![Rational64::default(); max_n + 1];
 
-    b[0] = 1.0;
+    b[0] = Rational64::new(1, 1);
     if max_n > 0 {
-        b[1] = -0.5;
+        b[1] = Rational64::new(-1, 2);
     }
 
     for n in 2..=max_n {
         if n % 2 == 1 {
             continue;
         }
-        let mut sum = 0.0;
+        let mut sum = Rational64::default();
         for k in 0..n {
             sum += binomial(n + 1, k) * b[k];
         }
 
-        b[n] = -sum / (n + 1) as f64;
+        b[n] = -sum * Rational64::new(1, (n + 1) as i64);
     }
 
     // Use positive sign convention
     if max_n > 0 {
-        b[1] = 0.5;
+        b[1] = Rational64::new(1, 2);
     }
 
     b
@@ -284,94 +343,38 @@ pub fn bernoulli_sequence(max_n: usize) -> Vec<f64> {
 
 #[cfg(test)]
 mod test {
-    use crate::lyndon::LyndonWord;
-
     use super::*;
-
-    #[test]
-    fn test_lie_bracket() {
-        let x = vec![1., 2., 3.];
-        let y = vec![4., 5., 6.];
-        let s_ui = vec![(0, 1), (1, 2)];
-        let z = lie_bracket(&x, &y, &s_ui);
-        assert_eq!(z, x[0] * y[1] - x[1] * y[0] + x[1] * y[2] - x[2] * y[1]);
-    }
-
-    // #[test]
-    // fn test_adjoint_operator() {
-    //     let mut t_n = LyndonWord::<u8>::generate_basis(2, 3)
-    //         .into_iter()
-    //         .map(|w| RootedTree::from(w))
-    //         .collect::<Vec<_>>();
-    //     let mut degree = vec![];
-    //     let mut tree_t_n_map = HashMap::<RootedTree<u8>, usize>::new();
-    //     for (i, tree) in t_n.iter().enumerate() {
-    //         degree.push(tree.degree());
-    //         tree_t_n_map.insert(tree.clone(), i);
-    //     }
-    //     let z_ui = vec![1., 1., 0.5, 0., 0., 0.];
-    //     let x_plus_y = vec![1., 1., 0., 0., 0.];
-    //     let s = build_s(&mut t_n, &mut tree_t_n_map, &mut degree);
-    //     let z = adjoint_operator(&z_ui, &x_plus_y, &s, 3, 3);
-    //     assert_eq!(z, 0.0);
-    //
-    //     let z = adjoint_operator(&z_ui, &x_plus_y, &s, 0, 1);
-    //     let expected_z = lie_bracket(&z_ui, &x_plus_y, &s[0]);
-    //     assert_eq!(z, expected_z);
-    // }
 
     #[test]
     fn test_bernoulli_sequence() {
         let seq = bernoulli_sequence(10);
-        assert_eq!(
-            seq,
-            [
-                1.0,
-                0.5,
-                0.16666666666666666,
-                0.0,
-                -0.033333333333333305,
-                0.0,
-                0.023809523809523662,
-                0.0,
-                -0.03333333333333233,
-                0.0,
-                0.0757575757575662,
-            ]
-        );
+        let expected_seq = vec![
+            Rational64::new(1, 1),
+            Rational64::new(1, 2),
+            Rational64::new(1, 6),
+            Rational64::default(),
+            Rational64::new(-1, 30),
+            Rational64::default(),
+            Rational64::new(1, 42),
+            Rational64::default(),
+            Rational64::new(-1, 30),
+            Rational64::default(),
+            Rational64::new(5, 66),
+        ];
+        assert_eq!(seq.len(), expected_seq.len());
+        for (&term, &expected_term) in seq.iter().zip(&expected_seq) {
+            assert_eq!(term, expected_term);
+        }
     }
 
     #[test]
-    fn test_build_s() {
-        let mut t_n = vec![
-            vec![0],
-            vec![1],
-            vec![0, 1],
-            vec![0, 1, 1],
-            vec![0, 0, 1],
-            vec![0, 1, 1, 1],
-            vec![0, 0, 1, 1],
-            vec![0, 0, 0, 1],
-            vec![0, 1, 1, 1, 1],
-            vec![0, 0, 1, 0, 1],
-            vec![0, 1, 0, 1, 1],
-            vec![0, 0, 1, 1, 1],
-            vec![0, 0, 0, 1, 1],
-            vec![0, 0, 0, 0, 1],
-        ]
-        .into_iter()
-        .map(|v| LyndonWord::<2, u8>::try_from(v).expect("To make a lyndon word"))
-        .map(|w| RootedTree::from(w))
-        .collect::<Vec<_>>();
+    fn test_graph_partition_table() {
+        let t_n = LyndonBasis::<2, char>::generate_basis(5)
+            .into_iter()
+            .map(|w| RootedTree::from(w))
+            .collect::<Vec<_>>();
         let m_n = t_n.len();
-        let mut degree = vec![];
-        let mut tree_t_n_map = HashMap::<RootedTree<u8>, usize>::new();
-        for (i, tree) in t_n.iter().enumerate() {
-            degree.push(tree.degree());
-            tree_t_n_map.insert(tree.clone(), i);
-        }
-
-        let s = build_s(&mut t_n, &mut tree_t_n_map, &mut degree);
+        let graph_partition_table = GraphPartitionTable::new(t_n);
         let expected_s = vec![
             vec![],                                             // X
             vec![],                                             // Y
@@ -396,33 +399,39 @@ mod test {
             vec![(m_n, 0), (m_n, 0)],                     // (X) <- (X) -> (X)
             vec![(m_n, 1), (2, 0)],                       // (Y) <- (X) -> (X)
         ];
-        for (i, (s_ui, expected_s_ui)) in s.iter().zip(expected_s.iter()).enumerate() {
+        for (i, (s_ui, expected_s_ui)) in graph_partition_table
+            .s
+            .iter()
+            .zip(expected_s.iter())
+            .enumerate()
+        {
             dbg!(i);
-            assert_eq!(s_ui, expected_s_ui);
+            assert_eq!(&s_ui.partitions, expected_s_ui);
         }
     }
 
     #[test]
     fn test_bch_series() {
-        let series = generate_bch_series_2(5);
+        let mut generator = BCHCoefficientGenerator::<char>::new(5);
+        let series = generator.generate_coefficients();
         let expected_z_ui_series = vec![
-            1.,
-            1.,
-            0.5,
-            1. / 12.,
-            1. / 12.,
-            0.,
-            1. / 24.,
-            0.,
-            -1. / 720.,
-            1. / 360.,
-            1. / 120.,
-            1. / 180.,
-            1. / 180.,
-            -1. / 720.,
+            Rational64::new(1, 1),
+            Rational64::new(1, 1),
+            Rational64::new(1, 2),
+            Rational64::new(1, 12),
+            Rational64::new(1, 12),
+            Rational64::default(),
+            Rational64::new(1, 24),
+            Rational64::default(),
+            Rational64::new(-1, 720),
+            Rational64::new(1, 360),
+            Rational64::new(1, 120),
+            Rational64::new(1, 180),
+            Rational64::new(1, 180),
+            Rational64::new(-1, 720),
         ];
-        dbg!(&series);
-        dbg!(&expected_z_ui_series);
-        // assert_eq!(series, expected_z_ui_series);
+        for (&term, &expected_term) in series.iter().zip(&expected_z_ui_series) {
+            assert_eq!(term, expected_term);
+        }
     }
 }
