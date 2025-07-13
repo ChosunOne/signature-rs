@@ -8,7 +8,7 @@ use std::{
 };
 
 #[cfg(feature = "progress")]
-use pbr::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
 
 pub trait Generator:
@@ -190,14 +190,20 @@ pub struct LyndonBasis<const N: usize, T: Generator> {
 }
 
 impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
-    pub fn generate_basis(max_length: usize) -> Vec<LyndonWord<N, T>> {
+    pub fn generate_basis(max_length: usize, topological_sort: bool) -> Vec<LyndonWord<N, T>> {
+        #[cfg(feature = "progress")]
+        let style = ProgressStyle::with_template(
+            "[{eta_precise}] {bar:35.green/white} {pos:>2}/{len:2} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
         let total_words: usize = Self::number_of_words_per_degree(max_length).iter().sum();
 
         #[cfg(feature = "progress")]
-        let mut pb = ProgressBar::new(total_words as u64);
+        let pb = ProgressBar::new(total_words as u64).with_style(style.clone());
         #[cfg(feature = "progress")]
         {
-            pb.message("Generating Lyndon Basis ");
+            pb.set_message("Generating Lyndon Basis ");
             pb.tick();
         }
 
@@ -226,7 +232,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                     .push(LyndonWord::try_from(w.clone()).expect("To make a lyndon word"));
 
                 #[cfg(feature = "progress")]
-                pb.inc();
+                pb.inc(1);
 
                 let m = w.len();
                 while w.len() < max_length as usize {
@@ -242,17 +248,21 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                 break;
             }
         }
-        unsorted_basis.sort_by_key(|word| word.len());
+        unsorted_basis.sort_by_key(|word| (word.len(), word.letters.clone()));
+        if !topological_sort {
+            return unsorted_basis;
+        }
+
         let mut basis = Vec::with_capacity(unsorted_basis.len());
         let mut sorted_basis_index = HashMap::new();
 
         #[cfg(feature = "progress")]
         pb.finish();
         #[cfg(feature = "progress")]
-        let mut pb = ProgressBar::new(max_length as u64);
+        let pb = ProgressBar::new(max_length as u64).with_style(style.clone());
         #[cfg(feature = "progress")]
         {
-            pb.message("Performing Topological Sort ");
+            pb.set_message("Performing Topological Sort ");
             pb.tick();
         }
 
@@ -270,7 +280,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                     basis.push(word.clone());
                 }
                 #[cfg(feature = "progress")]
-                pb.inc();
+                pb.inc(1);
 
                 continue;
             }
@@ -285,7 +295,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                 basis.push(word.clone());
             }
             #[cfg(feature = "progress")]
-            pb.inc();
+            pb.inc(1);
         }
         #[cfg(feature = "progress")]
         pb.finish();
@@ -433,7 +443,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonWord<N, T> {
         factors.push(self.clone());
         if self.len() > 1 {
             let (v, w) = self.factorize();
-            if v.letters[0] == alphabet[0] {
+            if v.letters[0] == alphabet[0] && v.len() == 1 {
                 let w_right_factors = w.right_factors();
                 for factor in w_right_factors {
                     factors.push(factor);
@@ -527,7 +537,7 @@ mod test {
 
     #[test]
     fn test_generate_a_lyndon_basis_1() {
-        let basis = LyndonBasis::<5, u8>::generate_basis(5);
+        let basis = LyndonBasis::<5, u8>::generate_basis(5, true);
         assert_eq!(basis.len(), 829);
         for word in &basis {
             assert!(LyndonWord::<5, u8>::is_lyndon(&word.letters));
@@ -536,7 +546,7 @@ mod test {
 
     #[test]
     fn test_generate_a_lyndon_basis_2() -> Result<(), LyndonWordError> {
-        let basis = LyndonBasis::<2, u8>::generate_basis(5);
+        let basis = LyndonBasis::<2, u8>::generate_basis(5, true);
         let expected_basis = vec![
             LyndonWord::try_from(vec![0])?,
             LyndonWord::try_from(vec![1])?,
@@ -579,8 +589,8 @@ mod test {
     #[case("XY", vec!["XY", "Y"])]
     #[case("XXY", vec!["XXY", "XY", "Y"])]
     #[case("XXXY", vec!["XXXY", "XXY", "XY", "Y"])]
-    #[case("XXYXY", vec![])]
-    #[case("XYXYY", vec![])]
+    #[case("XXYXY", vec!["XXYXY"])]
+    #[case("XYXYY", vec!["XYXYY"])]
     fn test_generate_right_factors(
         #[case] word: &str,
         #[case] expected_factors: Vec<&str>,
@@ -591,6 +601,7 @@ mod test {
             .map(|x| x.parse::<LyndonWord<2, char>>().unwrap())
             .collect::<Vec<_>>();
         let right_factors = lyndon_word.right_factors();
+        assert_eq!(right_factors.len(), expected_lyndon_factors.len());
         for (factor, expected_factor) in right_factors
             .into_iter()
             .zip(expected_lyndon_factors.into_iter())
