@@ -3,7 +3,7 @@ use crate::{
     bch::goldberg_coeff,
     bernoulli_sequence, binomial,
     constants::FACTORIALS,
-    lyndon::{Generator, LyndonBasis, LyndonWord},
+    lyndon::{Generator, Lexicographical, LyndonBasis, LyndonWord, Topological},
     rooted_tree::{GraphPartitionTable, RootedTree},
 };
 use bitvec::prelude::*;
@@ -19,11 +19,11 @@ mod progress_imports {
 pub use progress_imports::*;
 
 /// A Lie series of words with alphabet size `N` and generators of type `T`
-pub struct LieSeries<const N: usize = 2, T: Generator<Letter = T> = u8, U: Int = i128> {
+pub struct LieSeries<const N: usize = 2, T: Generator<Letter = T> = u8> {
     /// Maximum length of the words
     pub max_degree: usize,
     /// The words of the series
-    pub words: Vec<LyndonWord<N, T>>,
+    pub basis: Vec<LyndonWord<N, T>>,
     /// The index of the left factor for a given word index `i`
     pub left_factor: Vec<usize>,
     /// The index of the right factor for a given word index `i`
@@ -32,36 +32,33 @@ pub struct LieSeries<const N: usize = 2, T: Generator<Letter = T> = u8, U: Int =
     pub word_lengths: Vec<usize>,
     /// The starting indices of words with degree `n`
     pub index_of_degree: Vec<usize>,
-    /// The Goldberg coefficients for a given word index `i`
-    pub goldberg_coefficients: Vec<Ratio<U>>,
-    /// The Baker-Campbell-Hausdorff coefficients for a given word index `i`
-    pub bch_coefficients: Vec<Ratio<U>>,
     /// The multi-degree index for a given word index `i`
     pub multi_degree: Vec<usize>,
 }
 
-impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
-    pub fn new(max_degree: usize) -> Self {
+impl<const N: usize, T: Generator<Letter = T>> LieSeries<N, T> {
+    pub fn new(basis: Vec<LyndonWord<N, T>>) -> Self {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:35.green/white} {pos:>2}/{len:2} {msg}",
+            "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
         )
         .unwrap()
         .progress_chars("=>-");
+
+        let max_degree = basis.last().map(|x| x.len()).unwrap_or(0);
         let number_of_words_per_degree =
             LyndonBasis::<N, T>::number_of_words_per_degree(max_degree);
-        let words = LyndonBasis::<N, T>::generate_basis(max_degree, false);
         let mut word_index_map = HashMap::new();
-        for (i, word) in words.iter().enumerate() {
+        for (i, word) in basis.iter().enumerate() {
             word_index_map.insert(word, i);
         }
 
-        let mut left_factor = vec![0; words.len()];
+        let mut left_factor = vec![0; basis.len()];
         for i in 0..N {
             left_factor[i] = i;
         }
-        let mut right_factor = vec![0; words.len()];
-        let mut word_lengths = vec![0; words.len()];
+        let mut right_factor = vec![0; basis.len()];
+        let mut word_lengths = vec![0; basis.len()];
         let mut index_of_degree = vec![0; max_degree + 1];
 
         for n in 1..=max_degree {
@@ -69,23 +66,23 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
         }
 
         #[cfg(feature = "progress")]
-        let pb = ProgressBar::new(words.len() as u64).with_style(style.clone());
+        let pb = ProgressBar::new(basis.len() as u64).with_style(style.clone());
         #[cfg(feature = "progress")]
         {
             pb.set_message("Factorizing Lyndon words ");
             pb.tick();
         }
-        for (i, word) in words.iter().enumerate() {
+        for (i, word) in basis.iter().enumerate() {
             if word.len() > 1 {
                 let (l, r) = word.factorize();
                 for k in index_of_degree[l.len() - 1]..=index_of_degree[l.len()] - 1 {
-                    if words[k] == l {
+                    if basis[k] == l {
                         left_factor[i] = k;
                         break;
                     }
                 }
                 for k in index_of_degree[r.len() - 1]..=index_of_degree[r.len()] - 1 {
-                    if words[k] == r {
+                    if basis[k] == r {
                         right_factor[i] = k;
                         break;
                     }
@@ -99,29 +96,8 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
         #[cfg(feature = "progress")]
         pb.finish();
 
-        let mut goldberg_coefficients = vec![Ratio::default(); words.len()];
-
         let alphabet = T::alphabet::<N>();
-        #[cfg(feature = "progress")]
-        {
-            pb.set_length(0);
-            pb.set_message("Calculating Goldberg Coefficients ");
-            pb.tick();
-        }
-        for (i, word) in words.iter().enumerate() {
-            let goldberg_partition = word.goldberg();
-            let a_first = word.letters[0] == alphabet[0];
-            goldberg_coefficients[i] = goldberg_coeff(goldberg_partition, a_first);
-            #[cfg(feature = "progress")]
-            pb.inc(1);
-        }
-
-        #[cfg(feature = "progress")]
-        pb.finish();
-
-        let mut bch_coefficients = goldberg_coefficients.clone();
-
-        let mut multi_degree = vec![0; words.len()];
+        let mut multi_degree = vec![0; basis.len()];
         let mut alphabet_index = HashMap::new();
         for (i, letter) in alphabet.iter().enumerate() {
             alphabet_index.insert(letter, i);
@@ -133,9 +109,9 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
             pb.set_message("Calculating multi-degree groups ");
             pb.tick();
         }
-        for i in 0..words.len() {
+        for i in 0..basis.len() {
             let mut letter_counts = [0usize; N];
-            let word = &words[i];
+            let word = &basis[i];
             for j in 0..word_lengths[i] {
                 letter_counts[alphabet_index[&word.letters[j]]] += 1;
             }
@@ -144,16 +120,75 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
             pb.inc(1);
         }
         #[cfg(feature = "progress")]
+        pb.finish();
+
+        Self {
+            max_degree,
+            basis,
+            left_factor,
+            right_factor,
+            word_lengths,
+            index_of_degree,
+            multi_degree,
+        }
+    }
+
+    pub fn generate_goldberg_coefficients<U: Int>(&self) -> Vec<Ratio<U>> {
+        #[cfg(feature = "progress")]
+        let style = ProgressStyle::with_template(
+            "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
+
+        let mut goldberg_coefficients = vec![Ratio::default(); self.basis.len()];
+
+        let alphabet = T::alphabet::<N>();
+        #[cfg(feature = "progress")]
+        let pb = ProgressBar::new(self.basis.len() as u64).with_style(style.clone());
+        #[cfg(feature = "progress")]
         {
-            pb.finish();
-            drop(pb);
+            pb.set_position(0);
+            pb.set_message("Calculating Goldberg Coefficients ");
+            pb.tick();
+        }
+        for (i, word) in self.basis.iter().enumerate() {
+            let goldberg_partition = word.goldberg();
+            let a_first = word.letters[0] == alphabet[0];
+            goldberg_coefficients[i] = goldberg_coeff(goldberg_partition, a_first);
+            #[cfg(feature = "progress")]
+            pb.inc(1);
         }
 
+        #[cfg(feature = "progress")]
+        pb.finish();
+
+        goldberg_coefficients
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>> BCHCoefficientGenerator for LieSeries<N, T> {
+    fn generate_bch_coefficients<U: Int>(&self) -> Vec<Ratio<U>> {
+        #[cfg(feature = "progress")]
+        let style = ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
+        #[cfg(feature = "progress")]
+        let style_mb = ProgressStyle::with_template(
+            "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
+        let mut bch_coefficients = self.generate_goldberg_coefficients();
+        let alphabet = T::alphabet::<N>();
+
         // Loop over the words of max degree
-        let start = index_of_degree[max_degree - 1];
-        let end = index_of_degree[max_degree] - 1;
-        let h1 = multi_degree[start];
-        let h2 = multi_degree[end];
+        let start = self.index_of_degree[self.max_degree - 1];
+        let end = self.index_of_degree[self.max_degree] - 1;
+        let h1 = self.multi_degree[start];
+        let h2 = self.multi_degree[end];
 
         #[cfg(feature = "progress")]
         let mb = MultiProgress::new();
@@ -162,24 +197,24 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
         #[cfg(feature = "progress")]
         let p1 = mb.add(ProgressBar::new((h2 - h1 + 1) as u64).with_style(style.clone()));
         #[cfg(feature = "progress")]
-        let p2 = mb.add(ProgressBar::new(0).with_style(style.clone()));
+        let p2 = mb.add(ProgressBar::new(0).with_style(style_mb.clone()));
         #[cfg(feature = "progress")]
-        let p3 = mb.add(ProgressBar::new(0).with_style(style.clone()));
+        let p3 = mb.add(ProgressBar::new(0).with_style(style_mb.clone()));
         #[cfg(feature = "progress")]
-        let p4 = mb.add(ProgressBar::new(0).with_style(style.clone()));
+        let p4 = mb.add(ProgressBar::new(0).with_style(style_mb.clone()));
 
         #[cfg(feature = "progress")]
         p1.set_message("Calculating by multi-degree ");
 
         for h in h1..=h2 {
-            let words_in_group = words[start..=end]
+            let words_in_group = self.basis[start..=end]
                 .iter()
                 .enumerate()
-                .filter(|&(i, _)| multi_degree[i + start] == h)
+                .filter(|&(i, _)| self.multi_degree[i + start] == h)
                 .map(|(i, _)| i + start)
                 .collect::<Vec<_>>();
 
-            let mut matrix_tree = MatrixTree::<N, T>::new(max_degree as u8);
+            let mut matrix_tree = MatrixTree::<N, T>::new(self.max_degree as u8);
             let mut group_matrix_indices = Vec::with_capacity(words_in_group.len());
             #[cfg(feature = "progress")]
             {
@@ -191,16 +226,16 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
 
             for &j in &words_in_group {
                 let (num_factors, right_factors) =
-                    get_right_factors(j, max_degree, &left_factor, &right_factor);
+                    get_right_factors(j, self.max_degree, &self.left_factor, &self.right_factor);
 
                 let rightmost_factor = right_factors[num_factors];
 
                 group_matrix_indices.push(matrix_tree.append(
                     rightmost_factor,
                     num_factors as u8,
-                    &left_factor,
-                    &right_factor,
-                    &word_lengths,
+                    &self.left_factor,
+                    &self.right_factor,
+                    &self.word_lengths,
                 ));
                 #[cfg(feature = "progress")]
                 p2.inc(1);
@@ -223,8 +258,8 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
                 };
 
                 let (num_right_factors, right_factors) =
-                    get_right_factors(i, max_degree, &left_factor, &right_factor);
-                let word = &words[i];
+                    get_right_factors(i, self.max_degree, &self.left_factor, &self.right_factor);
+                let word = &self.basis[i];
                 matrix_tree.run(&mut X, word, stop);
 
                 let mut index_of_non_initial_generator = 0;
@@ -241,8 +276,12 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
                 }
                 for y in 0..x {
                     let j = words_in_group[y];
-                    let (previous_num_right_factors, previous_right_factors) =
-                        get_right_factors(j, max_degree, &left_factor, &right_factor);
+                    let (previous_num_right_factors, previous_right_factors) = get_right_factors(
+                        j,
+                        self.max_degree,
+                        &self.left_factor,
+                        &self.right_factor,
+                    );
                     if index_of_non_initial_generator >= previous_num_right_factors {
                         let d = X[group_matrix_indices[y]];
                         if d != 0 {
@@ -260,7 +299,7 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
                                 let previous_word_coefficient =
                                     bch_coefficients[previous_right_factors[k]].clone();
                                 bch_coefficients[right_factors[k]] -=
-                                    Ratio::new(d.into(), 1.into()) * previous_word_coefficient;
+                                    Ratio::<U>::new(d.into(), 1.into()) * previous_word_coefficient;
                                 #[cfg(feature = "progress")]
                                 {
                                     p4.inc(1);
@@ -289,23 +328,7 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int> LieSeries<N, T, U> {
             p4.finish();
         }
 
-        Self {
-            max_degree,
-            words,
-            left_factor,
-            right_factor,
-            word_lengths,
-            index_of_degree,
-            goldberg_coefficients,
-            bch_coefficients,
-            multi_degree,
-        }
-    }
-}
-
-impl BCHCoefficientGenerator for LieSeries {
-    fn generate_bch_coefficients<U: Int>(&self) -> Vec<Ratio<U>> {
-        todo!()
+        bch_coefficients
     }
 }
 
@@ -481,7 +504,7 @@ pub struct RootedTreeLieSeries<T: Generator<Letter = T> = u8, U: Int = i128> {
 
 impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
     pub fn new(n: usize) -> Self {
-        let t_n = LyndonBasis::<2, T>::generate_basis(n, true)
+        let t_n = LyndonBasis::<2, T, Topological>::generate_basis(n)
             .into_iter()
             .map(|w| RootedTree::from(w))
             .collect::<Vec<_>>();
@@ -650,7 +673,7 @@ mod test {
     fn test_lie_series_construction() {
         let lie_series = LieSeries::<2, char>::new(5);
         assert_eq!(lie_series.max_degree, 5);
-        assert_eq!(lie_series.words.len(), 14);
+        assert_eq!(lie_series.basis.len(), 14);
         let expected_left_factor = vec![
             0, // A
             1, // B

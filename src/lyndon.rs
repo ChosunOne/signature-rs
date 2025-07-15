@@ -184,16 +184,22 @@ impl Generator for char {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Lexicographical;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Topological;
+
 #[derive(Default, Debug, Clone, Copy)]
-pub struct LyndonBasis<const N: usize, T: Generator> {
+pub struct LyndonBasis<const N: usize, T: Generator = u8, U = Topological> {
     _generator: PhantomData<T>,
+    _sort: PhantomData<U>,
 }
 
-impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
-    pub fn generate_basis(max_length: usize, topological_sort: bool) -> Vec<LyndonWord<N, T>> {
+impl<const N: usize, T: Generator<Letter = T>, U> LyndonBasis<N, T, U> {
+    fn _generate_basis(max_length: usize) -> Vec<LyndonWord<N, T>> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
-            "[{eta_precise}] {bar:35.green/white} {pos:>2}/{len:2} {msg}",
+            "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
         )
         .unwrap()
         .progress_chars("=>-");
@@ -214,9 +220,9 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
             .enumerate()
             .map(|(i, v)| (v, i))
             .collect();
-        let mut unsorted_basis = Vec::with_capacity(total_words);
+        let mut basis = Vec::with_capacity(total_words);
         if max_length == 0 {
-            return unsorted_basis;
+            return basis;
         }
         let mut w = vec![];
 
@@ -228,8 +234,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
             }
 
             if !w.is_empty() && w.len() <= max_length && *w.last().unwrap() <= alphabet[N - 1] {
-                unsorted_basis
-                    .push(LyndonWord::try_from(w.clone()).expect("To make a lyndon word"));
+                basis.push(LyndonWord::try_from(w.clone()).expect("To make a lyndon word"));
 
                 #[cfg(feature = "progress")]
                 pb.inc(1);
@@ -248,55 +253,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
                 break;
             }
         }
-        unsorted_basis.sort_by_key(|word| (word.len(), word.letters.clone()));
-        if !topological_sort {
-            return unsorted_basis;
-        }
-
-        let mut basis = Vec::with_capacity(unsorted_basis.len());
-        let mut sorted_basis_index = HashMap::new();
-
-        #[cfg(feature = "progress")]
-        pb.finish();
-        #[cfg(feature = "progress")]
-        let pb = ProgressBar::new(max_length as u64).with_style(style.clone());
-        #[cfg(feature = "progress")]
-        {
-            pb.set_message("Performing Topological Sort ");
-            pb.tick();
-        }
-
-        for level in 1..=max_length {
-            let mut unsorted_words_by_level = unsorted_basis
-                .iter()
-                .filter(|word| word.len() == level)
-                .collect::<Vec<_>>();
-
-            if level == 1 {
-                // Sort lexicographically
-                unsorted_words_by_level.sort_by_key(|&w| w);
-                for word in unsorted_words_by_level {
-                    sorted_basis_index.insert(word.clone(), basis.len());
-                    basis.push(word.clone());
-                }
-                #[cfg(feature = "progress")]
-                pb.inc(1);
-
-                continue;
-            }
-
-            // Topological Sort
-            unsorted_words_by_level.sort_by_key(|w| {
-                let (_, i_dp) = w.factorize();
-                sorted_basis_index[&i_dp]
-            });
-            for word in unsorted_words_by_level {
-                sorted_basis_index.insert(word.clone(), basis.len());
-                basis.push(word.clone());
-            }
-            #[cfg(feature = "progress")]
-            pb.inc(1);
-        }
+        basis.sort_by_key(|word| (word.len(), word.letters.clone()));
         #[cfg(feature = "progress")]
         pb.finish();
 
@@ -325,6 +282,75 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T> {
         }
 
         words_per_degree
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Topological> {
+    pub fn generate_basis(max_length: usize) -> Vec<LyndonWord<N, T>> {
+        let basis = Self::_generate_basis(max_length);
+        Self::topological_sort(basis)
+    }
+
+    fn topological_sort(basis: Vec<LyndonWord<N, T>>) -> Vec<LyndonWord<N, T>> {
+        #[cfg(feature = "progress")]
+        let style = ProgressStyle::with_template(
+            "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
+        let max_length = basis.last().map(|x| x.len()).unwrap_or(0);
+        let mut sorted_basis = Vec::with_capacity(basis.len());
+        let mut sorted_basis_index = HashMap::new();
+
+        #[cfg(feature = "progress")]
+        let pb = ProgressBar::new(max_length as u64).with_style(style.clone());
+        #[cfg(feature = "progress")]
+        {
+            pb.set_message("Performing Topological Sort ");
+            pb.tick();
+        }
+
+        for level in 1..=max_length {
+            let mut unsorted_words_by_level = basis
+                .iter()
+                .filter(|word| word.len() == level)
+                .collect::<Vec<_>>();
+
+            if level == 1 {
+                // Sort lexicographically
+                unsorted_words_by_level.sort_by_key(|&w| w);
+                for word in unsorted_words_by_level {
+                    sorted_basis_index.insert(word.clone(), basis.len());
+                    sorted_basis.push(word.clone());
+                }
+                #[cfg(feature = "progress")]
+                pb.inc(1);
+
+                continue;
+            }
+
+            // Topological Sort
+            unsorted_words_by_level.sort_by_key(|w| {
+                let (_, i_dp) = w.factorize();
+                sorted_basis_index[&i_dp]
+            });
+            for word in unsorted_words_by_level {
+                sorted_basis_index.insert(word.clone(), basis.len());
+                sorted_basis.push(word.clone());
+            }
+            #[cfg(feature = "progress")]
+            pb.inc(1);
+        }
+        #[cfg(feature = "progress")]
+        pb.finish();
+
+        basis
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Lexicographical> {
+    pub fn generate_basis(max_length: usize) -> Vec<LyndonWord<N, T>> {
+        Self::_generate_basis(max_length)
     }
 }
 

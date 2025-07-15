@@ -5,6 +5,8 @@ use std::{
 };
 
 use crate::lyndon::{Generator, LyndonWord, LyndonWordError};
+#[cfg(feature = "progress")]
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Default, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RootedTree<T: Generator<Letter = T>> {
@@ -157,7 +159,14 @@ pub struct GraphPartitionTable<T: Generator<Letter = T>> {
 impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
     pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
         #[cfg(feature = "progress")]
-        let mut pb = ProgressBar::new(t_n.len() as u64);
+        let style = ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:35.green/white} {pos:>2}/{len:2} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
+
+        #[cfg(feature = "progress")]
+        let pb = ProgressBar::new(t_n.len() as u64).with_style(style.clone());
         #[cfg(feature = "progress")]
         {
             pb.set_message("Generating Partition Table ");

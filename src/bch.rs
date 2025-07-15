@@ -1,6 +1,9 @@
 use num_rational::Ratio;
 
-use crate::{FACTORIALS, Int, PRIMES};
+use crate::{
+    Int,
+    constants::{FACTORIALS, PRIMES},
+};
 
 pub fn p_adic_expansion(n: usize, p: i128) -> Vec<i128> {
     let mut num = n as i128;
