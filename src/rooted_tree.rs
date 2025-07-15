@@ -437,7 +437,7 @@ mod test {
 
     #[test]
     fn test_graph_partition_table() {
-        let t_n = LyndonBasis::<2, char>::generate_basis(5, true)
+        let t_n = LyndonBasis::<2, char>::generate_basis(5)
             .into_iter()
             .map(|w| RootedTree::from(w))
             .collect::<Vec<_>>();

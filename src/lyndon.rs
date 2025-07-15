@@ -320,7 +320,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Topological> {
                 // Sort lexicographically
                 unsorted_words_by_level.sort_by_key(|&w| w);
                 for word in unsorted_words_by_level {
-                    sorted_basis_index.insert(word.clone(), basis.len());
+                    sorted_basis_index.insert(word.clone(), sorted_basis.len());
                     sorted_basis.push(word.clone());
                 }
                 #[cfg(feature = "progress")]
@@ -335,7 +335,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Topological> {
                 sorted_basis_index[&i_dp]
             });
             for word in unsorted_words_by_level {
-                sorted_basis_index.insert(word.clone(), basis.len());
+                sorted_basis_index.insert(word.clone(), sorted_basis.len());
                 sorted_basis.push(word.clone());
             }
             #[cfg(feature = "progress")]
@@ -344,7 +344,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Topological> {
         #[cfg(feature = "progress")]
         pb.finish();
 
-        basis
+        sorted_basis
     }
 }
 
@@ -563,7 +563,7 @@ mod test {
 
     #[test]
     fn test_generate_a_lyndon_basis_1() {
-        let basis = LyndonBasis::<5, u8>::generate_basis(5, true);
+        let basis = LyndonBasis::<5, u8>::generate_basis(5);
         assert_eq!(basis.len(), 829);
         for word in &basis {
             assert!(LyndonWord::<5, u8>::is_lyndon(&word.letters));
@@ -572,7 +572,7 @@ mod test {
 
     #[test]
     fn test_generate_a_lyndon_basis_2() -> Result<(), LyndonWordError> {
-        let basis = LyndonBasis::<2, u8>::generate_basis(5, true);
+        let basis = LyndonBasis::<2, u8>::generate_basis(5);
         let expected_basis = vec![
             LyndonWord::try_from(vec![0])?,
             LyndonWord::try_from(vec![1])?,
