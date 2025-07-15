@@ -1,4 +1,6 @@
-use crate::{FACTORIALS, PRIMES, Rational};
+use num_rational::Ratio;
+
+use crate::{FACTORIALS, Int, PRIMES};
 
 pub fn p_adic_expansion(n: usize, p: i128) -> Vec<i128> {
     let mut num = n as i128;
@@ -32,11 +34,11 @@ pub fn bch_denominator(n: usize) -> i128 {
     prod
 }
 
-pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> Rational {
+pub fn goldberg_coeff<U: Int>(q: Vec<usize>, a_first: bool) -> Ratio<U> {
     let n = q.iter().sum();
     let d = FACTORIALS[n] * bch_denominator(n);
     let m = q.len();
-    let mut c = vec![Rational::default(); n * n];
+    let mut c = vec![Ratio::<U>::default(); n * n];
     let mut a_current = a_first;
     if m % 2 == 0 {
         a_current = !a_first;
@@ -45,40 +47,47 @@ pub fn goldberg_coeff(q: Vec<usize>, a_first: bool) -> Rational {
     for i in (0..m).rev() {
         for r in 1..=q[i] {
             l += 1;
-            let mut h = Rational::default();
+            let mut h = Ratio::<U>::default();
             if i == m - 1 {
-                h = Rational::new(d, FACTORIALS[l]);
+                h = Ratio::new(d.into(), FACTORIALS[l].into());
             } else if a_current && i == m - 2 {
-                h = Rational::new(d, FACTORIALS[r] * FACTORIALS[q[i + 1]]);
+                h = Ratio::new(d.into(), (FACTORIALS[r] * FACTORIALS[q[i + 1]]).into());
             }
             c[(l - 1) * n] = h;
             for k in 2..l {
-                h = 0.into();
+                h = Ratio::from_integer(0.into());
                 for j in 1..=r {
-                    if l > j && c[k - 2 + n * (l - j - 1)] != 0.into() {
-                        h += c[k - 2 + n * (l - j - 1)] * Rational::new(1, FACTORIALS[j]);
+                    if l > j && c[k - 2 + n * (l - j - 1)] != Ratio::from_integer(0.into()) {
+                        h += &c[k - 2 + n * (l - j - 1)]
+                            * Ratio::<U>::new(1.into(), FACTORIALS[j].into());
                     }
                 }
                 if a_current && i <= m - 2 {
                     for j in 1..=q[i + 1] {
-                        if l > r + j && c[k - 2 + n * (l - r - j - 1)] != 0.into() {
-                            h += c[k - 2 + n * (l - r - j - 1)]
-                                * Rational::new(1, FACTORIALS[r] * FACTORIALS[j]);
+                        if l > r + j
+                            && c[k - 2 + n * (l - r - j - 1)] != Ratio::from_integer(0.into())
+                        {
+                            h += &c[k - 2 + n * (l - r - j - 1)]
+                                * Ratio::<U>::new(1.into(), (FACTORIALS[r] * FACTORIALS[j]).into());
                         }
                     }
                 }
                 c[k - 1 + n * (l - 1)] = h;
             }
-            c[l - 1 + n * (l - 1)] = Rational::new(d, 1);
+            c[l - 1 + n * (l - 1)] = Ratio::<U>::new(d.into(), 1.into());
         }
         a_current = !a_current;
     }
-    let mut sum = Rational::default();
+    let mut sum = Ratio::<U>::default();
     for k in 1..=n {
-        let denom = if k % 2 != 0 { k as i128 } else { -(k as i128) };
-        sum += c[k - 1 + n * (n - 1)] * Rational::new(1, denom);
+        let denom: U = if k % 2 != 0 {
+            (k as u64).into()
+        } else {
+            (-(k as i64)).into()
+        };
+        sum += &c[k - 1 + n * (n - 1)] * Ratio::new(1.into(), denom);
     }
-    sum * Rational::new(1.into(), d.into())
+    sum * Ratio::<U>::new(1.into(), d.into())
 }
 
 #[cfg(test)]
@@ -111,19 +120,19 @@ mod test {
     }
 
     #[rstest]
-    #[case(vec![1], true, Rational::new(1.into(), 1.into()))]
-    #[case(vec![1], false, Rational::new(1.into(), 1.into()))]
-    #[case(vec![1, 1], true, Rational::new(1.into(), 2.into()))]
-    #[case(vec![2, 1], true, Rational::new(1.into(), 12.into()))]
-    #[case(vec![2, 2], true, Rational::new(1.into(), 24.into()))]
-    #[case(vec![3, 1], true, Rational::default())]
-    #[case(vec![3, 2], true, Rational::new(1.into(), 180.into()))]
-    #[case(vec![4, 1], true, Rational::new((-1).into(), 720.into()))]
-    #[case(vec![2, 1, 1, 1], true, Rational::new((-1).into(), 120.into()))]
+    #[case(vec![1], true, Ratio::new(1.into(), 1.into()))]
+    #[case(vec![1], false, Ratio::new(1.into(), 1.into()))]
+    #[case(vec![1, 1], true, Ratio::new(1.into(), 2.into()))]
+    #[case(vec![2, 1], true, Ratio::new(1.into(), 12.into()))]
+    #[case(vec![2, 2], true, Ratio::new(1.into(), 24.into()))]
+    #[case(vec![3, 1], true, Ratio::default())]
+    #[case(vec![3, 2], true, Ratio::new(1.into(), 180.into()))]
+    #[case(vec![4, 1], true, Ratio::new((-1).into(), 720.into()))]
+    #[case(vec![2, 1, 1, 1], true, Ratio::new((-1).into(), 120.into()))]
     fn test_goldberg_coeff(
         #[case] q_m: Vec<usize>,
         #[case] a_first: bool,
-        #[case] expected_coeff: Rational,
+        #[case] expected_coeff: Ratio<i128>,
     ) {
         dbg!(&q_m);
         dbg!(a_first);

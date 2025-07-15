@@ -1,4 +1,8 @@
-use std::hash::Hash;
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    ops::{Index, IndexMut},
+};
 
 use crate::lyndon::{Generator, LyndonWord, LyndonWordError};
 
@@ -124,11 +128,137 @@ impl<const N: usize, T: Generator<Letter = T>> TryFrom<&RootedTree<T>> for Lyndo
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct EdgePartitions {
+    pub partitions: Vec<(usize, usize)>,
+}
+
+impl Index<usize> for EdgePartitions {
+    type Output = (usize, usize);
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.partitions[index]
+    }
+}
+
+impl IndexMut<usize> for EdgePartitions {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.partitions[index]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphPartitionTable<T: Generator<Letter = T>> {
+    t_n: Vec<RootedTree<T>>,
+    degree: Vec<usize>,
+    s: Vec<EdgePartitions>,
+}
+
+impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
+    pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
+        #[cfg(feature = "progress")]
+        let mut pb = ProgressBar::new(t_n.len() as u64);
+        #[cfg(feature = "progress")]
+        {
+            pb.set_message("Generating Partition Table ");
+            pb.tick();
+        }
+
+        let mut degree = Vec::with_capacity(t_n.len());
+        let mut tree_t_n_map = HashMap::<RootedTree<T>, usize>::new();
+        for (i, tree) in t_n.iter().enumerate() {
+            degree.push(tree.degree());
+            tree_t_n_map.insert(tree.clone(), i);
+        }
+        let mut s = vec![EdgePartitions::default(); t_n.len()];
+        let mut i = 0;
+        while i < t_n.len() {
+            let tree = &t_n[i];
+            let Some((v, w)) = tree.factorize() else {
+                i += 1;
+                #[cfg(feature = "progress")]
+                pb.inc(1);
+
+                continue;
+            };
+            let v_idx = tree_t_n_map[&v];
+            let w_idx = tree_t_n_map[&w];
+            s[i].partitions.push((v_idx, w_idx));
+
+            for p in 0..v.degree() - 1 {
+                let s_v = &s[v_idx];
+                let mut v_root_w = t_n[s_v[p].0].clone();
+                v_root_w.graft(w.clone());
+                let v_comp = t_n[s_v[p].1].clone();
+                if !tree_t_n_map.contains_key(&v_root_w) {
+                    #[cfg(feature = "progress")]
+                    {
+                        pb.inc_length(1);
+                        pb.inc(1);
+                    }
+                    t_n.push(v_root_w.clone());
+                    degree.push(v_root_w.degree());
+                    tree_t_n_map.insert(v_root_w.clone(), t_n.len() - 1);
+                    s.push(EdgePartitions::default());
+                }
+                s[i].partitions
+                    .push((tree_t_n_map[&v_root_w], tree_t_n_map[&v_comp]));
+            }
+            for q in 0..w.degree() - 1 {
+                let s_w = &s[w_idx];
+                let mut v_w_root = v.clone();
+                let w_root = t_n[s_w[q].0].clone();
+                v_w_root.graft(w_root);
+                let w_comp = t_n[s_w[q].1].clone();
+                if !tree_t_n_map.contains_key(&v_w_root) {
+                    #[cfg(feature = "progress")]
+                    {
+                        pb.inc_length(1);
+                        pb.inc(1);
+                    }
+                    t_n.push(v_w_root.clone());
+                    degree.push(v_w_root.degree());
+                    tree_t_n_map.insert(v_w_root.clone(), t_n.len() - 1);
+                    s.push(EdgePartitions::default());
+                }
+                s[i].partitions
+                    .push((tree_t_n_map[&v_w_root], tree_t_n_map[&w_comp]));
+            }
+            i += 1;
+            #[cfg(feature = "progress")]
+            pb.inc(1);
+        }
+
+        #[cfg(feature = "progress")]
+        pb.finish();
+
+        Self { degree, t_n, s }
+    }
+
+    pub fn partitions(&self, i: usize) -> &EdgePartitions {
+        &self.s[i]
+    }
+
+    pub fn degree(&self, i: usize) -> usize {
+        self.degree[i]
+    }
+
+    pub fn tree(&self, i: usize) -> &RootedTree<T> {
+        &self.t_n[i]
+    }
+
+    pub fn tm_n(&self) -> usize {
+        self.t_n.len()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
 
     use rstest::rstest;
+
+    use crate::lyndon::LyndonBasis;
 
     use super::*;
 
@@ -294,5 +424,48 @@ mod test {
         grafted_tree_2.graft(RootedTree::new('X'));
 
         assert!(tree_set.contains(&grafted_tree_2));
+    }
+
+    #[test]
+    fn test_graph_partition_table() {
+        let t_n = LyndonBasis::<2, char>::generate_basis(5, true)
+            .into_iter()
+            .map(|w| RootedTree::from(w))
+            .collect::<Vec<_>>();
+        let m_n = t_n.len();
+        let graph_partition_table = GraphPartitionTable::new(t_n);
+        let expected_s = vec![
+            vec![],                                             // X
+            vec![],                                             // Y
+            vec![(0, 1)],                                       // XY
+            vec![(2, 1), (2, 1)],                               // XYY
+            vec![(0, 2), (m_n, 1)],                             // XXY
+            vec![(3, 1), (3, 1), (3, 1)],                       // XYYY
+            vec![(0, 3), (4, 1), (4, 1)],                       // XXYY
+            vec![(0, 4), (m_n, 2), (m_n + 1, 1)],               // XXXY
+            vec![(5, 1), (5, 1), (5, 1), (5, 1)],               // XYYYY
+            vec![(4, 2), (4, 2), (m_n + 2, 1), (m_n + 2, 1)],   // XXYXY
+            vec![(2, 3), (6, 1), (m_n + 3, 1), (m_n + 3, 1)],   // XYXYY
+            vec![(0, 5), (6, 1), (6, 1), (6, 1)],               // XXYYY
+            vec![(0, 6), (m_n, 3), (7, 1), (7, 1)],             // XXXYY
+            vec![(0, 7), (m_n, 4), (m_n + 1, 2), (m_n + 4, 1)], // XXXXY
+            // Auxiliary S values
+            vec![(0, 0)],                                 // (X) -> (X)
+            vec![(0, m_n), (m_n, 0)],                     // (X) -> (X) -> (X)
+            vec![(m_n, 2), (4, 0), (m_n + 5, 1)],         // (X) <- (X) -> (X) -> (Y)
+            vec![(2, 2), (4, 1), (m_n + 6, 1)],           // (Y) <- (X) -> (X) -> (Y)
+            vec![(0, m_n + 1), (m_n, m_n), (m_n + 1, 0)], // (X) -> (X) -> (X) -> (X)
+            vec![(m_n, 0), (m_n, 0)],                     // (X) <- (X) -> (X)
+            vec![(m_n, 1), (2, 0)],                       // (Y) <- (X) -> (X)
+        ];
+        for (i, (s_ui, expected_s_ui)) in graph_partition_table
+            .s
+            .iter()
+            .zip(expected_s.iter())
+            .enumerate()
+        {
+            dbg!(i);
+            assert_eq!(&s_ui.partitions, expected_s_ui);
+        }
     }
 }

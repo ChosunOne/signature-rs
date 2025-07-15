@@ -360,6 +360,7 @@ version = "0.1.0"
 dependencies = [
  "bitvec",
  "indicatif",
+ "num-bigint",
  "num-integer",
  "num-rational",
  "rstest",
