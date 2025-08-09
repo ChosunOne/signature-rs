@@ -1,18 +1,23 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::ops::{Index, IndexMut};
 
 use num_rational::Ratio;
 
 use crate::{
-    Commutator, Int,
+    Int, comm,
+    commutator::{Commutator, CommutatorTerm},
     lyndon::{Generator, LyndonWord},
 };
 
-pub struct LieSeries<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> {
+pub struct LieSeries<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> {
     /// The Lyndon basis for the series
     basis: Vec<LyndonWord<N, T>>,
     /// The commutator basis for the series
-    commutator_basis: Vec<CommutatorExpression<U, T>>,
+    commutator_basis: Vec<CommutatorTerm<U, T>>,
+    /// A map for converting arbitrary commutator terms to basis elements
+    commutator_basis_map: HashMap<CommutatorTerm<U, T>, CommutatorTerm<U, T>>,
     /// The coefficients for each of the terms in the series
     coefficients: Vec<Ratio<U>>,
     /// The left factors of each word in the basis
@@ -23,7 +28,7 @@ pub struct LieSeries<const N: usize, T: Generator<Letter = T>, U: Int + Send + S
     terms: Vec<Ratio<U>>,
 }
 
-impl<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> Index<usize>
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Index<usize>
     for LieSeries<N, T, U>
 {
     type Output = Ratio<U>;
@@ -33,7 +38,7 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> Index<usize
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> IndexMut<usize>
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> IndexMut<usize>
     for LieSeries<N, T, U>
 {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
@@ -41,7 +46,7 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> IndexMut<us
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> LieSeries<N, T, U> {
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> LieSeries<N, T, U> {
     pub fn new(
         basis: Vec<LyndonWord<N, T>>,
         coefficients: Vec<Ratio<U>>,
@@ -51,16 +56,26 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> LieSeries<N
     ) -> Self {
         let mut commutator_basis = Vec::with_capacity(basis.len());
         for word in basis.iter() {
-            if word.len() == 1 {
-                commutator_basis.push(
-                    CommutatorExpression::<U, T>::try_from(word).expect("Failed to make term"),
-                );
+            commutator_basis.push(CommutatorTerm::from(word));
+        }
+        let mut commutator_basis_map = HashMap::new();
+
+        for a in commutator_basis.iter() {
+            for b in commutator_basis.iter() {
+                if a == b {
+                    continue;
+                }
+                let term = comm![a, b];
+                let mut lyndon_term = term.clone();
+                lyndon_term.lyndon_sort();
+                commutator_basis_map.insert(term, lyndon_term);
             }
         }
 
         Self {
             basis,
             commutator_basis,
+            commutator_basis_map,
             coefficients,
             left_factors,
             right_factors,
@@ -69,7 +84,7 @@ impl<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> LieSeries<N
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Debug + Clone, U: Int + Send + Sync>
+impl<const N: usize, T: Generator<Letter = T> + Debug + Clone, U: Hash + Int + Send + Sync>
     Commutator<&Self> for LieSeries<N, T, U>
 {
     type Output = Self;
@@ -130,136 +145,5 @@ impl<const N: usize, T: Generator<Letter = T> + Debug + Clone, U: Int + Send + S
             for j in 0..other.terms.len() {}
         }
         todo!()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CommutatorTerm<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> {
-    Atom(U),
-    Expression(CommutatorExpression<T, U>),
-}
-
-// [a, b], [a, b] => Equal
-// [b, a], [a, b] => Greater
-// [b, a], [a, [b, a]] => Greater
-// [a, [b, a]], [a, [a, b]] => Greater
-// [b, a], [b] => Greater
-// [b], [b, a] => Less
-
-impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> PartialOrd
-    for CommutatorTerm<T, U>
-{
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (CommutatorTerm::Atom(a), CommutatorTerm::Atom(b)) => a.partial_cmp(b),
-            (CommutatorTerm::Atom(_), CommutatorTerm::Expression(b)) => {
-                match self.partial_cmp(&(*b.left)) {
-                    Some(o) => match o {
-                        std::cmp::Ordering::Equal => Some(std::cmp::Ordering::Less),
-                        _ => Some(o),
-                    },
-                    None => None,
-                }
-            }
-            (CommutatorTerm::Expression(e), CommutatorTerm::Atom(_)) => {
-                match (*e.left).partial_cmp(other) {
-                    Some(o) => match o {
-                        std::cmp::Ordering::Equal => Some(std::cmp::Ordering::Greater),
-                        _ => Some(o),
-                    },
-                    None => None,
-                }
-            }
-            (CommutatorTerm::Expression(s_e), CommutatorTerm::Expression(o_e)) => {
-                match s_e.left.partial_cmp(&o_e.left) {
-                    Some(o) => match o {
-                        std::cmp::Ordering::Equal => s_e.right.partial_cmp(&o_e.right),
-                        _ => Some(o),
-                    },
-                    None => None,
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CommutatorExpressionError {
-    TooShort,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CommutatorExpression<
-    T: Debug + Int + PartialEq + Eq,
-    U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord,
-> {
-    coefficient: T,
-    left: Box<CommutatorTerm<T, U>>,
-    right: Box<CommutatorTerm<T, U>>,
-}
-
-impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + Ord + PartialOrd>
-    CommutatorExpression<T, U>
-{
-    /// Implements `[A, B] = -[B, A]`
-    pub fn anti_symm(&self) -> Self {
-        Self {
-            coefficient: -self.coefficient.clone(),
-            left: self.right.clone(),
-            right: self.left.clone(),
-        }
-    }
-}
-
-impl<const N: usize, T: Int, U: Generator<Letter = U> + Debug + Clone> TryFrom<&LyndonWord<N, U>>
-    for CommutatorExpression<T, U>
-{
-    type Error = CommutatorExpressionError;
-
-    fn try_from(value: &LyndonWord<N, U>) -> Result<Self, Self::Error> {
-        if value.len() <= 1 {
-            return Err(CommutatorExpressionError::TooShort);
-        }
-
-        let (left, right) = value.factorize();
-        let left = if left.len() == 1 {
-            Box::new(CommutatorTerm::Atom(left.letters[0]))
-        } else {
-            Box::new(CommutatorTerm::Expression(Self::try_from(&left)?))
-        };
-        let right = if right.len() == 1 {
-            Box::new(CommutatorTerm::Atom(right.letters[0]))
-        } else {
-            Box::new(CommutatorTerm::Expression(Self::try_from(&right)?))
-        };
-
-        Ok(Self {
-            coefficient: T::from(1),
-            left,
-            right,
-        })
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::lyndon::LyndonWordError;
-
-    use super::*;
-    use rstest::rstest;
-
-    #[rstest]
-    #[case("XY", CommutatorExpression::<i128, char> { coefficient: 1, left: Box::new(CommutatorTerm::<i128, char>::Atom('X')), right: Box::new(CommutatorTerm::<i128, char>::Atom('Y'))})]
-    #[case("XXY", CommutatorExpression::<i128, char> {coefficient: 1, left: Box::new(CommutatorTerm::<i128, char>::Atom('X')), right: Box::new(CommutatorTerm::Expression(CommutatorExpression::<i128, char> { coefficient: 1, left: Box::new(CommutatorTerm::<i128, char>::Atom('X')), right: Box::new(CommutatorTerm::Atom('Y')) })) })]
-    fn test_commutator_expression(
-        #[case] word: &str,
-        #[case] expected_expression: CommutatorExpression<i128, char>,
-    ) -> Result<(), LyndonWordError> {
-        let word = word.parse::<LyndonWord<2, char>>()?;
-        let expression = CommutatorExpression::<i128, char>::try_from(&word)
-            .expect("Failed to create expression");
-        assert_eq!(expression, expected_expression);
-
-        Ok(())
     }
 }

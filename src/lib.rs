@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::ops::{AddAssign, DivAssign, MulAssign, Neg, RemAssign, SubAssign};
 
 #[cfg(feature = "progress")]
@@ -13,6 +14,7 @@ use crate::lyndon::Generator;
 
 pub mod bch;
 pub mod bch_series_generator;
+pub mod commutator;
 pub mod constants;
 pub mod lie_series;
 pub mod lyndon;
@@ -44,29 +46,9 @@ pub trait BCHCoefficientGenerator {
     fn generate_bch_coefficients<U: Int + Send + Sync>(&self) -> Vec<Ratio<U>>;
 }
 
-pub trait LieSeriesGenerator<const N: usize, T: Generator<Letter = T>, U: Int + Send + Sync> {
+pub trait LieSeriesGenerator<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync>
+{
     fn generate_lie_series(&self) -> LieSeries<N, T, U>;
-}
-
-pub trait Commutator<Rhs = Self> {
-    type Output;
-    /// The commutator operation is represented with `[A, B]` and commonly represents `AB - BA`
-    fn commutator(&self, other: Rhs) -> Self::Output;
-}
-
-impl<T: Int> Commutator<&Self> for T {
-    type Output = T;
-
-    fn commutator(&self, other: &Self) -> Self::Output {
-        self.clone() * other.clone() - other.clone() * self.clone()
-    }
-}
-
-/// Shorthand for applying the commutator operation `[A, B]`.
-macro_rules! comm {
-    ($a:expr, $b:expr) => {
-        $a.commutator(&$b)
-    };
 }
 
 fn binomial<U: Int>(n: usize, k: usize) -> U {
@@ -138,18 +120,5 @@ mod test {
         for (term, expected_term) in seq.iter().zip(&expected_seq) {
             assert_eq!(term, expected_term);
         }
-    }
-
-    #[test]
-    fn test_commutators_int() {
-        assert_eq!(comm![1, 2], 0);
-    }
-
-    #[test]
-    fn test_commutators_bigint() {
-        let a = BigInt::from(1);
-        let b = BigInt::from(2);
-
-        assert_eq!(comm![a, b], BigInt::from(0));
     }
 }

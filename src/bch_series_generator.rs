@@ -10,7 +10,7 @@ use crate::{
 use bitvec::prelude::*;
 use num_rational::Ratio;
 use rayon::prelude::*;
-use std::{collections::HashMap, marker::PhantomData};
+use std::{collections::HashMap, hash::Hash, marker::PhantomData};
 
 #[cfg(feature = "progress")]
 mod progress_imports {
@@ -311,7 +311,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BCHCoefficientGener
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Send + Sync>
+impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Hash + Int + Send + Sync>
     LieSeriesGenerator<N, T, U> for BchSeriesGenerator<N, T>
 {
     fn generate_lie_series(&self) -> LieSeries<N, T, U> {
