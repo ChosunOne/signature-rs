@@ -317,11 +317,8 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Hash + Int + Sen
     fn generate_lie_series(&self) -> LieSeries<N, T, U> {
         let basis = self.basis.clone();
         let coefficients = self.generate_bch_coefficients::<U>();
-        let left_factors = self.left_factor.clone();
-        let right_factors = self.right_factor.clone();
-        let terms = vec![Ratio::default(); basis.len()];
 
-        LieSeries::new(basis, coefficients, left_factors, right_factors, terms)
+        LieSeries::new(basis, coefficients)
     }
 }
 

@@ -176,7 +176,7 @@ pub struct CommutatorExpression<
     T: Debug + Int + PartialEq + Eq,
     U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord,
 > {
-    coefficient: T,
+    pub coefficient: T,
     left: Box<CommutatorTerm<T, U>>,
     right: Box<CommutatorTerm<T, U>>,
 }
