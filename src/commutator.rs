@@ -2,7 +2,7 @@ use crate::{
     Int,
     lyndon::{Generator, LyndonWord},
 };
-use std::fmt::Debug;
+use std::{fmt::Debug, ops::Mul};
 
 pub trait Commutator<Rhs = Self> {
     type Output;
@@ -27,7 +27,7 @@ macro_rules! comm {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CommutatorTerm<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> {
+pub enum CommutatorTerm<T: Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> {
     Atom(U),
     Expression(CommutatorExpression<T, U>),
 }
@@ -253,6 +253,92 @@ impl<const N: usize, T: Int, U: Generator<Letter = U> + Debug + Clone> TryFrom<&
             left,
             right,
         })
+    }
+}
+
+/// This can represent terms of the form `αe_1⋅⋅⋅e_n`
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormalIndeterminate<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> {
+    coefficient: U,
+    symbols: Vec<T>,
+}
+
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> Mul
+    for &FormalIndeterminate<T, U>
+{
+    type Output = FormalIndeterminate<T, U>;
+
+    /// For formal indeterminates, `e_1 ⊗ e_2 = e_1e_2`
+    fn mul(self, rhs: Self) -> Self::Output {
+        let mut symbols = self.symbols.clone();
+        symbols.append(&mut rhs.symbols.clone());
+        let coefficient = self.coefficient.clone() * rhs.coefficient.clone();
+        FormalIndeterminate {
+            coefficient,
+            symbols,
+        }
+    }
+}
+
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> Mul<U>
+    for &FormalIndeterminate<T, U>
+{
+    type Output = FormalIndeterminate<T, U>;
+
+    fn mul(self, rhs: U) -> Self::Output {
+        FormalIndeterminate {
+            coefficient: self.coefficient.clone() * rhs,
+            symbols: self.symbols.clone()
+        }
+    }
+}
+
+
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> From<&CommutatorTerm<U, T>>
+    for Vec<FormalIndeterminate<T, U>>
+{
+    fn from(value: &CommutatorTerm<U, T>) -> Self {
+        match value {
+            CommutatorTerm::Atom(a) => vec![FormalIndeterminate::<T, U> {
+                coefficient: U::from(1),
+                symbols: vec![a.clone()],
+            }],
+            CommutatorTerm::Expression(e) => {
+                let mut left = Self::from(&*e.left);
+                match &*e.left {
+                    CommutatorTerm::Expression(l) => {
+                        for e_i in left.iter_mut() {
+                            e_i.coefficient *= l.coefficient.clone();
+                        }
+                    }
+                    _ => {}
+                }
+                let mut right = Self::from(&*e.right);
+                match &*e.right {
+                    CommutatorTerm::Expression(r) => {
+                        for e_i in right.iter_mut() {
+                            e_i.coefficient *= r.coefficient.clone();
+                        }
+                    }
+                    _ => {}
+                }
+
+                let mut terms = vec![];
+                for l in left.iter() {
+                    for r in right.iter() {
+                        terms.push(l * r);
+                    }
+                }
+
+                for r in right.iter() {
+                    for l in left.iter() {
+                        terms.push(&(r * l) * U::from(-1));
+                    }
+                }
+
+                terms
+            }
+        }
     }
 }
 
@@ -560,5 +646,67 @@ mod test {
     ) {
         term.lyndon_sort();
         assert_eq!(term, expected_term);
+    }
+
+    #[rstest]
+    #[case(
+        CommutatorTerm::Atom('X'),
+        CommutatorTerm::Atom('Y'),
+        vec![
+            FormalIndeterminate::<char, i128> { 
+                coefficient: 1, 
+                symbols: vec!['X', 'Y']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: -1,
+                symbols: vec!['Y', 'X']
+            }
+        ])]
+    #[case(
+        comm![CommutatorTerm::Atom('A'), CommutatorTerm::Atom('B')],
+        comm![CommutatorTerm::Atom('C'), CommutatorTerm::Atom('D')],
+        vec![
+            FormalIndeterminate::<char, i128> {
+                coefficient: 1,
+                symbols: vec!['A', 'B', 'C', 'D']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: -1,
+                symbols: vec!['A', 'B', 'D', 'C']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: -1,
+                symbols: vec!['B', 'A', 'C', 'D']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: 1,
+                symbols: vec!['B', 'A', 'D', 'C']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: -1,
+                symbols: vec!['C', 'D', 'A', 'B']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: 1,
+                symbols: vec!['C', 'D', 'B', 'A']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: 1,
+                symbols: vec!['D', 'C', 'A', 'B']
+            },
+            FormalIndeterminate::<char, i128> {
+                coefficient: -1,
+                symbols: vec!['D', 'C', 'B', 'A']
+            }
+        ]
+    )]
+    fn test_formal_indeterminate_expansion(
+        #[case] a: CommutatorTerm<i128, char>,
+        #[case] b: CommutatorTerm<i128, char>,
+        #[case] expected_indeterminates: Vec<FormalIndeterminate<char, i128>>,
+    ) {
+        let term = comm![a, b];
+        let indeterminates = Vec::<FormalIndeterminate<char, i128>>::from(&term);
+        assert_eq!(indeterminates, expected_indeterminates);
     }
 }

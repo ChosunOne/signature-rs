@@ -17,6 +17,7 @@ pub mod bch_series_generator;
 pub mod commutator;
 pub mod constants;
 pub mod lie_series;
+pub mod log_sig;
 pub mod lyndon;
 pub mod rooted_tree;
 

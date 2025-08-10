@@ -93,56 +93,7 @@ impl<const N: usize, T: Generator<Letter = T> + Debug + Clone, U: Hash + Int + S
 {
     type Output = Self;
 
-    // For a series this is the following:
-    // A: e_1 + 2e_2 + 3[e_1, e_2]
-    // B: 4e_1 + 5e_2 + 6[e_1, e_2]
-    //
-    // [A, B] = [e_1, 4e_1] + [e_1, 5e_2] + [e_1, 6[e_1, e_2]]
-    //          + [2e_2, 4e_1] + [2e_2, 5e_2] + [2e_2, 6[e_1, e_2]]
-    //          + [3[e_1, e_2], 4e_1] + [3[e_1, e_2], 5e_2] + [3[e_1, e_2], 6[e_1, e_2]]
-    //
-    //        = [e_1, 5e_2] + [e_1, 6[e_1, e_2]]
-    //          + [2e_2, 4e_1] + [2e_2, 6[e_1, e_2]]
-    //          + [3[e_1, e_2], 4e_1] + [3[e_1, e_2], 5e_2]
-    //
-    //        = e_1*5e_2 - 5e_2*e_1 + e_1*6(e_1*e_2 - e_2*e_1) - 6(e_1*e_2 - e_2*e_1)*e_1
-    //          + 2e_2*4e_1 - 4e_1*2e_2 + 2e_2 * 6(e_1*e_2 - e_2*e_1) - 6(e_1*e_2 - e_2*e_1)*2e_2
-    //          + 3(e_1*e_2 - e_2*e_1)*4e_1 - 4e_1*3(e_1*e_2 - e_2*e_1)
-    //          + 3(e_1*e_2 - e_2*e_1)*5e_2 - 5e_2*3(e_1*e_2 - e_2*e_1)
-    //
-    //        = 5e_1e_2 - 5e_2e_1 + 6e_1e_1e_2 - 6e_1e_2e_1 - 6e_1e_2e_1 + 6e_2e_1e_1
-    //          + 8e_2e_1 - 8e_1e_2 + 12e_2e_1e_2 - 12e_2e_2e_1 - 12e_1e_2e_2 + 12e_2e_1e_2
-    //          + 12e_1e_2e_1 - 12e_2e_1e_1 - 12e_1e_1e_2 + 12e_1e_2e_1
-    //          + 15e_1e_2e_2 - 15e_2e_1e_2 - 15e_2e_1e_2 + 15e_2e_2e_1
-    //
-    //      Notational shortcut e_1e_2 = e_12
-    //        = 5e_12 - 5e_21 + 6e_112 - 6e_121 - 6e_121 + 6e_211
-    //          + 8e_21 - 8e_12 + 12e_212 - 12e_221 - 12e_122 + 12e_212
-    //          + 12e_121 - 12e_211 - 12e_112 + 12e_121
-    //          + 15e_122 - 15e_212 - 15e_212 + 15e_221
-    //
-    //        = 5e_12 - 8e_12
-    //          + 8e_21 - 5e_21
-    //          + 6e_112 - 12e_112
-    //          + 12e_121 + 12e_121 - 6e_121 - 6e_121
-    //          + 15e_122 - 12e_122
-    //          + 6e_211 - 12e_211
-    //          + 12e_212 + 12e_212 - 15e_212 - 15e_212
-    //          + 15e_221 - 12e_221
-    //
-    //        = -3e_12 + 3e_21 - 6e_112 + 12e_121 + 3e_122 - 6e_211 - 6e_212 + 3e_221
-    //
-    //  Essentially, for two series A and B with bases:
-    //  e_1 + e_2 + [e_1, e_2] + [e_1, [e_1, e_2]] + ...
-    //
-    //  we need to calculate all the possible combination terms:
-    //  [e_1, e_1] + [e_1, e_2] + [e_1, [e_1, [e_1, e_2]]] + ...
-    //  + [e_2, e_1] + [e_2, e_2] + [e_2, [e_1, e_2]] + ...
-    //
-    //  once we have that, we then need to store the corresponding lyndon basis element for each
-    //  possible commutation.  Then we can use that lookup table to quickly aggregate the basis
-    //  elements.
-
+    /// Calculates the lie bracket `[A, B]` for a lie series for terms within the commutator basis.
     fn commutator(&self, other: &Self) -> Self::Output {
         let mut coefficients = vec![Ratio::<U>::default(); self.coefficients.len()];
         for i in 0..self.coefficients.len() {
@@ -182,15 +133,10 @@ mod test {
 
     use super::*;
 
-    // A = 3e_1 + 2e_2 + [e_1, e_2]
-    // B = e_1 + 2e_2 + 3[e_1, e_2]
-    //
-    // [A, B] = 3*2[e_1, e_2] + 2[e_2, e_1] = 6[e_1, e_2] - 2[e_1, e_2]
-    //        = 4[e_1, e_2]
-
     #[rstest]
     #[case(2, vec![1, 2, 3], vec![4, 5, 6], vec![0, 0, -3])]
     #[case(2, vec![3, 2, 1], vec![1, 2, 3], vec![0, 0, 4])]
+    #[case(3, vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9, 10], vec![0, 0, -5, -10, 5])]
     fn test_lie_series_commutation(
         #[case] basis_depth: usize,
         #[case] a_coefficients: Vec<i128>,
