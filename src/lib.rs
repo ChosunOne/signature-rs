@@ -2,9 +2,6 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::ops::{AddAssign, DivAssign, MulAssign, Neg, RemAssign, SubAssign};
 
-#[cfg(feature = "progress")]
-use indicatif::ProgressBar;
-
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_rational::Ratio;
@@ -69,6 +66,7 @@ fn binomial<U: Int>(n: usize, k: usize) -> U {
     num / den
 }
 
+#[must_use]
 pub fn bernoulli_sequence<U: Int>(max_n: usize) -> Vec<Ratio<U>> {
     let mut b = vec![Ratio::default(); max_n + 1];
 

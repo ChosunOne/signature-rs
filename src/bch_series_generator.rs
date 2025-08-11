@@ -39,6 +39,7 @@ pub struct BchSeriesGenerator<const N: usize = 2, T: Generator<Letter = T> + Sen
 }
 
 impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<N, T> {
+    #[must_use]
     pub fn new(basis: Vec<LyndonWord<N, T>>) -> Self {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
@@ -136,6 +137,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
         }
     }
 
+    #[must_use]
     pub fn generate_goldberg_coefficient_numerators<U: Int + Send + Sync>(&self) -> Vec<U> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
@@ -161,7 +163,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
             .for_each(|(word, numer)| {
                 let goldberg_partition = word.goldberg();
                 let a_first = word.letters[0] == alphabet[0];
-                *numer = goldberg_coeff_numerator(goldberg_partition, a_first)
+                *numer = goldberg_coeff_numerator(&goldberg_partition, a_first);
             });
 
         #[cfg(feature = "progress")]
@@ -187,6 +189,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
 impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BCHCoefficientGenerator
     for BchSeriesGenerator<N, T>
 {
+    #[allow(clippy::too_many_lines)]
     fn generate_bch_coefficients<U: Int + Send + Sync>(&self) -> Vec<Ratio<U>> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
@@ -341,6 +344,7 @@ pub struct MatrixTree<const N: usize, T: Generator<Letter = T>> {
 }
 
 impl<const N: usize, T: Generator<Letter = T>> MatrixTree<N, T> {
+    #[must_use]
     pub fn new(degree: u8) -> Self {
         let mut matrices = Vec::with_capacity(N * degree as usize);
         let mut memoization_cache = HashMap::new();
@@ -348,7 +352,7 @@ impl<const N: usize, T: Generator<Letter = T>> MatrixTree<N, T> {
         for i in 0..N {
             for j in 0..degree {
                 let matrix = Matrix2x2::default();
-                let key = ((i as usize) << 8) | j as usize;
+                let key = (i << 8) | j as usize;
                 memoization_cache.insert(key, matrices.len());
                 matrices.push(matrix);
             }
@@ -418,11 +422,7 @@ impl<const N: usize, T: Generator<Letter = T>> MatrixTree<N, T> {
         for k in 0..N {
             for i in 0..self.degree {
                 x[k * self.degree as usize + i as usize] =
-                    if word.letters[i as usize] == alphabet[k] {
-                        1
-                    } else {
-                        0
-                    };
+                    i64::from(word.letters[i as usize] == alphabet[k]);
             }
         }
 
@@ -435,8 +435,8 @@ impl<const N: usize, T: Generator<Letter = T>> MatrixTree<N, T> {
 
 fn tuple_index<const N: usize>(letter_counts: &[usize; N]) -> usize {
     if N == 2 {
-        let s = letter_counts[0] as usize + letter_counts[1] as usize;
-        return (((s * (s + 1)) >> 1) + letter_counts[1] as usize) as usize;
+        let s = letter_counts[0] + letter_counts[1];
+        return ((s * (s + 1)) >> 1) + letter_counts[1];
     }
     let mut index = 0;
     let mut n = 0;
@@ -446,7 +446,7 @@ fn tuple_index<const N: usize>(letter_counts: &[usize; N]) -> usize {
         if n == 0 {
             continue;
         }
-        index += usize::try_from(binomial::<i128>(k + n as usize, (n - 1) as usize).clone())
+        index += usize::try_from(binomial::<i128>(k + n, n - 1))
             .expect("Failed to convert bigint to usize");
     }
 
@@ -470,10 +470,11 @@ pub struct RootedTreeLieSeries<T: Generator<Letter = T> = u8, U: Int = i128> {
 }
 
 impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
+    #[must_use]
     pub fn new(n: usize) -> Self {
         let t_n = LyndonBasis::<2, T, Topological>::generate_basis(n)
             .into_iter()
-            .map(|w| RootedTree::from(w))
+            .map(RootedTree::from)
             .collect::<Vec<_>>();
         let m_n = t_n.len();
         let graph_partition_table = GraphPartitionTable::new(t_n);
@@ -515,7 +516,7 @@ impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
 
     fn lie_bracket(&self, alpha: &[Ratio<U>], beta: &[Ratio<U>], i: usize) -> Ratio<U> {
         let mut sum = Ratio::<U>::default();
-        for &(j, k) in self.graph_partition_table.partitions(i).partitions.iter() {
+        for &(j, k) in &self.graph_partition_table.partitions(i).partitions {
             sum += &alpha[j] * &beta[k] - &alpha[k] * &beta[j];
         }
 
@@ -535,13 +536,7 @@ impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
             return result;
         }
         let mut sum = Ratio::default();
-        let partitions = self
-            .graph_partition_table
-            .partitions(i)
-            .partitions
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        let partitions = self.graph_partition_table.partitions(i).partitions.clone();
         for (j, k) in partitions {
             sum += self.z[j].clone() * self.adjoint_operator(k, power - 1)
                 - self.z[k].clone() * self.adjoint_operator(j, power - 1);
@@ -582,12 +577,12 @@ impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
             bernoulli_term += bernoulli_coef * adjoint_term;
         }
         self.is_computed_z.set(i, true);
-        let result = (left_term + bernoulli_term)
+
+        (left_term + bernoulli_term)
             * Ratio::new(
                 1.into(),
                 (self.graph_partition_table.degree(i) as i8).into(),
-            );
-        result
+            )
     }
 
     /// Generates the truncated Baker-Campbell-Hausdorff series of a Lyndon basis
@@ -607,10 +602,10 @@ impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
                     self.prime[i] = self.graph_partition_table.partitions(i)[0].0;
                     self.d_prime[i] = self.graph_partition_table.partitions(i)[0].1;
                     self.kappa[i] = {
-                        if self.d_prime[self.prime[i]] != self.d_prime[i] {
-                            1
-                        } else {
+                        if self.d_prime[self.prime[i]] == self.d_prime[i] {
                             self.kappa[self.prime[i]] + 1
+                        } else {
+                            1
                         }
                     };
                     self.sigma[i] =
@@ -644,7 +639,7 @@ mod test {
         let lie_series = BchSeriesGenerator::<2, char>::new(basis);
         assert_eq!(lie_series.max_degree, 5);
         assert_eq!(lie_series.basis.len(), 14);
-        let expected_left_factor = vec![
+        let expected_left_factor = [
             0, // A
             1, // B
             0, // AB
@@ -669,7 +664,7 @@ mod test {
             dbg!(i);
             assert_eq!(term, expected_term);
         }
-        let expected_right_factor = vec![
+        let expected_right_factor = [
             0, // A
             0, // B
             1, // AB
@@ -696,7 +691,7 @@ mod test {
             assert_eq!(term, expected_term);
         }
 
-        let expected_multi_degree_indices = vec![
+        let expected_multi_degree_indices = [
             1,  // A
             2,  // B
             4,  // AB
@@ -793,7 +788,7 @@ mod test {
             .enumerate()
         {
             dbg!(i);
-            assert_eq!(term, expected_term)
+            assert_eq!(term, expected_term);
         }
     }
 

@@ -80,7 +80,7 @@ impl<T: Generator<Letter = T>> RootedTree<T> {
 
     /// Sort the tree in canonical order, which is by color then by children
     fn canonicalize(&mut self) {
-        for child in self.children.iter_mut() {
+        for child in &mut self.children {
             child.canonicalize();
         }
 
@@ -157,6 +157,7 @@ pub struct GraphPartitionTable<T: Generator<Letter = T>> {
 }
 
 impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
+    #[must_use]
     pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
@@ -241,21 +242,25 @@ impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
         #[cfg(feature = "progress")]
         pb.finish();
 
-        Self { degree, t_n, s }
+        Self { t_n, degree, s }
     }
 
+    #[must_use]
     pub fn partitions(&self, i: usize) -> &EdgePartitions {
         &self.s[i]
     }
 
+    #[must_use]
     pub fn degree(&self, i: usize) -> usize {
         self.degree[i]
     }
 
+    #[must_use]
     pub fn tree(&self, i: usize) -> &RootedTree<T> {
         &self.t_n[i]
     }
 
+    #[must_use]
     pub fn tm_n(&self) -> usize {
         self.t_n.len()
     }
@@ -439,7 +444,7 @@ mod test {
     fn test_graph_partition_table() {
         let t_n = LyndonBasis::<2, char>::generate_basis(5)
             .into_iter()
-            .map(|w| RootedTree::from(w))
+            .map(RootedTree::from)
             .collect::<Vec<_>>();
         let m_n = t_n.len();
         let graph_partition_table = GraphPartitionTable::new(t_n);

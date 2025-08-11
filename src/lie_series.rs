@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::ops::{Index, IndexMut};
+use std::ops::{Add, AddAssign, Index, IndexMut, Sub, SubAssign};
 
 use num_rational::Ratio;
 
@@ -34,6 +34,30 @@ impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Inde
     }
 }
 
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Index<LyndonWord<N, T>>
+    for LieSeries<N, T, U>
+{
+    type Output = Ratio<U>;
+
+    fn index(&self, index: LyndonWord<N, T>) -> &Self::Output {
+        let term = CommutatorTerm::<U, T>::from(&index);
+        let i = self.commutator_basis_index_map[&term];
+        &self.coefficients[i]
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Index<&LyndonWord<N, T>>
+    for LieSeries<N, T, U>
+{
+    type Output = Ratio<U>;
+
+    fn index(&self, index: &LyndonWord<N, T>) -> &Self::Output {
+        let term = CommutatorTerm::<U, T>::from(index);
+        let i = self.commutator_basis_index_map[&term];
+        &self.coefficients[i]
+    }
+}
+
 impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> IndexMut<usize>
     for LieSeries<N, T, U>
 {
@@ -42,10 +66,117 @@ impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Inde
     }
 }
 
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync>
+    IndexMut<LyndonWord<N, T>> for LieSeries<N, T, U>
+{
+    fn index_mut(&mut self, index: LyndonWord<N, T>) -> &mut Self::Output {
+        let term = CommutatorTerm::<U, T>::from(&index);
+        let i = self.commutator_basis_index_map[&term];
+        &mut self.coefficients[i]
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync>
+    IndexMut<&LyndonWord<N, T>> for LieSeries<N, T, U>
+{
+    fn index_mut(&mut self, index: &LyndonWord<N, T>) -> &mut Self::Output {
+        let term = CommutatorTerm::<U, T>::from(index);
+        let i = self.commutator_basis_index_map[&term];
+        &mut self.coefficients[i]
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Add
+    for &LieSeries<N, T, U>
+{
+    type Output = LieSeries<N, T, U>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let mut coefficients = self.coefficients.clone();
+        for i in 0..self.coefficients.len() {
+            coefficients[i] = self.coefficients[i].clone() + rhs.coefficients[i].clone();
+        }
+        LieSeries::<N, T, U> {
+            basis: self.basis.clone(),
+            commutator_basis: self.commutator_basis.clone(),
+            commutator_basis_map: self.commutator_basis_map.clone(),
+            commutator_basis_index_map: self.commutator_basis_index_map.clone(),
+            coefficients,
+        }
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Add
+    for LieSeries<N, T, U>
+{
+    type Output = LieSeries<N, T, U>;
+
+    fn add(mut self, rhs: Self) -> Self::Output {
+        for i in 0..self.coefficients.len() {
+            self.coefficients[i] += rhs.coefficients[i].clone();
+        }
+        self
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> AddAssign
+    for LieSeries<N, T, U>
+{
+    fn add_assign(&mut self, rhs: Self) {
+        for i in 0..self.coefficients.len() {
+            self.coefficients[i] += rhs.coefficients[i].clone();
+        }
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Sub
+    for &LieSeries<N, T, U>
+{
+    type Output = LieSeries<N, T, U>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        let mut coefficients = self.coefficients.clone();
+        for i in 0..self.coefficients.len() {
+            coefficients[i] = self.coefficients[i].clone() - rhs.coefficients[i].clone();
+        }
+        LieSeries::<N, T, U> {
+            basis: self.basis.clone(),
+            commutator_basis: self.commutator_basis.clone(),
+            commutator_basis_map: self.commutator_basis_map.clone(),
+            commutator_basis_index_map: self.commutator_basis_index_map.clone(),
+            coefficients,
+        }
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> Sub
+    for LieSeries<N, T, U>
+{
+    type Output = LieSeries<N, T, U>;
+
+    fn sub(mut self, rhs: Self) -> Self::Output {
+        for i in 0..self.coefficients.len() {
+            self.coefficients[i] -= rhs.coefficients[i].clone();
+        }
+        self
+    }
+}
+
+impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> SubAssign
+    for LieSeries<N, T, U>
+{
+    fn sub_assign(&mut self, rhs: Self) {
+        for i in 0..self.coefficients.len() {
+            self.coefficients[i] -= rhs.coefficients[i].clone();
+        }
+    }
+}
+
 impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> LieSeries<N, T, U> {
+    #[must_use]
     pub fn new(basis: Vec<LyndonWord<N, T>>, coefficients: Vec<Ratio<U>>) -> Self {
         let mut commutator_basis = Vec::<CommutatorTerm<U, T>>::with_capacity(basis.len());
-        for word in basis.iter() {
+        for word in &basis {
             commutator_basis.push(CommutatorTerm::from(word));
         }
         let mut commutator_basis_map = HashMap::new();
@@ -53,18 +184,15 @@ impl<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync> LieS
         let mut commutator_basis_index_map = HashMap::new();
         for (i, a) in commutator_basis.iter().enumerate() {
             commutator_basis_index_map.insert(a.clone(), i);
-            match a {
-                CommutatorTerm::Expression(e) => {
-                    let mut e = e.clone();
-                    e.coefficient = -e.coefficient.clone();
-                    commutator_basis_index_map.insert(CommutatorTerm::Expression(e), i);
-                }
-                _ => {}
+            if let CommutatorTerm::Expression(e) = a {
+                let mut e = e.clone();
+                e.coefficient = -e.coefficient.clone();
+                commutator_basis_index_map.insert(CommutatorTerm::Expression(e), i);
             }
         }
 
-        for a in commutator_basis.iter() {
-            for b in commutator_basis.iter() {
+        for a in &commutator_basis {
+            for b in &commutator_basis {
                 if a == b {
                     continue;
                 }
@@ -148,17 +276,17 @@ mod test {
         let basis = LyndonBasis::<2, u8, Lexicographical>::generate_basis(basis_depth);
         let a_coefficients = a_coefficients
             .into_iter()
-            .map(|x| Ratio::<i128>::from_integer(x))
+            .map(Ratio::<i128>::from_integer)
             .collect::<Vec<_>>();
         let a = LieSeries::new(basis.clone(), a_coefficients);
         let b_coefficients = b_coefficients
             .into_iter()
-            .map(|x| Ratio::<i128>::from_integer(x))
+            .map(Ratio::<i128>::from_integer)
             .collect::<Vec<_>>();
         let b = LieSeries::new(basis.clone(), b_coefficients);
         let expected_coefficients = expected_coefficients
             .into_iter()
-            .map(|x| Ratio::<i128>::from_integer(x))
+            .map(Ratio::<i128>::from_integer)
             .collect::<Vec<_>>();
 
         let series = comm![a, b];

@@ -162,9 +162,10 @@ impl Generator for char {
     type Letter = Self;
 
     fn alphabet<const N: usize>() -> [Self::Letter; N] {
-        if N > 26 {
-            panic!("Only up to 26 generators are supported for 'char' based generators.");
-        }
+        assert!(
+            (N <= 26),
+            "Only up to 26 generators are supported for 'char' based generators."
+        );
 
         let alphabet_letters = [
             'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q',
@@ -173,11 +174,11 @@ impl Generator for char {
 
         let mut letters = ['A'; N];
         // Special case N == 2 because I want to
-        if N != 2 {
-            letters.copy_from_slice(&alphabet_letters[..N]);
-        } else {
+        if N == 2 {
             letters[0] = 'X';
             letters[1] = 'Y';
+        } else {
+            letters.copy_from_slice(&alphabet_letters[..N]);
         }
 
         letters
@@ -240,7 +241,7 @@ impl<const N: usize, T: Generator<Letter = T>, U> LyndonBasis<N, T, U> {
                 pb.inc(1);
 
                 let m = w.len();
-                while w.len() < max_length as usize {
+                while w.len() < max_length {
                     w.push(w[w.len() % m]);
                 }
             }
@@ -260,6 +261,7 @@ impl<const N: usize, T: Generator<Letter = T>, U> LyndonBasis<N, T, U> {
         basis
     }
 
+    #[must_use]
     pub fn number_of_words_per_degree(max_degree: usize) -> Vec<usize> {
         let mu = moebius_mu(max_degree);
         let mut words_per_degree = vec![0; max_degree];
@@ -286,12 +288,13 @@ impl<const N: usize, T: Generator<Letter = T>, U> LyndonBasis<N, T, U> {
 }
 
 impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Topological> {
+    #[must_use]
     pub fn generate_basis(max_length: usize) -> Vec<LyndonWord<N, T>> {
         let basis = Self::_generate_basis(max_length);
-        Self::topological_sort(basis)
+        Self::topological_sort(&basis)
     }
 
-    fn topological_sort(basis: Vec<LyndonWord<N, T>>) -> Vec<LyndonWord<N, T>> {
+    fn topological_sort(basis: &[LyndonWord<N, T>]) -> Vec<LyndonWord<N, T>> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
             "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
@@ -349,11 +352,13 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Topological> {
 }
 
 impl<const N: usize, T: Generator<Letter = T>> LyndonBasis<N, T, Lexicographical> {
+    #[must_use]
     pub fn generate_basis(max_length: usize) -> Vec<LyndonWord<N, T>> {
         Self::_generate_basis(max_length)
     }
 }
 
+#[must_use]
 pub fn moebius_mu(max_degree: usize) -> Vec<i64> {
     let mut mu = vec![0; max_degree];
     mu[0] = 1;
@@ -410,6 +415,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonWord<N, T> {
         period == n
     }
 
+    #[must_use]
     pub fn factorize(&self) -> (LyndonWord<N, T>, LyndonWord<N, T>) {
         let n = self.letters.len();
         assert!(n > 1, "Word length must be greater than 1.");
@@ -423,17 +429,19 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonWord<N, T> {
                 break;
             }
         }
-        return (
+        (
             Self::try_from(v).expect("A factorized lyndon word should produce a lyndon word"),
             Self::try_from(w).expect("A factorized lyndon word should produce a lyndon word"),
-        );
+        )
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.letters.len()
     }
 
     /// Computes the canonical Goldberg representation of the Lyndon word
+    #[must_use]
     pub fn goldberg(&self) -> Vec<usize> {
         if self.letters.is_empty() {
             return vec![];
@@ -463,6 +471,7 @@ impl<const N: usize, T: Generator<Letter = T>> LyndonWord<N, T> {
         partition
     }
 
+    #[must_use]
     pub fn right_factors(&self) -> Vec<Self> {
         let alphabet: [_; N] = T::alphabet();
         let mut factors = vec![];
@@ -484,7 +493,7 @@ impl<const N: usize, T: Generator<Letter = T>> Mul for LyndonWord<N, T> {
     type Output = Result<Self, LyndonWordError>;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        Ok(Self::try_from([self.letters, rhs.letters].concat())?)
+        Self::try_from([self.letters, rhs.letters].concat())
     }
 }
 
@@ -501,7 +510,7 @@ impl<const N: usize, T: Generator<Letter = T>> TryFrom<Vec<T>> for LyndonWord<N,
 
     fn try_from(value: Vec<T>) -> Result<Self, Self::Error> {
         let distinct_alphabet_letters = HashSet::<T>::from(T::alphabet::<N>());
-        let distinct_word_letters = HashSet::<T>::from_iter(value.iter().copied());
+        let distinct_word_letters = value.iter().copied().collect::<HashSet<T>>();
         let intersection = distinct_alphabet_letters
             .intersection(&distinct_word_letters)
             .collect::<Vec<_>>();
@@ -657,7 +666,7 @@ mod test {
     #[test]
     fn test_number_of_lyndon_words_per_degree() {
         let num_words_per_degree = LyndonBasis::<2, char>::number_of_words_per_degree(5);
-        let expected_num_words_per_degree = vec![2, 1, 2, 3, 6];
+        let expected_num_words_per_degree = [2, 1, 2, 3, 6];
         assert_eq!(
             num_words_per_degree.len(),
             expected_num_words_per_degree.len()

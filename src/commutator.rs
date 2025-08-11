@@ -40,17 +40,14 @@ impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commu
             CommutatorTerm::Expression(e) => {
                 e.left.lyndon_sort();
                 e.right.lyndon_sort();
-                match e.left.partial_cmp(&e.right) {
-                    Some(o) => match o {
-                        std::cmp::Ordering::Equal => e.coefficient = T::from(0),
-                        std::cmp::Ordering::Greater => {
-                            e.coefficient = -e.coefficient.clone();
-                            std::mem::swap(&mut e.left, &mut e.right);
-                        }
-                        _ => {}
-                    },
-                    None => {}
-                }
+                if let Some(o) = e.left.partial_cmp(&e.right) { match o {
+                    std::cmp::Ordering::Equal => e.coefficient = T::from(0),
+                    std::cmp::Ordering::Greater => {
+                        e.coefficient = -e.coefficient.clone();
+                        std::mem::swap(&mut e.left, &mut e.right);
+                    }
+                    _ => {}
+                } }
                 // Propagate up coefficients
                 if let CommutatorTerm::Expression(e2) = &mut *e.left {
                     e.coefficient *= e2.coefficient.clone();
@@ -108,10 +105,10 @@ impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commu
                 })
             }
             (CommutatorTerm::Expression(e1), CommutatorTerm::Expression(e2)) => {
-                let coefficient = if e1 != e2 {
-                    e1.coefficient.clone() * e2.coefficient.clone()
-                } else {
+                let coefficient = if e1 == e2 {
                     T::from(0)
+                } else {
+                    e1.coefficient.clone() * e2.coefficient.clone()
                 };
                 let mut left = e1.clone();
                 left.coefficient = T::from(1);
@@ -185,6 +182,7 @@ impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + Ord + PartialOrd>
     CommutatorExpression<T, U>
 {
     /// Implements `[A, B] = -[B, A]`
+    #[must_use]
     pub fn anti_symm(&self) -> Self {
         Self {
             coefficient: -self.coefficient.clone(),
@@ -305,33 +303,27 @@ impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> From<&Commuta
             }],
             CommutatorTerm::Expression(e) => {
                 let mut left = Self::from(&*e.left);
-                match &*e.left {
-                    CommutatorTerm::Expression(l) => {
-                        for e_i in left.iter_mut() {
-                            e_i.coefficient *= l.coefficient.clone();
-                        }
+                if let CommutatorTerm::Expression(l) = &*e.left {
+                    for e_i in &mut left {
+                        e_i.coefficient *= l.coefficient.clone();
                     }
-                    _ => {}
                 }
                 let mut right = Self::from(&*e.right);
-                match &*e.right {
-                    CommutatorTerm::Expression(r) => {
-                        for e_i in right.iter_mut() {
-                            e_i.coefficient *= r.coefficient.clone();
-                        }
+                if let CommutatorTerm::Expression(r) = &*e.right {
+                    for e_i in &mut right {
+                        e_i.coefficient *= r.coefficient.clone();
                     }
-                    _ => {}
                 }
 
                 let mut terms = vec![];
-                for l in left.iter() {
-                    for r in right.iter() {
+                for l in &left {
+                    for r in &right {
                         terms.push(l * r);
                     }
                 }
 
-                for r in right.iter() {
-                    for l in left.iter() {
+                for r in &right {
+                    for l in &left {
                         terms.push(&(r * l) * U::from(-1));
                     }
                 }
@@ -654,7 +646,7 @@ mod test {
         CommutatorTerm::Atom('Y'),
         vec![
             FormalIndeterminate::<char, i128> { 
-                coefficient: 1, 
+                coefficient: 1,
                 symbols: vec!['X', 'Y']
             },
             FormalIndeterminate::<char, i128> {

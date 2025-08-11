@@ -1,10 +1,9 @@
-use num_rational::Ratio;
-
 use crate::{
     Int,
     constants::{FACTORIALS, PRIMES},
 };
 
+#[must_use]
 pub fn p_adic_expansion(n: usize, p: i128) -> Vec<i128> {
     let mut num = n as i128;
     let mut max_power = 0;
@@ -19,10 +18,13 @@ pub fn p_adic_expansion(n: usize, p: i128) -> Vec<i128> {
 
     alphas
 }
+
+#[must_use]
 pub fn s_p(n: usize, p: i128) -> i128 {
     p_adic_expansion(n, p).iter().sum()
 }
 
+#[must_use]
 pub fn bch_denominator<U: Int>(n: usize) -> U {
     let primes = PRIMES.iter().filter(|&&x| x < n as i128);
     let mut prod = U::from(1);
@@ -38,7 +40,8 @@ pub fn bch_denominator<U: Int>(n: usize) -> U {
 }
 
 /// Calculates the numerator of the Goldberg coefficient.
-pub fn goldberg_coeff_numerator<U: Int>(q: Vec<usize>, a_first: bool) -> U {
+#[must_use]
+pub fn goldberg_coeff_numerator<U: Int>(q: &[usize], a_first: bool) -> U {
     let n = q.iter().sum();
     let d = U::from(FACTORIALS[n]) * bch_denominator(n);
     let m = q.len();
@@ -94,6 +97,7 @@ pub fn goldberg_coeff_numerator<U: Int>(q: Vec<usize>, a_first: bool) -> U {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::Ratio;
     use rstest::rstest;
 
     #[rstest]
@@ -112,9 +116,7 @@ mod test {
     #[test]
     fn test_bch_denominators() {
         let n = 25;
-        let denominators = (1..n + 1)
-            .map(|x| bch_denominator::<i128>(x))
-            .collect::<Vec<_>>();
+        let denominators = (1..=n).map(bch_denominator::<i128>).collect::<Vec<_>>();
         let expected_denominators = [
             1, 1, 2, 1, 6, 2, 6, 3, 10, 2, 6, 2, 210, 30, 12, 3, 30, 10, 210, 42, 330, 30, 60, 30,
             546,
@@ -141,8 +143,8 @@ mod test {
         dbg!(a_first);
         let n: usize = q_m.iter().sum();
         let coeff = Ratio::new(
-            goldberg_coeff_numerator::<i128>(q_m, a_first),
-            i128::from(FACTORIALS[n] * bch_denominator::<i128>(n)),
+            goldberg_coeff_numerator::<i128>(&q_m, a_first),
+            FACTORIALS[n] * bch_denominator::<i128>(n),
         );
         assert_eq!(coeff, expected_coeff);
     }
