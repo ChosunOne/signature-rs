@@ -1,5 +1,5 @@
 use crate::{
-    BCHCoefficientGenerator, Int, LieSeriesGenerator,
+    Arith, BCHCoefficientGenerator, Int, LieSeriesGenerator,
     bch::{bch_denominator, goldberg_coeff_numerator},
     bernoulli_sequence, binomial,
     constants::FACTORIALS,
@@ -314,7 +314,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BCHCoefficientGener
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Hash + Int + Send + Sync>
+impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Arith + Send + Sync>
     LieSeriesGenerator<N, T, U> for BchSeriesGenerator<N, T>
 {
     fn generate_lie_series(&self) -> LieSeries<N, T, U> {

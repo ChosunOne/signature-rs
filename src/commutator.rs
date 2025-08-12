@@ -1,8 +1,7 @@
 use crate::{
-    Int,
-    lyndon::{Generator, LyndonWord},
+    lyndon::{Generator, LyndonWord}, Arith, Int
 };
-use std::{fmt::Debug, ops::Mul};
+use std::{fmt::Debug, ops::{Mul, Neg}};
 
 pub trait Commutator<Rhs = Self> {
     type Output;
@@ -27,12 +26,12 @@ macro_rules! comm {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CommutatorTerm<T: Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> {
+pub enum CommutatorTerm<T: Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> {
     Atom(U),
     Expression(CommutatorExpression<T, U>),
 }
 
-impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> CommutatorTerm<T, U> {
+impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> CommutatorTerm<T, U> {
     pub fn lyndon_sort(&mut self) {
         match self {
             // Do nothing, already sorted
@@ -66,7 +65,7 @@ impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commu
     }
 }
 
-impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator<&Self>
+impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator<&Self>
     for CommutatorTerm<T, U>
 {
     type Output = Self;
@@ -126,7 +125,7 @@ impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commu
     }
 }
 
-impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> PartialOrd
+impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> PartialOrd
     for CommutatorTerm<T, U>
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -170,15 +169,15 @@ pub enum CommutatorExpressionError {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CommutatorExpression<
-    T: Debug + Int + PartialEq + Eq,
+    T: Debug + Arith + PartialEq + Eq + From<i32>,
     U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord,
 > {
     pub coefficient: T,
-    left: Box<CommutatorTerm<T, U>>,
-    right: Box<CommutatorTerm<T, U>>,
+    pub left: Box<CommutatorTerm<T, U>>,
+    pub right: Box<CommutatorTerm<T, U>>,
 }
 
-impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + Ord + PartialOrd>
+impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + Ord + PartialOrd>
     CommutatorExpression<T, U>
 {
     /// Implements `[A, B] = -[B, A]`
@@ -192,7 +191,7 @@ impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + Ord + PartialOrd>
     }
 }
 
-impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator
+impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator
     for CommutatorExpression<T, U>
 {
     type Output = Self;
@@ -213,7 +212,7 @@ impl<T: Debug + Int, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commu
     }
 }
 
-impl<const N: usize, T: Int, U: Generator<Letter = U> + Debug + Clone> From<&LyndonWord<N, U>>
+impl<const N: usize, T: Arith + From<i32>, U: Generator<Letter = U> + Debug + Clone> From<&LyndonWord<N, U>>
     for CommutatorTerm<T, U>
 {
     fn from(value: &LyndonWord<N, U>) -> Self {
@@ -224,7 +223,7 @@ impl<const N: usize, T: Int, U: Generator<Letter = U> + Debug + Clone> From<&Lyn
     }
 }
 
-impl<const N: usize, T: Int, U: Generator<Letter = U> + Debug + Clone> TryFrom<&LyndonWord<N, U>>
+impl<const N: usize, T: Arith + From<i32>, U: Generator<Letter = U> + Debug + Clone> TryFrom<&LyndonWord<N, U>>
     for CommutatorExpression<T, U>
 {
     type Error = CommutatorExpressionError;
@@ -256,12 +255,12 @@ impl<const N: usize, T: Int, U: Generator<Letter = U> + Debug + Clone> TryFrom<&
 
 /// This can represent terms of the form `αe_1⋅⋅⋅e_n`
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FormalIndeterminate<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> {
+pub struct FormalIndeterminate<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith> {
     coefficient: U,
     symbols: Vec<T>,
 }
 
-impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> Mul
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith> Mul
     for &FormalIndeterminate<T, U>
 {
     type Output = FormalIndeterminate<T, U>;
@@ -278,7 +277,7 @@ impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> Mul
     }
 }
 
-impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> Mul<U>
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith> Mul<U>
     for &FormalIndeterminate<T, U>
 {
     type Output = FormalIndeterminate<T, U>;
@@ -291,8 +290,27 @@ impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> Mul<U>
     }
 }
 
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith> Neg for FormalIndeterminate<T, U> {
+    type Output = Self;
 
-impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> From<&CommutatorTerm<U, T>>
+    fn neg(mut self) -> Self::Output {
+        self.coefficient = -self.coefficient;
+        self
+    }
+}
+
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith> Neg for &FormalIndeterminate<T, U> {
+    type Output = FormalIndeterminate<T, U>;
+
+    fn neg(self) -> Self::Output {
+        let mut result = self.clone();
+        result.coefficient = -result.coefficient;
+        result
+    }
+}
+
+
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith + From<i32>> From<&CommutatorTerm<U, T>>
     for Vec<FormalIndeterminate<T, U>>
 {
     fn from(value: &CommutatorTerm<U, T>) -> Self {
@@ -324,7 +342,7 @@ impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Int> From<&Commuta
 
                 for r in &right {
                     for l in &left {
-                        terms.push(&(r * l) * U::from(-1));
+                        terms.push(-&(r * l));
                     }
                 }
 

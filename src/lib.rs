@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::ops::{AddAssign, DivAssign, MulAssign, Neg, RemAssign, SubAssign};
+use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, RemAssign, Sub, SubAssign};
 
 use num_bigint::BigInt;
 use num_integer::Integer;
@@ -18,24 +18,54 @@ pub mod log_sig;
 pub mod lyndon;
 pub mod rooted_tree;
 
-pub trait Int:
+pub trait Arith:
     Clone
     + Default
     + Debug
-    + Integer
+    + Sized
+    + Add<Output = Self>
     + AddAssign
+    + Sub<Output = Self>
     + SubAssign
+    + Mul<Output = Self>
     + MulAssign
+    + Div<Output = Self>
     + DivAssign
     + RemAssign
     + Neg<Output = Self>
-    + From<i8>
-    + From<i32>
-    + From<i64>
-    + From<i128>
-    + From<u64>
+    + PartialOrd
+    + Ord
+    + PartialEq
+    + Eq
+    + Hash
 {
 }
+
+impl<
+    T: Clone
+        + Default
+        + Debug
+        + Sized
+        + Add<Output = Self>
+        + AddAssign
+        + Sub<Output = Self>
+        + SubAssign
+        + Mul<Output = Self>
+        + MulAssign
+        + Div<Output = Self>
+        + DivAssign
+        + RemAssign
+        + Neg<Output = Self>
+        + PartialOrd
+        + Ord
+        + Eq
+        + PartialEq
+        + Hash,
+> Arith for T
+{
+}
+
+pub trait Int: Arith + Integer + From<i8> + From<i32> + From<i64> + From<i128> + From<u64> {}
 
 impl Int for i128 {}
 impl Int for BigInt {}
@@ -44,7 +74,11 @@ pub trait BCHCoefficientGenerator {
     fn generate_bch_coefficients<U: Int + Send + Sync>(&self) -> Vec<Ratio<U>>;
 }
 
-pub trait LieSeriesGenerator<const N: usize, T: Generator<Letter = T>, U: Hash + Int + Send + Sync>
+pub trait LieSeriesGenerator<
+    const N: usize,
+    T: Generator<Letter = T>,
+    U: Int + Hash + Arith + Send + Sync,
+>
 {
     fn generate_lie_series(&self) -> LieSeries<N, T, U>;
 }
