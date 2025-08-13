@@ -1,5 +1,5 @@
 use crate::{
-    Int,
+    Arith,
     constants::{FACTORIALS, PRIMES},
 };
 
@@ -25,27 +25,28 @@ pub fn s_p(n: usize, p: i128) -> i128 {
 }
 
 #[must_use]
-pub fn bch_denominator<U: Int>(n: usize) -> U {
+pub fn bch_denominator<U: Arith>(n: usize) -> U {
     let primes = PRIMES.iter().filter(|&&x| x < n as i128);
-    let mut prod = U::from(1);
+    let mut prod = U::one();
     for &p in primes {
         let s_p_n = s_p(n, p);
         let mut t = 0;
         while p.pow(t) <= s_p_n {
             t += 1;
         }
-        prod *= U::from(p.pow(t - 1));
+        prod *= U::from_i128(p.pow(t - 1)).expect("Failed to convert from i128");
     }
     prod
 }
 
 /// Calculates the numerator of the Goldberg coefficient.
 #[must_use]
-pub fn goldberg_coeff_numerator<U: Int>(q: &[usize], a_first: bool) -> U {
+pub fn goldberg_coeff_numerator<U: Arith>(q: &[usize], a_first: bool) -> U {
     let n = q.iter().sum();
-    let d = U::from(FACTORIALS[n]) * bch_denominator(n);
+    let d: U =
+        U::from_i128(FACTORIALS[n]).expect("failed to convert form i128") * bch_denominator(n);
     let m = q.len();
-    let mut c = vec![U::from(0); n * n];
+    let mut c = vec![U::zero(); n * n];
     let mut a_current = a_first;
     if m % 2 == 0 {
         a_current = !a_first;
@@ -54,25 +55,32 @@ pub fn goldberg_coeff_numerator<U: Int>(q: &[usize], a_first: bool) -> U {
     for i in (0..m).rev() {
         for r in 1..=q[i] {
             l += 1;
-            let mut h = U::from(0);
+            let mut h = U::zero();
             if i == m - 1 {
-                h = d.clone() / FACTORIALS[l].into();
+                h = d.clone() / U::from_i128(FACTORIALS[l]).expect("Failed to convert from i128");
             } else if a_current && i == m - 2 {
-                h = d.clone() / (FACTORIALS[r] * FACTORIALS[q[i + 1]]).into();
+                h = d.clone()
+                    / U::from_i128(FACTORIALS[r] * FACTORIALS[q[i + 1]])
+                        .expect("Faield to convert from i128");
             }
             c[(l - 1) * n] = h;
             for k in 2..l {
-                h = U::from(0);
+                h = U::zero();
                 for j in 1..=r {
-                    if l > j && c[k - 2 + n * (l - j - 1)] != U::from(0) {
-                        h += c[k - 2 + n * (l - j - 1)].clone() / U::from(FACTORIALS[j]);
+                    if l > j && c[k - 2 + n * (l - j - 1)] != U::zero() {
+                        h += c[k - 2 + n * (l - j - 1)].clone()
+                            / U::from_i128(FACTORIALS[j]).expect("Faield to convert from i128");
                     }
                 }
                 if a_current && i <= m - 2 {
                     for j in 1..=q[i + 1] {
-                        if l > r + j && c[k - 2 + n * (l - r - j - 1)] != U::from(0) {
+                        if l > r + j && c[k - 2 + n * (l - r - j - 1)] != U::zero() {
                             h += c[k - 2 + n * (l - r - j - 1)].clone()
-                                / U::from(FACTORIALS[r] * FACTORIALS[j]);
+                                / U::from_i128(FACTORIALS[r]).expect("Failed to convert from i128")
+                                * U::from_i128(FACTORIALS[j]).expect(
+                                    "Faield to convert from
+* i128",
+                                );
                         }
                     }
                 }
@@ -82,12 +90,12 @@ pub fn goldberg_coeff_numerator<U: Int>(q: &[usize], a_first: bool) -> U {
         }
         a_current = !a_current;
     }
-    let mut sum = U::from(0);
+    let mut sum = U::zero();
     for k in 1..=n {
         let denom: U = if k % 2 != 0 {
-            (k as u64).into()
+            U::from_usize(k).expect("Failed to convert from usize")
         } else {
-            (-(k as i64)).into()
+            -U::from_usize(k).expect("Failed to convert from usize")
         };
         sum += c[k - 1 + n * (n - 1)].clone() / denom;
     }
@@ -97,7 +105,7 @@ pub fn goldberg_coeff_numerator<U: Int>(q: &[usize], a_first: bool) -> U {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::Ratio;
+    use num_rational::Ratio;
     use rstest::rstest;
 
     #[rstest]

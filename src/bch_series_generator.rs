@@ -1,5 +1,5 @@
 use crate::{
-    Arith, BCHCoefficientGenerator, Int, LieSeriesGenerator,
+    Arith, BCHCoefficientGenerator, LieSeriesGenerator,
     bch::{bch_denominator, goldberg_coeff_numerator},
     bernoulli_sequence, binomial,
     constants::FACTORIALS,
@@ -10,7 +10,7 @@ use crate::{
 use bitvec::prelude::*;
 use num_rational::Ratio;
 use rayon::prelude::*;
-use std::{collections::HashMap, hash::Hash, marker::PhantomData};
+use std::{collections::HashMap, marker::PhantomData};
 
 #[cfg(feature = "progress")]
 mod progress_imports {
@@ -56,8 +56,8 @@ impl<T: Generator + Send + Sync> BchSeriesGenerator<T> {
         let basis = basis.generate_basis(max_degree);
 
         let mut left_factor = vec![0; basis.len()];
-        for i in 0..alphabet_size {
-            left_factor[i] = i;
+        for (i, lf) in left_factor.iter_mut().enumerate().take(alphabet_size) {
+            *lf = i;
         }
         let mut right_factor = vec![0; basis.len()];
         let mut word_lengths = vec![0; basis.len()];
@@ -83,14 +83,24 @@ impl<T: Generator + Send + Sync> BchSeriesGenerator<T> {
             .for_each(|(((word, lf), rf), wl)| {
                 if word.len() > 1 {
                     let (l, r) = word.factorize();
-                    for k in index_of_degree[l.len() - 1]..=index_of_degree[l.len()] - 1 {
-                        if basis[k] == l {
+                    for (k, basis_k) in basis
+                        .iter()
+                        .enumerate()
+                        .take((index_of_degree[l.len()] - 1) + 1)
+                        .skip(index_of_degree[l.len() - 1])
+                    {
+                        if *basis_k == l {
                             *lf = k;
                             break;
                         }
                     }
-                    for k in index_of_degree[r.len() - 1]..=index_of_degree[r.len()] - 1 {
-                        if basis[k] == r {
+                    for (k, basis_k) in basis
+                        .iter()
+                        .enumerate()
+                        .take((index_of_degree[r.len()] - 1) + 1)
+                        .skip(index_of_degree[r.len() - 1])
+                    {
+                        if *basis_k == r {
                             *rf = k;
                             break;
                         }
@@ -141,7 +151,7 @@ impl<T: Generator + Send + Sync> BchSeriesGenerator<T> {
     }
 
     #[must_use]
-    pub fn generate_goldberg_coefficient_numerators<U: Int + Send + Sync>(&self) -> Vec<U> {
+    pub fn generate_goldberg_coefficient_numerators<U: Arith + Send + Sync>(&self) -> Vec<U> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
             "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
@@ -149,7 +159,7 @@ impl<T: Generator + Send + Sync> BchSeriesGenerator<T> {
         .unwrap()
         .progress_chars("=>-");
 
-        let mut goldberg_coefficient_numerators = vec![U::from(0); self.basis.len()];
+        let mut goldberg_coefficient_numerators = vec![U::zero(); self.basis.len()];
 
         let alphabet = T::alphabet(1);
         #[cfg(feature = "progress")]
@@ -191,7 +201,7 @@ impl<T: Generator + Send + Sync> BchSeriesGenerator<T> {
 
 impl<T: Generator + Send + Sync> BCHCoefficientGenerator for BchSeriesGenerator<T> {
     #[allow(clippy::too_many_lines)]
-    fn generate_bch_coefficients<U: Int + Send + Sync>(&self) -> Vec<Ratio<U>> {
+    fn generate_bch_coefficients<U: Arith + Send + Sync>(&self) -> Vec<U> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
             "[{elapsed_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
@@ -287,8 +297,9 @@ impl<T: Generator + Send + Sync> BCHCoefficientGenerator for BchSeriesGenerator<
                                 unsafe {
                                     let ptr = coeffs_addr as *mut U;
                                     let coeffs = std::slice::from_raw_parts_mut(ptr, len);
-                                    coeffs[right_factors[k]] -=
-                                        U::from(d) * previous_word_coefficient;
+                                    coeffs[right_factors[k]] -= U::from_i64(d)
+                                        .expect("Failed to convert from i64")
+                                        * previous_word_coefficient;
                                 }
                             }
                         }
@@ -308,14 +319,15 @@ impl<T: Generator + Send + Sync> BCHCoefficientGenerator for BchSeriesGenerator<
             .zip(self.basis.iter())
             .map(|(numerator, word)| {
                 let n = word.goldberg().iter().sum();
-                let denominator = U::from(FACTORIALS[n]) * bch_denominator::<U>(n);
-                Ratio::new(numerator, denominator)
+                let denominator = U::from_i128(FACTORIALS[n]).expect("Failed to convert from i128")
+                    * bch_denominator::<U>(n);
+                numerator / denominator
             })
             .collect()
     }
 }
 
-impl<T: Generator + Send + Sync, U: Int + Hash + Arith + Send + Sync> LieSeriesGenerator<T, U>
+impl<T: Generator + Send + Sync, U: Arith + Send + Sync> LieSeriesGenerator<T, U>
     for BchSeriesGenerator<T>
 {
     fn generate_lie_series(&self) -> LieSeries<T, U> {
@@ -456,23 +468,23 @@ fn tuple_index(letter_counts: &[usize]) -> usize {
     index
 }
 
-pub struct RootedTreeLieSeries<T: Generator = u8, U: Int = i128> {
+pub struct RootedTreeLieSeries<T: Generator = u8, U: Arith = Ratio<i128>> {
     graph_partition_table: GraphPartitionTable<T>,
     is_computed_z: BitVec,
-    z: Vec<Ratio<U>>,
-    bernoulli: Vec<Ratio<U>>,
-    x_minus_y: Vec<Ratio<U>>,
-    x_plus_y: Vec<Ratio<U>>,
+    z: Vec<U>,
+    bernoulli: Vec<U>,
+    x_minus_y: Vec<U>,
+    x_plus_y: Vec<U>,
     prime: Vec<usize>,
     d_prime: Vec<usize>,
     sigma: Vec<usize>,
     kappa: Vec<usize>,
     m_n: usize,
-    adjoint_cache: HashMap<(usize, usize), Ratio<U>>,
+    adjoint_cache: HashMap<(usize, usize), U>,
     progress: u64,
 }
 
-impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
+impl<T: Generator, U: Arith> RootedTreeLieSeries<T, U> {
     #[must_use]
     pub fn new(n: usize) -> Self {
         let basis = LyndonBasis::new(2, Sort::Topological);
@@ -485,13 +497,13 @@ impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
         let graph_partition_table = GraphPartitionTable::new(t_n);
         let is_computed_z = bitvec![0; graph_partition_table.tm_n()];
         let bernoulli = bernoulli_sequence(n);
-        let z = vec![Ratio::default(); graph_partition_table.tm_n()];
-        let mut x_minus_y = vec![Ratio::default(); graph_partition_table.tm_n()];
-        x_minus_y[0] = Ratio::new(1.into(), 1.into());
-        x_minus_y[1] = Ratio::new((-1).into(), 1.into());
-        let mut x_plus_y = vec![Ratio::default(); graph_partition_table.tm_n()];
-        x_plus_y[0] = Ratio::new(1.into(), 1.into());
-        x_plus_y[1] = Ratio::new(1.into(), 1.into());
+        let z = vec![U::default(); graph_partition_table.tm_n()];
+        let mut x_minus_y = vec![U::default(); graph_partition_table.tm_n()];
+        x_minus_y[0] = U::one();
+        x_minus_y[1] = -U::one();
+        let mut x_plus_y = vec![U::default(); graph_partition_table.tm_n()];
+        x_plus_y[0] = U::one();
+        x_plus_y[1] = U::one();
         let prime = vec![0; m_n];
         let d_prime = vec![0; m_n];
         let mut sigma = vec![0_usize; m_n];
@@ -519,16 +531,16 @@ impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
         }
     }
 
-    fn lie_bracket(&self, alpha: &[Ratio<U>], beta: &[Ratio<U>], i: usize) -> Ratio<U> {
-        let mut sum = Ratio::<U>::default();
+    fn lie_bracket(&self, alpha: &[U], beta: &[U], i: usize) -> U {
+        let mut sum = U::default();
         for &(j, k) in &self.graph_partition_table.partitions(i).partitions {
-            sum += &alpha[j] * &beta[k] - &alpha[k] * &beta[j];
+            sum += alpha[j].clone() * beta[k].clone() - alpha[k].clone() * beta[j].clone();
         }
 
         sum
     }
 
-    fn adjoint_operator(&mut self, i: usize, power: usize) -> Ratio<U> {
+    fn adjoint_operator(&mut self, i: usize, power: usize) -> U {
         if power == 0 {
             return self.x_plus_y[i].clone();
         }
@@ -540,7 +552,7 @@ impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
             self.adjoint_cache.insert((i, power), result.clone());
             return result;
         }
-        let mut sum = Ratio::default();
+        let mut sum = U::default();
         let partitions = self.graph_partition_table.partitions(i).partitions.clone();
         for (j, k) in partitions {
             sum += self.z[j].clone() * self.adjoint_operator(k, power - 1)
@@ -551,10 +563,10 @@ impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
         sum
     }
 
-    fn compute_z(&mut self, i: usize) -> Ratio<U> {
+    fn compute_z(&mut self, i: usize) -> U {
         if i == 0 || i == 1 {
             self.is_computed_z.set(i, true);
-            return Ratio::new(1.into(), 1.into());
+            return U::one();
         }
         // 1/2 [X-Y, Z] (u_i)
         let s_ui = self.graph_partition_table.partitions(i).clone();
@@ -569,29 +581,27 @@ impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
                 self.progress += 1;
             }
         }
-        let left_term =
-            Ratio::new(1.into(), 2.into()) * self.lie_bracket(&self.x_minus_y, &self.z, i);
+        let left_term = U::one() / U::from_u8(2).expect("Failed to convert from u8")
+            * self.lie_bracket(&self.x_minus_y, &self.z, i);
 
         // Bernoulli term
-        let mut bernoulli_term = Ratio::default();
+        let mut bernoulli_term = U::default();
         let degree = self.graph_partition_table.degree(i);
         for p in 1..=((degree - 1) / 2) {
-            let bernoulli_coef =
-                &self.bernoulli[2 * p] * Ratio::new(1.into(), (FACTORIALS[2 * p]).into());
+            let bernoulli_coef = self.bernoulli[2 * p].clone()
+                / U::from_i128(FACTORIALS[2 * p]).expect("Failed to convert from i128");
             let adjoint_term = self.adjoint_operator(i, 2 * p);
             bernoulli_term += bernoulli_coef * adjoint_term;
         }
         self.is_computed_z.set(i, true);
 
         (left_term + bernoulli_term)
-            * Ratio::new(
-                1.into(),
-                (self.graph_partition_table.degree(i) as i8).into(),
-            )
+            / U::from_usize(self.graph_partition_table.degree(i))
+                .expect("Failed to convert from usize")
     }
 
     /// Generates the truncated Baker-Campbell-Hausdorff series of a Lyndon basis
-    pub fn generate_coefficients(&mut self) -> Vec<Ratio<U>> {
+    pub fn generate_coefficients(&mut self) -> Vec<U> {
         #[cfg(feature = "progress")]
         let pb = ProgressBar::new(self.graph_partition_table.tm_n() as u64);
         #[cfg(feature = "progress")]
@@ -627,7 +637,7 @@ impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
         self.z[..self.m_n]
             .iter()
             .zip(self.sigma.iter())
-            .map(|(z, &sig)| z * Ratio::new(1.into(), (sig as u64).into()))
+            .map(|(z, &sig)| z.clone() / U::from_usize(sig).expect("Failed to convert from usize"))
             .collect()
     }
 }
@@ -725,7 +735,7 @@ mod test {
     #[test]
     fn test_lie_series_goldberg_series() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
-        let lie_series = BchSeriesGenerator::<char>::new(basis.clone(), 5);
+        let lie_series = BchSeriesGenerator::<char>::new(basis, 5);
         let basis = basis.generate_basis(5);
         let goldberg_coefficients = lie_series
             .generate_goldberg_coefficient_numerators::<i128>()
@@ -768,7 +778,7 @@ mod test {
     fn test_lie_series_bch_series() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
         let lie_series = BchSeriesGenerator::<char>::new(basis, 5);
-        let bch_coefficients = lie_series.generate_bch_coefficients();
+        let bch_coefficients = lie_series.generate_bch_coefficients::<Ratio<i128>>();
         let expected_bch_coefficients = vec![
             Ratio::new(1, 1),
             Ratio::new(1, 1),

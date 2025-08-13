@@ -1,5 +1,5 @@
 use crate::{
-    lyndon::{Generator, LyndonWord}, Arith, Int
+    lyndon::{Generator, LyndonWord}, Arith
 };
 use std::{fmt::Debug, ops::{Mul, Neg}};
 
@@ -9,7 +9,7 @@ pub trait Commutator<Rhs = Self> {
     fn commutator(&self, other: Rhs) -> Self::Output;
 }
 
-impl<T: Int> Commutator<&Self> for T {
+impl<T: Arith> Commutator<&Self> for T {
     type Output = T;
 
     fn commutator(&self, other: &Self) -> Self::Output {
@@ -26,12 +26,12 @@ macro_rules! comm {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CommutatorTerm<T: Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> {
+pub enum CommutatorTerm<T: Arith, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> {
     Atom(U),
     Expression(CommutatorExpression<T, U>),
 }
 
-impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> CommutatorTerm<T, U> {
+impl<T: Debug + Arith,  U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> CommutatorTerm<T, U> {
     pub fn lyndon_sort(&mut self) {
         match self {
             // Do nothing, already sorted
@@ -40,7 +40,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
                 e.left.lyndon_sort();
                 e.right.lyndon_sort();
                 if let Some(o) = e.left.partial_cmp(&e.right) { match o {
-                    std::cmp::Ordering::Equal => e.coefficient = T::from(0),
+                    std::cmp::Ordering::Equal => e.coefficient = T::zero(),
                     std::cmp::Ordering::Greater => {
                         e.coefficient = -e.coefficient.clone();
                         std::mem::swap(&mut e.left, &mut e.right);
@@ -50,13 +50,13 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
                 // Propagate up coefficients
                 if let CommutatorTerm::Expression(e2) = &mut *e.left {
                     e.coefficient *= e2.coefficient.clone();
-                    if e2.coefficient == T::from(-1) {
+                    if e2.coefficient == -T::one() {
                         e2.coefficient = -e2.coefficient.clone();
                     }
                 }
                 if let CommutatorTerm::Expression(e2) = &mut *e.right {
                     e.coefficient *= e2.coefficient.clone();
-                    if e2.coefficient == T::from(-1) {
+                    if e2.coefficient == -T::one() {
                         e2.coefficient = -e2.coefficient.clone();
                     }
                 }
@@ -65,7 +65,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
     }
 }
 
-impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator<&Self>
+impl<T: Debug + Arith, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator<&Self>
     for CommutatorTerm<T, U>
 {
     type Output = Self;
@@ -73,7 +73,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
     fn commutator(&self, other: &Self) -> Self::Output {
         match (self, other) {
             (a @ CommutatorTerm::Atom(e1), b @ CommutatorTerm::Atom(e2)) => {
-                let coefficient = if e1 == e2 { T::from(0) } else { T::from(1) };
+                let coefficient = if e1 == e2 { T::zero() } else { T::one() };
                 CommutatorTerm::Expression(CommutatorExpression {
                     coefficient,
                     left: Box::new(a.clone()),
@@ -83,7 +83,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
             (a @ CommutatorTerm::Atom(_), CommutatorTerm::Expression(e)) => {
                 let coefficient = e.coefficient.clone();
                 let mut right = e.clone();
-                right.coefficient = T::from(1);
+                right.coefficient = T::one();
                 let right = Box::new(CommutatorTerm::Expression(right));
 
                 CommutatorTerm::Expression(CommutatorExpression {
@@ -95,7 +95,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
             (CommutatorTerm::Expression(e), b @ CommutatorTerm::Atom(_)) => {
                 let coefficient = e.coefficient.clone();
                 let mut left = e.clone();
-                left.coefficient = T::from(1);
+                left.coefficient = T::one();
                 let left = Box::new(CommutatorTerm::Expression(left));
                 CommutatorTerm::Expression(CommutatorExpression {
                     coefficient,
@@ -105,15 +105,15 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
             }
             (CommutatorTerm::Expression(e1), CommutatorTerm::Expression(e2)) => {
                 let coefficient = if e1 == e2 {
-                    T::from(0)
+                    T::zero()
                 } else {
                     e1.coefficient.clone() * e2.coefficient.clone()
                 };
                 let mut left = e1.clone();
-                left.coefficient = T::from(1);
+                left.coefficient = T::one();
                 let left = Box::new(CommutatorTerm::Expression(left));
                 let mut right = e2.clone();
-                right.coefficient = T::from(1);
+                right.coefficient = T::one();
                 let right = Box::new(CommutatorTerm::Expression(right));
                 CommutatorTerm::Expression(CommutatorExpression {
                     coefficient,
@@ -125,7 +125,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
     }
 }
 
-impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> PartialOrd
+impl<T: Debug + Arith, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> PartialOrd
     for CommutatorTerm<T, U>
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -169,7 +169,7 @@ pub enum CommutatorExpressionError {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CommutatorExpression<
-    T: Debug + Arith + PartialEq + Eq + From<i32>,
+    T: Debug + Arith + PartialEq + Eq,
     U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord,
 > {
     pub coefficient: T,
@@ -177,7 +177,7 @@ pub struct CommutatorExpression<
     pub right: Box<CommutatorTerm<T, U>>,
 }
 
-impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + Ord + PartialOrd>
+impl<T: Debug + Arith, U: Clone + Debug + PartialEq + Eq + Ord + PartialOrd>
     CommutatorExpression<T, U>
 {
     /// Implements `[A, B] = -[B, A]`
@@ -191,7 +191,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + Ord + Par
     }
 }
 
-impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator
+impl<T: Debug + Arith, U: Clone + Debug + PartialEq + Eq + PartialOrd + Ord> Commutator
     for CommutatorExpression<T, U>
 {
     type Output = Self;
@@ -199,10 +199,10 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
     fn commutator(&self, other: Self) -> Self::Output {
         let coefficient = self.coefficient.clone() * other.coefficient.clone();
         let mut left = self.clone();
-        left.coefficient = T::from(1);
+        left.coefficient = T::one();
         let left = Box::new(CommutatorTerm::Expression(left));
         let mut right = other.clone();
-        right.coefficient = T::from(1);
+        right.coefficient = T::one();
         let right = Box::new(CommutatorTerm::Expression(right));
         CommutatorExpression {
             coefficient,
@@ -212,7 +212,7 @@ impl<T: Debug + Arith + From<i32>, U: Clone + Debug + PartialEq + Eq + PartialOr
     }
 }
 
-impl<T: Arith + From<i32>, U: Generator + Debug + Clone> From<&LyndonWord<U>>
+impl<T: Arith, U: Generator + Debug + Clone> From<&LyndonWord<U>>
     for CommutatorTerm<T, U>
 {
     fn from(value: &LyndonWord<U>) -> Self {
@@ -223,7 +223,7 @@ impl<T: Arith + From<i32>, U: Generator + Debug + Clone> From<&LyndonWord<U>>
     }
 }
 
-impl<T: Arith + From<i32>, U: Generator + Debug + Clone> TryFrom<&LyndonWord<U>>
+impl<T: Arith, U: Generator + Debug + Clone> TryFrom<&LyndonWord<U>>
     for CommutatorExpression<T, U>
 {
     type Error = CommutatorExpressionError;
@@ -246,7 +246,7 @@ impl<T: Arith + From<i32>, U: Generator + Debug + Clone> TryFrom<&LyndonWord<U>>
         };
 
         Ok(Self {
-            coefficient: T::from(1),
+            coefficient: T::one(),
             left,
             right,
         })
@@ -310,13 +310,13 @@ impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith> Neg for &Fo
 }
 
 
-impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith + From<i32>> From<&CommutatorTerm<U, T>>
+impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd, U: Arith> From<&CommutatorTerm<U, T>>
     for Vec<FormalIndeterminate<T, U>>
 {
     fn from(value: &CommutatorTerm<U, T>) -> Self {
         match value {
             CommutatorTerm::Atom(a) => vec![FormalIndeterminate::<T, U> {
-                coefficient: U::from(1),
+                coefficient: U::one(),
                 symbols: vec![a.clone()],
             }],
             CommutatorTerm::Expression(e) => {

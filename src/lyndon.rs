@@ -21,8 +21,8 @@ impl Generator for u8 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as u8;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as u8;
         }
 
         letters
@@ -33,8 +33,8 @@ impl Generator for u16 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as u16;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as u16;
         }
 
         letters
@@ -45,8 +45,8 @@ impl Generator for u32 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as u32;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as u32;
         }
 
         letters
@@ -57,8 +57,20 @@ impl Generator for u64 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as u64;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as u64;
+        }
+
+        letters
+    }
+}
+
+impl Generator for usize {
+    fn alphabet(size: usize) -> Vec<Self> {
+        let mut letters = vec![0; size];
+
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i;
         }
 
         letters
@@ -69,8 +81,8 @@ impl Generator for u128 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as u128;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as u128;
         }
 
         letters
@@ -81,8 +93,8 @@ impl Generator for i8 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as i8;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as i8;
         }
 
         letters
@@ -93,8 +105,8 @@ impl Generator for i16 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as i16;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as i16;
         }
 
         letters
@@ -105,8 +117,8 @@ impl Generator for i32 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as i32;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as i32;
         }
 
         letters
@@ -117,8 +129,20 @@ impl Generator for i64 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as i64;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as i64;
+        }
+
+        letters
+    }
+}
+
+impl Generator for isize {
+    fn alphabet(size: usize) -> Vec<Self> {
+        let mut letters = vec![0; size];
+
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as isize;
         }
 
         letters
@@ -129,8 +153,8 @@ impl Generator for i128 {
     fn alphabet(size: usize) -> Vec<Self> {
         let mut letters = vec![0; size];
 
-        for i in 0..size {
-            letters[i] = i as i128;
+        for (i, l) in letters.iter_mut().enumerate() {
+            *l = i as i128;
         }
 
         letters
@@ -171,6 +195,7 @@ pub struct LyndonBasis<T: Generator = u8> {
 }
 
 impl<T: Generator> LyndonBasis<T> {
+    #[must_use]
     pub fn new(alphabet_size: usize, sort: Sort) -> Self {
         Self {
             alphabet_size,
@@ -179,7 +204,8 @@ impl<T: Generator> LyndonBasis<T> {
         }
     }
 
-    fn _generate_basis(&self, max_length: usize) -> Vec<LyndonWord<T>> {
+    #[must_use]
+    pub fn generate_basis(&self, max_length: usize) -> Vec<LyndonWord<T>> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
             "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
@@ -243,7 +269,10 @@ impl<T: Generator> LyndonBasis<T> {
         #[cfg(feature = "progress")]
         pb.finish();
 
-        basis
+        match self.sort {
+            Sort::Lexicographical => basis,
+            Sort::Topological => Self::topological_sort(&basis),
+        }
     }
 
     #[must_use]
@@ -271,15 +300,6 @@ impl<T: Generator> LyndonBasis<T> {
         words_per_degree
     }
 
-    #[must_use]
-    pub fn generate_basis(&self, max_length: usize) -> Vec<LyndonWord<T>> {
-        let basis = self._generate_basis(max_length);
-        match self.sort {
-            Sort::Lexicographical => basis,
-            Sort::Topological => Self::topological_sort(&basis),
-        }
-    }
-
     fn topological_sort(basis: &[LyndonWord<T>]) -> Vec<LyndonWord<T>> {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
@@ -287,7 +307,7 @@ impl<T: Generator> LyndonBasis<T> {
         )
         .unwrap()
         .progress_chars("=>-");
-        let max_length = basis.last().map(|x| x.len()).unwrap_or(0);
+        let max_length = basis.last().map_or(0, LyndonWord::len);
         let mut sorted_basis = Vec::with_capacity(basis.len());
         let mut sorted_basis_index = HashMap::new();
 
@@ -417,6 +437,11 @@ impl<T: Generator> LyndonWord<T> {
     #[must_use]
     pub fn len(&self) -> usize {
         self.letters.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.letters.is_empty()
     }
 
     /// Computes the canonical Goldberg representation of the Lyndon word
