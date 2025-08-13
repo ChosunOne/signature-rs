@@ -4,7 +4,7 @@ use crate::{
     bernoulli_sequence, binomial,
     constants::FACTORIALS,
     lie_series::LieSeries,
-    lyndon::{Generator, LyndonBasis, LyndonWord, Topological},
+    lyndon::{Generator, LyndonBasis, LyndonWord, Sort},
     rooted_tree::{GraphPartitionTable, RootedTree},
 };
 use bitvec::prelude::*;
@@ -21,11 +21,13 @@ mod progress_imports {
 pub use progress_imports::*;
 
 /// A Lie series of words with alphabet size `N` and generators of type `T`
-pub struct BchSeriesGenerator<const N: usize = 2, T: Generator<Letter = T> + Send + Sync = u8> {
+pub struct BchSeriesGenerator<T: Generator + Send + Sync = u8> {
+    /// The size of the alphabet of the words
+    pub alphabet_size: usize,
     /// Maximum length of the words
     pub max_degree: usize,
     /// The words of the series
-    pub basis: Vec<LyndonWord<N, T>>,
+    pub basis: Vec<LyndonWord<T>>,
     /// The index of the left factor for a given word index `i`
     pub left_factor: Vec<usize>,
     /// The index of the right factor for a given word index `i`
@@ -38,9 +40,9 @@ pub struct BchSeriesGenerator<const N: usize = 2, T: Generator<Letter = T> + Sen
     pub multi_degree: Vec<usize>,
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<N, T> {
+impl<T: Generator + Send + Sync> BchSeriesGenerator<T> {
     #[must_use]
-    pub fn new(basis: Vec<LyndonWord<N, T>>) -> Self {
+    pub fn new(basis: LyndonBasis<T>, max_degree: usize) -> Self {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
             "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
@@ -48,12 +50,13 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
         .unwrap()
         .progress_chars("=>-");
 
-        let max_degree = basis.last().map(|x| x.len()).unwrap_or(0);
-        let number_of_words_per_degree =
-            LyndonBasis::<N, T>::number_of_words_per_degree(max_degree);
+        let alphabet = T::alphabet(basis.alphabet_size);
+        let alphabet_size = basis.alphabet_size;
+        let number_of_words_per_degree = basis.number_of_words_per_degree(max_degree);
+        let basis = basis.generate_basis(max_degree);
 
         let mut left_factor = vec![0; basis.len()];
-        for i in 0..N {
+        for i in 0..alphabet_size {
             left_factor[i] = i;
         }
         let mut right_factor = vec![0; basis.len()];
@@ -99,7 +102,6 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
         #[cfg(feature = "progress")]
         pb.finish();
 
-        let alphabet = T::alphabet::<N>();
         let mut multi_degree = vec![0; basis.len()];
         let mut alphabet_index = HashMap::new();
         for (i, letter) in alphabet.iter().enumerate() {
@@ -114,7 +116,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
         }
 
         for i in 0..basis.len() {
-            let mut letter_counts = [0usize; N];
+            let mut letter_counts = vec![0usize; alphabet_size];
             let word = &basis[i];
             for j in 0..word_lengths[i] {
                 letter_counts[alphabet_index[&word.letters[j]]] += 1;
@@ -127,6 +129,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
         pb.finish();
 
         Self {
+            alphabet_size,
             max_degree,
             basis,
             left_factor,
@@ -148,7 +151,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
 
         let mut goldberg_coefficient_numerators = vec![U::from(0); self.basis.len()];
 
-        let alphabet = T::alphabet::<N>();
+        let alphabet = T::alphabet(1);
         #[cfg(feature = "progress")]
         let pb = ProgressBar::new(self.basis.len() as u64).with_style(style.clone());
         #[cfg(feature = "progress")]
@@ -186,9 +189,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BchSeriesGenerator<
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BCHCoefficientGenerator
-    for BchSeriesGenerator<N, T>
-{
+impl<T: Generator + Send + Sync> BCHCoefficientGenerator for BchSeriesGenerator<T> {
     #[allow(clippy::too_many_lines)]
     fn generate_bch_coefficients<U: Int + Send + Sync>(&self) -> Vec<Ratio<U>> {
         #[cfg(feature = "progress")]
@@ -204,7 +205,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BCHCoefficientGener
         .unwrap()
         .progress_chars("=>-");
         let mut bch_coefficient_numerators = self.generate_goldberg_coefficient_numerators::<U>();
-        let alphabet = T::alphabet::<N>();
+        let alphabet = T::alphabet(1);
 
         // Loop over the words of max degree
         let start = self.index_of_degree[self.max_degree - 1];
@@ -235,7 +236,7 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BCHCoefficientGener
                 .map(|(i, _)| i + start)
                 .collect::<Vec<_>>();
 
-            let mut matrix_tree = MatrixTree::<N, T>::new(self.max_degree as u8);
+            let mut matrix_tree = MatrixTree::<T>::new(self.max_degree as u8, self.alphabet_size);
             let mut group_matrix_indices = Vec::with_capacity(words_in_group.len());
 
             for &j in &words_in_group {
@@ -314,10 +315,10 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync> BCHCoefficientGener
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Arith + Send + Sync>
-    LieSeriesGenerator<N, T, U> for BchSeriesGenerator<N, T>
+impl<T: Generator + Send + Sync, U: Int + Hash + Arith + Send + Sync> LieSeriesGenerator<T, U>
+    for BchSeriesGenerator<T>
 {
-    fn generate_lie_series(&self) -> LieSeries<N, T, U> {
+    fn generate_lie_series(&self) -> LieSeries<T, U> {
         let basis = self.basis.clone();
         let coefficients = self.generate_bch_coefficients::<U>();
 
@@ -333,7 +334,8 @@ pub struct Matrix2x2 {
     a22: u32,
 }
 
-pub struct MatrixTree<const N: usize, T: Generator<Letter = T>> {
+pub struct MatrixTree<T: Generator> {
+    alphabet_size: usize,
     /// A vector of matrices
     matrices: Vec<Matrix2x2>,
     /// The maximum degree of the words
@@ -343,13 +345,13 @@ pub struct MatrixTree<const N: usize, T: Generator<Letter = T>> {
     _phantom: PhantomData<T>,
 }
 
-impl<const N: usize, T: Generator<Letter = T>> MatrixTree<N, T> {
+impl<T: Generator> MatrixTree<T> {
     #[must_use]
-    pub fn new(degree: u8) -> Self {
-        let mut matrices = Vec::with_capacity(N * degree as usize);
+    pub fn new(degree: u8, alphabet_size: usize) -> Self {
+        let mut matrices = Vec::with_capacity(alphabet_size * degree as usize);
         let mut memoization_cache = HashMap::new();
 
-        for i in 0..N {
+        for i in 0..alphabet_size {
             for j in 0..degree {
                 let matrix = Matrix2x2::default();
                 let key = (i << 8) | j as usize;
@@ -359,6 +361,7 @@ impl<const N: usize, T: Generator<Letter = T>> MatrixTree<N, T> {
         }
 
         Self {
+            alphabet_size,
             matrices,
             degree,
             memoization_cache,
@@ -414,35 +417,35 @@ impl<const N: usize, T: Generator<Letter = T>> MatrixTree<N, T> {
         self.matrices.len() - 1
     }
 
-    pub fn run(&self, x: &mut [i64], word: &LyndonWord<N, T>, mut stop: usize) {
-        let alphabet = T::alphabet::<N>();
+    pub fn run(&self, x: &mut [i64], word: &LyndonWord<T>, mut stop: usize) {
+        let alphabet = T::alphabet(self.alphabet_size);
         if stop >= self.matrices.len() {
             stop = self.matrices.len() - 1;
         }
-        for k in 0..N {
+        for k in 0..self.alphabet_size {
             for i in 0..self.degree {
                 x[k * self.degree as usize + i as usize] =
                     i64::from(word.letters[i as usize] == alphabet[k]);
             }
         }
 
-        for p in N * self.degree as usize..=stop {
+        for p in self.alphabet_size * self.degree as usize..=stop {
             x[p] = x[self.matrices[p].a11 as usize] * x[self.matrices[p].a22 as usize]
                 - x[self.matrices[p].a12 as usize] * x[self.matrices[p].a21 as usize];
         }
     }
 }
 
-fn tuple_index<const N: usize>(letter_counts: &[usize; N]) -> usize {
-    if N == 2 {
+fn tuple_index(letter_counts: &[usize]) -> usize {
+    if letter_counts.len() == 2 {
         let s = letter_counts[0] + letter_counts[1];
         return ((s * (s + 1)) >> 1) + letter_counts[1];
     }
     let mut index = 0;
     let mut n = 0;
 
-    for k in 0..N {
-        n += letter_counts[N - k - 1];
+    for k in 0..letter_counts.len() {
+        n += letter_counts[letter_counts.len() - k - 1];
         if n == 0 {
             continue;
         }
@@ -453,7 +456,7 @@ fn tuple_index<const N: usize>(letter_counts: &[usize; N]) -> usize {
     index
 }
 
-pub struct RootedTreeLieSeries<T: Generator<Letter = T> = u8, U: Int = i128> {
+pub struct RootedTreeLieSeries<T: Generator = u8, U: Int = i128> {
     graph_partition_table: GraphPartitionTable<T>,
     is_computed_z: BitVec,
     z: Vec<Ratio<U>>,
@@ -469,10 +472,12 @@ pub struct RootedTreeLieSeries<T: Generator<Letter = T> = u8, U: Int = i128> {
     progress: u64,
 }
 
-impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
+impl<T: Generator, U: Int> RootedTreeLieSeries<T, U> {
     #[must_use]
     pub fn new(n: usize) -> Self {
-        let t_n = LyndonBasis::<2, T, Topological>::generate_basis(n)
+        let basis = LyndonBasis::new(2, Sort::Topological);
+        let t_n = basis
+            .generate_basis(n)
             .into_iter()
             .map(RootedTree::from)
             .collect::<Vec<_>>();
@@ -629,14 +634,13 @@ impl<T: Generator<Letter = T>, U: Int> RootedTreeLieSeries<T, U> {
 
 #[cfg(test)]
 mod test {
-    use crate::lyndon::Lexicographical;
 
     use super::*;
 
     #[test]
     fn test_lie_series_construction() {
-        let basis = LyndonBasis::<2, char, Lexicographical>::generate_basis(5);
-        let lie_series = BchSeriesGenerator::<2, char>::new(basis);
+        let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
+        let lie_series = BchSeriesGenerator::<char>::new(basis, 5);
         assert_eq!(lie_series.max_degree, 5);
         assert_eq!(lie_series.basis.len(), 14);
         let expected_left_factor = [
@@ -720,8 +724,9 @@ mod test {
 
     #[test]
     fn test_lie_series_goldberg_series() {
-        let basis = LyndonBasis::<2, char, Lexicographical>::generate_basis(5);
-        let lie_series = BchSeriesGenerator::<2, char>::new(basis.clone());
+        let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
+        let lie_series = BchSeriesGenerator::<char>::new(basis.clone(), 5);
+        let basis = basis.generate_basis(5);
         let goldberg_coefficients = lie_series
             .generate_goldberg_coefficient_numerators::<i128>()
             .into_iter()
@@ -761,8 +766,8 @@ mod test {
 
     #[test]
     fn test_lie_series_bch_series() {
-        let basis = LyndonBasis::<2, char, Lexicographical>::generate_basis(5);
-        let lie_series = BchSeriesGenerator::<2, char>::new(basis);
+        let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
+        let lie_series = BchSeriesGenerator::<char>::new(basis, 5);
         let bch_coefficients = lie_series.generate_bch_coefficients();
         let expected_bch_coefficients = vec![
             Ratio::new(1, 1),

@@ -6,7 +6,7 @@ use crate::{
     comm,
     commutator::{Commutator, CommutatorTerm},
     lie_series::LieSeries,
-    lyndon::{Generator, Lexicographical, LyndonBasis, LyndonWord},
+    lyndon::{Generator, LyndonBasis, LyndonWord, Sort},
 };
 use std::{
     collections::HashMap,
@@ -15,18 +15,12 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-pub struct LogSignature<
-    const N: usize,
-    T: Generator<Letter = T> + Send + Sync,
-    U: Int + Arith + Hash + Send + Sync,
-> {
-    series: LieSeries<N, T, U>,
-    bch_series: LieSeries<2, u8, U>,
+pub struct LogSignature<T: Generator + Send + Sync = u8, U: Int + Hash + Send + Sync = i128> {
+    series: LieSeries<T, U>,
+    bch_series: LieSeries<u8, U>,
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Send + Sync>
-    Index<usize> for LogSignature<N, T, U>
-{
+impl<T: Generator + Send + Sync, U: Int + Hash + Send + Sync> Index<usize> for LogSignature<T, U> {
     type Output = Ratio<U>;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -34,62 +28,60 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Sen
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Send + Sync>
-    Index<LyndonWord<N, T>> for LogSignature<N, T, U>
+impl<T: Generator + Send + Sync, U: Int + Hash + Send + Sync> Index<LyndonWord<T>>
+    for LogSignature<T, U>
 {
     type Output = Ratio<U>;
 
-    fn index(&self, index: LyndonWord<N, T>) -> &Self::Output {
+    fn index(&self, index: LyndonWord<T>) -> &Self::Output {
         &self.series[index]
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Send + Sync>
-    Index<&LyndonWord<N, T>> for LogSignature<N, T, U>
+impl<T: Generator + Send + Sync, U: Int + Hash + Send + Sync> Index<&LyndonWord<T>>
+    for LogSignature<T, U>
 {
     type Output = Ratio<U>;
 
-    fn index(&self, index: &LyndonWord<N, T>) -> &Self::Output {
+    fn index(&self, index: &LyndonWord<T>) -> &Self::Output {
         &self.series[index]
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Send + Sync>
-    IndexMut<usize> for LogSignature<N, T, U>
+impl<T: Generator + Send + Sync, U: Int + Hash + Send + Sync> IndexMut<usize>
+    for LogSignature<T, U>
 {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.series[index]
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Send + Sync>
-    IndexMut<LyndonWord<N, T>> for LogSignature<N, T, U>
+impl<T: Generator + Send + Sync, U: Int + Hash + Send + Sync> IndexMut<LyndonWord<T>>
+    for LogSignature<T, U>
 {
-    fn index_mut(&mut self, index: LyndonWord<N, T>) -> &mut Self::Output {
+    fn index_mut(&mut self, index: LyndonWord<T>) -> &mut Self::Output {
         &mut self.series[index]
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Send + Sync>
-    IndexMut<&LyndonWord<N, T>> for LogSignature<N, T, U>
+impl<T: Generator + Send + Sync, U: Int + Hash + Send + Sync> IndexMut<&LyndonWord<T>>
+    for LogSignature<T, U>
 {
-    fn index_mut(&mut self, index: &LyndonWord<N, T>) -> &mut Self::Output {
+    fn index_mut(&mut self, index: &LyndonWord<T>) -> &mut Self::Output {
         &mut self.series[index]
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Send + Sync>
-    LogSignature<N, T, U>
-{
+impl<T: Generator + Send + Sync, U: Int + Hash + Send + Sync> LogSignature<T, U> {
     #[must_use]
-    pub fn new(max_lyndon_word_length: usize) -> Self {
-        let basis = LyndonBasis::<N, T, Lexicographical>::generate_basis(max_lyndon_word_length);
-        let bch_basis =
-            LyndonBasis::<2, u8, Lexicographical>::generate_basis(max_lyndon_word_length);
-        let bch_series_generator = BchSeriesGenerator::<2, u8>::new(bch_basis.clone());
+    pub fn new(alphabet_size: usize, max_lyndon_word_length: usize) -> Self {
+        let basis = LyndonBasis::<T>::new(alphabet_size, Sort::Lexicographical)
+            .generate_basis(max_lyndon_word_length);
+        let bch_basis = LyndonBasis::new(2, Sort::Lexicographical);
+        let bch_series_generator = BchSeriesGenerator::new(bch_basis, max_lyndon_word_length);
         let bch_series = bch_series_generator.generate_lie_series();
         let coefficients = vec![Ratio::<U>::from(U::from(0)); basis.len()];
-        let series = LieSeries::<N, T, U>::new(basis, coefficients);
+        let series = LieSeries::<T, U>::new(basis, coefficients);
 
         Self { series, bch_series }
     }
@@ -111,15 +103,11 @@ impl<const N: usize, T: Generator<Letter = T> + Send + Sync, U: Int + Hash + Sen
     }
 }
 
-fn evaluate_commutator_term<
-    const N: usize,
-    T: Generator<Letter = T>,
-    U: Int + Hash + Arith + Send + Sync,
->(
+fn evaluate_commutator_term<T: Generator, U: Int + Hash + Send + Sync>(
     term: &CommutatorTerm<U, u8>,
-    series: &[&LieSeries<N, T, U>],
-    computed_commutations: &mut HashMap<CommutatorTerm<U, u8>, LieSeries<N, T, U>>,
-) -> LieSeries<N, T, U> {
+    series: &[&LieSeries<T, U>],
+    computed_commutations: &mut HashMap<CommutatorTerm<U, u8>, LieSeries<T, U>>,
+) -> LieSeries<T, U> {
     match term {
         &CommutatorTerm::Atom(a) => series[a as usize].clone(),
         t @ CommutatorTerm::Expression(e) => {
@@ -141,8 +129,8 @@ mod test {
 
     #[test]
     fn test_log_sig_concat() {
-        let mut a = LogSignature::<2, u8, i128>::new(3);
-        let mut b = LogSignature::new(3);
+        let mut a = LogSignature::<u8, i128>::new(2, 3);
+        let mut b = LogSignature::new(2, 3);
         a.series.coefficients = [1, 2, 3, 4, 5].map(Ratio::from_integer).to_vec();
         b.series.coefficients = [6, 7, 8, 9, 10].map(Ratio::from_integer).to_vec();
         let c = a.concatenate(&b);

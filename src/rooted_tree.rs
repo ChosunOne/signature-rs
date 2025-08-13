@@ -9,13 +9,13 @@ use crate::lyndon::{Generator, LyndonWord, LyndonWordError};
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Default, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RootedTree<T: Generator<Letter = T>> {
+pub struct RootedTree<T: Generator> {
     color: T,
     children: Vec<RootedTree<T>>,
     degree: usize,
 }
 
-impl<T: Generator<Letter = T>> RootedTree<T> {
+impl<T: Generator> RootedTree<T> {
     pub fn new(color: T) -> Self {
         Self {
             color,
@@ -99,8 +99,8 @@ impl<T: Generator<Letter = T>> RootedTree<T> {
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T>> From<LyndonWord<N, T>> for RootedTree<T> {
-    fn from(value: LyndonWord<N, T>) -> Self {
+impl<T: Generator> From<LyndonWord<T>> for RootedTree<T> {
+    fn from(value: LyndonWord<T>) -> Self {
         if value.len() == 1 {
             return Self::new(value.letters[0]);
         }
@@ -117,7 +117,7 @@ impl<const N: usize, T: Generator<Letter = T>> From<LyndonWord<N, T>> for Rooted
     }
 }
 
-impl<const N: usize, T: Generator<Letter = T>> TryFrom<&RootedTree<T>> for LyndonWord<N, T> {
+impl<T: Generator> TryFrom<&RootedTree<T>> for LyndonWord<T> {
     type Error = LyndonWordError;
     fn try_from(value: &RootedTree<T>) -> Result<Self, Self::Error> {
         let letters = value.to_letters();
@@ -150,13 +150,13 @@ impl IndexMut<usize> for EdgePartitions {
 }
 
 #[derive(Debug, Clone)]
-pub struct GraphPartitionTable<T: Generator<Letter = T>> {
+pub struct GraphPartitionTable<T: Generator> {
     t_n: Vec<RootedTree<T>>,
     degree: Vec<usize>,
     s: Vec<EdgePartitions>,
 }
 
-impl<T: Generator<Letter = T>> GraphPartitionTable<T> {
+impl<T: Generator> GraphPartitionTable<T> {
     #[must_use]
     pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
         #[cfg(feature = "progress")]
@@ -272,30 +272,30 @@ mod test {
 
     use rstest::rstest;
 
-    use crate::lyndon::LyndonBasis;
+    use crate::lyndon::{LyndonBasis, Sort};
 
     use super::*;
 
     #[rstest]
-    #[case("X", vec![])]
-    #[case("Y", vec![])]
-    #[case("XY", vec![vec![0]])]
-    #[case("XYY", vec![vec![0], vec![1]])]
-    #[case("XXY", vec![vec![0], vec![0, 0]])]
-    #[case("XYYY", vec![vec![0], vec![1], vec![2]])]
-    #[case("XXYY", vec![vec![0], vec![0, 0], vec![0, 1]])]
-    #[case("XXXY", vec![vec![0], vec![0, 0], vec![0, 0, 0]])]
-    #[case("XYYYY", vec![vec![0], vec![1], vec![2], vec![3]])]
-    #[case("XXYXY", vec![vec![0], vec![0, 0], vec![1], vec![1, 0]])]
-    #[case("XYXYY", vec![vec![0], vec![1], vec![1, 0], vec![1, 1]])]
-    #[case("XXYYY", vec![vec![0], vec![0, 0], vec![0, 1], vec![0, 2]])]
-    #[case("XXXYY", vec![vec![0], vec![0, 0], vec![0, 0, 0], vec![0, 0, 1]])]
-    #[case("XXXXY", vec![vec![0], vec![0, 0], vec![0, 0, 0], vec![0, 0, 0, 0]])]
+    #[case("A", vec![])]
+    #[case("B", vec![])]
+    #[case("AB", vec![vec![0]])]
+    #[case("ABB", vec![vec![0], vec![1]])]
+    #[case("AAB", vec![vec![0], vec![0, 0]])]
+    #[case("ABBB", vec![vec![0], vec![1], vec![2]])]
+    #[case("AABB", vec![vec![0], vec![0, 0], vec![0, 1]])]
+    #[case("AAAB", vec![vec![0], vec![0, 0], vec![0, 0, 0]])]
+    #[case("ABBBB", vec![vec![0], vec![1], vec![2], vec![3]])]
+    #[case("AABAB", vec![vec![0], vec![0, 0], vec![1], vec![1, 0]])]
+    #[case("ABABB", vec![vec![0], vec![1], vec![1, 0], vec![1, 1]])]
+    #[case("AABBB", vec![vec![0], vec![0, 0], vec![0, 1], vec![0, 2]])]
+    #[case("AAABB", vec![vec![0], vec![0, 0], vec![0, 0, 0], vec![0, 0, 1]])]
+    #[case("AAAAB", vec![vec![0], vec![0, 0], vec![0, 0, 0], vec![0, 0, 0, 0]])]
     fn it_creates_a_rooted_tree_from_a_lyndon_word(
         #[case] letters: &str,
         #[case] paths: Vec<Vec<usize>>,
     ) -> Result<(), LyndonWordError> {
-        let word = letters.parse::<LyndonWord<2, char>>()?;
+        let word = letters.parse::<LyndonWord<char>>()?;
         dbg!(&word);
         let tree = RootedTree::from(word);
         dbg!(&tree);
@@ -309,24 +309,24 @@ mod test {
     }
 
     #[rstest]
-    #[case("X")]
-    #[case("Y")]
-    #[case("XY")]
-    #[case("XYY")]
-    #[case("XXY")]
-    #[case("XYYY")]
-    #[case("XXYY")]
-    #[case("XXXY")]
-    #[case("XYYYY")]
-    #[case("XXYXY")]
-    #[case("XYXYY")]
-    #[case("XXYYY")]
-    #[case("XXXYY")]
-    #[case("XXXXY")]
+    #[case("A")]
+    #[case("B")]
+    #[case("AB")]
+    #[case("ABB")]
+    #[case("AAB")]
+    #[case("ABBB")]
+    #[case("AABB")]
+    #[case("AAAB")]
+    #[case("ABBBB")]
+    #[case("AABAB")]
+    #[case("ABABB")]
+    #[case("AABBB")]
+    #[case("AAABB")]
+    #[case("AAAAB")]
     fn it_converts_a_rooted_tree_back_to_a_lyndon_word(
         #[case] letters: &str,
     ) -> Result<(), LyndonWordError> {
-        let word = letters.parse::<LyndonWord<2, char>>()?;
+        let word = letters.parse::<LyndonWord<char>>()?;
         let tree = RootedTree::from(word.clone());
         let reconstructed_word = LyndonWord::try_from(&tree)?;
         assert_eq!(word, reconstructed_word);
@@ -334,24 +334,24 @@ mod test {
     }
 
     #[rstest]
-    #[case("X", "Y")]
-    #[case("XY", "Y")]
-    #[case("X", "XY")]
-    #[case("XYY", "Y")]
-    #[case("X", "XYY")]
-    #[case("X", "XXY")]
-    #[case("XYYY", "Y")]
-    #[case("XXY", "XY")]
-    #[case("XY", "XYY")]
-    #[case("X", "XXYY")]
-    #[case("X", "XXXY")]
+    #[case("A", "B")]
+    #[case("AB", "B")]
+    #[case("A", "AB")]
+    #[case("ABB", "B")]
+    #[case("A", "ABB")]
+    #[case("A", "AAB")]
+    #[case("ABBB", "B")]
+    #[case("AAB", "AB")]
+    #[case("AB", "ABB")]
+    #[case("A", "AABB")]
+    #[case("A", "AAAB")]
     fn it_grafts_a_rooted_tree(
         #[case] word_1_letters: &str,
         #[case] word_2_letters: &str,
     ) -> Result<(), LyndonWordError> {
-        let word_1 = word_1_letters.parse::<LyndonWord<2, char>>()?;
+        let word_1 = word_1_letters.parse::<LyndonWord<char>>()?;
         dbg!(&word_1);
-        let word_2 = word_2_letters.parse::<LyndonWord<2, char>>()?;
+        let word_2 = word_2_letters.parse::<LyndonWord<char>>()?;
         dbg!(&word_2);
         let mut tree_1 = RootedTree::from(word_1);
         dbg!(&tree_1);
@@ -362,35 +362,33 @@ mod test {
         let reconstructed_word = LyndonWord::try_from(&tree_1)?;
         let expected_word = (word_1_letters.to_owned() + word_2_letters)
             .as_str()
-            .parse::<LyndonWord<2, char>>()?;
+            .parse::<LyndonWord<char>>()?;
         assert_eq!(reconstructed_word, expected_word);
         Ok(())
     }
 
     #[rstest]
-    #[case("XY", "X", "Y")]
-    #[case("XYY", "XY", "Y")]
-    #[case("XXY", "X", "XY")]
-    #[case("XYYY", "XYY", "Y")]
-    #[case("XXYY", "X", "XYY")]
-    #[case("XXXY", "X", "XXY")]
-    #[case("XYYYY", "XYYY", "Y")]
-    #[case("XXYXY", "XXY", "XY")]
-    #[case("XYXYY", "XY", "XYY")]
-    #[case("XXXYY", "X", "XXYY")]
-    #[case("XXXXY", "X", "XXXY")]
+    #[case("AB", "A", "B")]
+    #[case("ABB", "AB", "B")]
+    #[case("AAB", "A", "AB")]
+    #[case("ABBB", "ABB", "B")]
+    #[case("AABB", "A", "ABB")]
+    #[case("AAAB", "A", "AAB")]
+    #[case("ABBBB", "ABBB", "B")]
+    #[case("AABAB", "AAB", "AB")]
+    #[case("ABABB", "AB", "ABB")]
+    #[case("AAABB", "A", "AABB")]
+    #[case("AAAAB", "A", "AAAB")]
     fn it_factorizes_a_rooted_tree_1(
         #[case] letters: &str,
         #[case] expected_v: &str,
         #[case] expected_w: &str,
     ) -> Result<(), LyndonWordError> {
-        let word = LyndonWord::<2, char>::try_from(letters.chars().collect::<Vec<_>>())?;
+        let word = LyndonWord::<char>::try_from(letters.chars().collect::<Vec<_>>())?;
         let tree = RootedTree::from(word);
         let (v, w) = tree.factorize().expect("To factorize a lyndon tree.");
-        let expected_v_word =
-            LyndonWord::<2, char>::try_from(expected_v.chars().collect::<Vec<_>>())?;
-        let expected_w_word =
-            LyndonWord::<2, char>::try_from(expected_w.chars().collect::<Vec<_>>())?;
+        let expected_v_word = LyndonWord::<char>::try_from(expected_v.chars().collect::<Vec<_>>())?;
+        let expected_w_word = LyndonWord::<char>::try_from(expected_w.chars().collect::<Vec<_>>())?;
         let v_word = LyndonWord::try_from(&v)?;
         let w_word = LyndonWord::try_from(&w)?;
 
@@ -401,76 +399,78 @@ mod test {
 
     #[test]
     fn it_factorizes_a_non_lyndon_rooted_tree() {
-        let letters = vec!['X', 'Y'];
-        let word = LyndonWord::<2, char>::try_from(letters).expect("To make a lyndon word");
+        let letters = vec!['A', 'B'];
+        let word = LyndonWord::<char>::try_from(letters).expect("To make a lyndon word");
         let mut tree = RootedTree::from(word.clone());
         tree.graft(RootedTree::from(word));
         let Some((v, w)) = tree.factorize() else {
             panic!("Failed to factorize tree");
         };
         assert_eq!(v.degree(), 2);
-        assert_eq!(v.color, 'X');
-        assert_eq!(v.get_node(&[0]).color, 'Y');
+        assert_eq!(v.color, 'A');
+        assert_eq!(v.get_node(&[0]).color, 'B');
         assert_eq!(w.degree(), 2);
-        assert_eq!(w.color, 'X');
-        assert_eq!(w.get_node(&[0]).color, 'Y');
+        assert_eq!(w.color, 'A');
+        assert_eq!(w.get_node(&[0]).color, 'B');
     }
 
     #[test]
     fn it_correctly_identifies_isomorphisms() {
         let mut tree_set = HashSet::new();
 
-        let mut tree_1 = RootedTree::new('X');
-        tree_1.graft(RootedTree::new('X'));
+        let mut tree_1 = RootedTree::new('A');
+        tree_1.graft(RootedTree::new('A'));
 
-        // (X) <- (X) -> (X) -> (Y)
+        // (A) <- (A) -> (A) -> (B)
         let mut grafted_tree_1 = tree_1.clone();
         grafted_tree_1.graft(RootedTree::from(
-            LyndonWord::<2, char>::try_from(vec!['X', 'Y']).expect("To make a lyndon word"),
+            LyndonWord::<char>::try_from(vec!['A', 'B']).expect("To make a lyndon word"),
         ));
         tree_set.insert(grafted_tree_1);
 
-        // (Y) <- (X) <- (X) -> (X)
-        let mut grafted_tree_2 = RootedTree::new('X');
+        // (B) <- (A) <- (A) -> (A)
+        let mut grafted_tree_2 = RootedTree::new('A');
         grafted_tree_2.graft(RootedTree::from(
-            LyndonWord::<2, char>::try_from(vec!['X', 'Y']).expect("To make a lyndon word"),
+            LyndonWord::<char>::try_from(vec!['A', 'B']).expect("To make a lyndon word"),
         ));
-        grafted_tree_2.graft(RootedTree::new('X'));
+        grafted_tree_2.graft(RootedTree::new('A'));
 
         assert!(tree_set.contains(&grafted_tree_2));
     }
 
     #[test]
     fn test_graph_partition_table() {
-        let t_n = LyndonBasis::<2, char>::generate_basis(5)
+        let basis = LyndonBasis::<char>::new(2, Sort::Topological);
+        let t_n = basis
+            .generate_basis(5)
             .into_iter()
             .map(RootedTree::from)
             .collect::<Vec<_>>();
         let m_n = t_n.len();
         let graph_partition_table = GraphPartitionTable::new(t_n);
         let expected_s = vec![
-            vec![],                                             // X
-            vec![],                                             // Y
-            vec![(0, 1)],                                       // XY
-            vec![(2, 1), (2, 1)],                               // XYY
-            vec![(0, 2), (m_n, 1)],                             // XXY
-            vec![(3, 1), (3, 1), (3, 1)],                       // XYYY
-            vec![(0, 3), (4, 1), (4, 1)],                       // XXYY
-            vec![(0, 4), (m_n, 2), (m_n + 1, 1)],               // XXXY
-            vec![(5, 1), (5, 1), (5, 1), (5, 1)],               // XYYYY
-            vec![(4, 2), (4, 2), (m_n + 2, 1), (m_n + 2, 1)],   // XXYXY
-            vec![(2, 3), (6, 1), (m_n + 3, 1), (m_n + 3, 1)],   // XYXYY
-            vec![(0, 5), (6, 1), (6, 1), (6, 1)],               // XXYYY
-            vec![(0, 6), (m_n, 3), (7, 1), (7, 1)],             // XXXYY
-            vec![(0, 7), (m_n, 4), (m_n + 1, 2), (m_n + 4, 1)], // XXXXY
+            vec![],                                             // A
+            vec![],                                             // B
+            vec![(0, 1)],                                       // AB
+            vec![(2, 1), (2, 1)],                               // ABB
+            vec![(0, 2), (m_n, 1)],                             // AAB
+            vec![(3, 1), (3, 1), (3, 1)],                       // ABBB
+            vec![(0, 3), (4, 1), (4, 1)],                       // AABB
+            vec![(0, 4), (m_n, 2), (m_n + 1, 1)],               // AAAB
+            vec![(5, 1), (5, 1), (5, 1), (5, 1)],               // ABBBB
+            vec![(4, 2), (4, 2), (m_n + 2, 1), (m_n + 2, 1)],   // AABAB
+            vec![(2, 3), (6, 1), (m_n + 3, 1), (m_n + 3, 1)],   // ABABB
+            vec![(0, 5), (6, 1), (6, 1), (6, 1)],               // AABBB
+            vec![(0, 6), (m_n, 3), (7, 1), (7, 1)],             // AAABB
+            vec![(0, 7), (m_n, 4), (m_n + 1, 2), (m_n + 4, 1)], // AAAAB
             // Auxiliary S values
-            vec![(0, 0)],                                 // (X) -> (X)
-            vec![(0, m_n), (m_n, 0)],                     // (X) -> (X) -> (X)
-            vec![(m_n, 2), (4, 0), (m_n + 5, 1)],         // (X) <- (X) -> (X) -> (Y)
-            vec![(2, 2), (4, 1), (m_n + 6, 1)],           // (Y) <- (X) -> (X) -> (Y)
-            vec![(0, m_n + 1), (m_n, m_n), (m_n + 1, 0)], // (X) -> (X) -> (X) -> (X)
-            vec![(m_n, 0), (m_n, 0)],                     // (X) <- (X) -> (X)
-            vec![(m_n, 1), (2, 0)],                       // (Y) <- (X) -> (X)
+            vec![(0, 0)],                                 // (A) -> (A)
+            vec![(0, m_n), (m_n, 0)],                     // (A) -> (A) -> (A)
+            vec![(m_n, 2), (4, 0), (m_n + 5, 1)],         // (A) <- (A) -> (A) -> (B)
+            vec![(2, 2), (4, 1), (m_n + 6, 1)],           // (B) <- (A) -> (A) -> (B)
+            vec![(0, m_n + 1), (m_n, m_n), (m_n + 1, 0)], // (A) -> (A) -> (A) -> (A)
+            vec![(m_n, 0), (m_n, 0)],                     // (A) <- (A) -> (A)
+            vec![(m_n, 1), (2, 0)],                       // (B) <- (A) -> (A)
         ];
         for (i, (s_ui, expected_s_ui)) in graph_partition_table
             .s

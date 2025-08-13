@@ -74,13 +74,8 @@ pub trait BCHCoefficientGenerator {
     fn generate_bch_coefficients<U: Int + Send + Sync>(&self) -> Vec<Ratio<U>>;
 }
 
-pub trait LieSeriesGenerator<
-    const N: usize,
-    T: Generator<Letter = T>,
-    U: Int + Hash + Arith + Send + Sync,
->
-{
-    fn generate_lie_series(&self) -> LieSeries<N, T, U>;
+pub trait LieSeriesGenerator<T: Generator, U: Int + Hash + Send + Sync> {
+    fn generate_lie_series(&self) -> LieSeries<T, U>;
 }
 
 fn binomial<U: Int>(n: usize, k: usize) -> U {
