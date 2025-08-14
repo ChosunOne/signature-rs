@@ -1,4 +1,4 @@
-use ndarray::Array;
+use ndarray::{Array, Axis, Dimension, RemoveAxis, s};
 
 use crate::{
     Arith, LieSeriesGenerator,
@@ -8,15 +8,90 @@ use crate::{
     lie_series::LieSeries,
     lyndon::{Generator, LyndonBasis, LyndonWord, Sort},
 };
+use ordered_float::NotNan;
 use std::{
     collections::HashMap,
     ops::{Index, IndexMut},
 };
 
-#[derive(Debug, Clone)]
-pub struct LogSignature<T: Generator + Send + Sync = u8, U: Arith + Send + Sync = i32> {
-    series: LieSeries<T, U>,
+#[derive(Default, Debug)]
+pub struct LogSignatureBuilder<
+    T: Generator + Default + Send + Sync = u8,
+    U: Arith + Send + Sync = NotNan<f64>,
+> {
+    /// The maximum degree of terms to include in the log signature
+    max_degree: usize,
+    lyndon_basis: LyndonBasis<T>,
     bch_series: LieSeries<u8, U>,
+}
+
+impl<T: Generator + Default + Send + Sync, U: Arith + Send + Sync> LogSignatureBuilder<T, U> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+
+    #[must_use]
+    pub fn with_max_degree(mut self, max_degree: usize) -> Self {
+        self.max_degree = max_degree;
+        self
+    }
+
+    #[must_use]
+    pub fn with_num_dimensions(mut self, num_dimensions: usize) -> Self {
+        self.lyndon_basis.alphabet_size = num_dimensions;
+        self
+    }
+
+    #[must_use]
+    pub fn max_degree(&self) -> usize {
+        self.max_degree
+    }
+
+    #[must_use]
+    pub fn num_dimensions(&self) -> usize {
+        self.lyndon_basis.alphabet_size
+    }
+
+    #[must_use]
+    pub fn build(&self) -> LogSignature<T, U> {
+        let bch_basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
+        let bch_series = BchSeriesGenerator::new(bch_basis, self.max_degree).generate_lie_series();
+        let basis = self.lyndon_basis.generate_basis(self.max_degree);
+        let coefficients = vec![U::default(); basis.len()];
+        let series = LieSeries::<T, U>::new(basis, coefficients);
+        LogSignature::<T, U> { series, bch_series }
+    }
+
+    #[must_use]
+    pub fn build_from_path<D: Dimension + RemoveAxis>(
+        &self,
+        path: &Array<U, D>,
+    ) -> LogSignature<T, U> {
+        let mut log_sig = self.build();
+        let mut log_sig_segment = log_sig.clone();
+
+        for window in path.axis_windows(Axis(0), 2) {
+            let start = window.index_axis(Axis(0), 0);
+            let end = window.index_axis(Axis(0), 1);
+            let displacement = (&end - &start).iter().cloned().collect::<Vec<_>>();
+            log_sig_segment
+                .series
+                .coefficients
+                .clone_from_slice(&displacement[..self.lyndon_basis.alphabet_size]);
+            log_sig.concatenate_assign(&log_sig_segment);
+        }
+
+        log_sig
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogSignature<T: Generator + Send + Sync = u8, U: Arith + Send + Sync = NotNan<f64>> {
+    pub series: LieSeries<T, U>,
+    pub bch_series: LieSeries<u8, U>,
 }
 
 impl<T: Generator + Send + Sync, U: Arith + Send + Sync> Index<usize> for LogSignature<T, U> {
@@ -71,19 +146,6 @@ impl<T: Generator + Send + Sync, U: Arith + Send + Sync> IndexMut<&LyndonWord<T>
 
 impl<T: Generator + Send + Sync, U: Arith + Send + Sync> LogSignature<T, U> {
     #[must_use]
-    pub fn new(alphabet_size: usize, max_lyndon_word_length: usize) -> Self {
-        let basis = LyndonBasis::<T>::new(alphabet_size, Sort::Lexicographical)
-            .generate_basis(max_lyndon_word_length);
-        let bch_basis = LyndonBasis::new(2, Sort::Lexicographical);
-        let bch_series_generator = BchSeriesGenerator::new(bch_basis, max_lyndon_word_length);
-        let bch_series = bch_series_generator.generate_lie_series();
-        let coefficients = vec![U::zero(); basis.len()];
-        let series = LieSeries::<T, U>::new(basis, coefficients);
-
-        Self { series, bch_series }
-    }
-
-    #[must_use]
     pub fn concatenate(&self, rhs: &Self) -> Self {
         let mut computed_commutations = HashMap::new();
         let mut concatenated_log_sig = self.clone();
@@ -97,6 +159,19 @@ impl<T: Generator + Send + Sync, U: Arith + Send + Sync> LogSignature<T, U> {
         }
 
         concatenated_log_sig
+    }
+
+    pub fn concatenate_assign(&mut self, rhs: &Self) {
+        let mut computed_commutations = HashMap::new();
+        let original_series = self.series.clone();
+
+        for (i, term) in self.bch_series.commutator_basis.iter().enumerate().skip(1) {
+            self.series += evaluate_commutator_term(
+                term,
+                &[&original_series, &rhs.series],
+                &mut computed_commutations,
+            ) * self.bch_series[i].clone();
+        }
     }
 }
 
@@ -128,8 +203,11 @@ mod test {
 
     #[test]
     fn test_log_sig_concat() {
-        let mut a = LogSignature::<u8, Ratio<i128>>::new(2, 3);
-        let mut b = LogSignature::new(2, 3);
+        let builder = LogSignatureBuilder::<u8, Ratio<i128>>::new()
+            .with_num_dimensions(2)
+            .with_max_degree(3);
+        let mut a = builder.build();
+        let mut b = builder.build();
         a.series.coefficients = [1, 2, 3, 4, 5].map(Ratio::from_integer).to_vec();
         b.series.coefficients = [6, 7, 8, 9, 10].map(Ratio::from_integer).to_vec();
         let c = a.concatenate(&b);

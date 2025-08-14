@@ -34,10 +34,11 @@ pub trait Arith:
     + PartialOrd
     + PartialEq
     + Eq
-    + Hash
+    + Ord
     + Sized
     + Num
     + FromPrimitive
+    + Hash
 {
 }
 
@@ -57,12 +58,13 @@ impl<
         + RemAssign
         + Neg<Output = Self>
         + PartialOrd
-        + Eq
+        + Ord
         + PartialEq
-        + Hash
+        + Eq
         + Sized
         + Num
-        + FromPrimitive,
+        + FromPrimitive
+        + Hash,
 > Arith for T
 {
 }
@@ -78,6 +80,10 @@ pub trait LieSeriesGenerator<T: Generator, U: Arith + Send + Sync> {
 fn binomial<U: Arith>(n: usize, k: usize) -> U {
     if k == 0 {
         return U::one();
+    }
+
+    if k > n {
+        return U::zero();
     }
 
     let k = k.min(n - k);
@@ -98,7 +104,7 @@ pub fn bernoulli_sequence<U: Arith>(max_n: usize) -> Vec<U> {
 
     b[0] = U::one();
     if max_n > 0 {
-        b[1] = -U::one() / U::from_u8(2).expect("Failed to convert from i8");
+        b[1] = -U::one() / U::from_u8(2).expect("Failed to convert from u8");
     }
 
     for n in 2..=max_n {
@@ -124,8 +130,74 @@ pub fn bernoulli_sequence<U: Arith>(max_n: usize) -> Vec<U> {
 #[cfg(test)]
 mod test {
     use num_rational::Ratio;
+    use ordered_float::NotNan;
+    use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case(0, 0, 1)]
+    #[case(5, 0, 1)]
+    #[case(100, 0, 1)]
+    #[case(1, 1, 1)]
+    #[case(2, 2, 1)]
+    #[case(3, 3, 1)]
+    #[case(4, 4, 1)]
+    #[case(5, 5, 1)]
+    #[case(5, 6, 0)]
+    #[case(4, 1, 4)]
+    #[case(4, 2, 6)]
+    #[case(4, 3, 4)]
+    #[case(4, 4, 1)]
+    #[case(30, 15, 155_117_520)]
+    fn test_binomial_integer(#[case] n: usize, #[case] k: usize, #[case] expected_result: i128) {
+        assert_eq!(binomial::<i128>(n, k), expected_result);
+    }
+
+    #[rstest]
+    #[case(0, 0, NotNan::from(1))]
+    #[case(5, 0, NotNan::from(1))]
+    #[case(100, 0, NotNan::from(1))]
+    #[case(1, 1, NotNan::from(1))]
+    #[case(2, 2, NotNan::from(1))]
+    #[case(3, 3, NotNan::from(1))]
+    #[case(4, 4, NotNan::from(1))]
+    #[case(5, 5, NotNan::from(1))]
+    #[case(4, 1, NotNan::from(4))]
+    #[case(4, 2, NotNan::from(6))]
+    #[case(4, 3, NotNan::from(4))]
+    #[case(4, 4, NotNan::from(1))]
+    #[case(30, 15, NotNan::from(155_117_520))]
+    fn test_binomial_float(
+        #[case] n: usize,
+        #[case] k: usize,
+        #[case] expected_result: NotNan<f64>,
+    ) {
+        assert_eq!(binomial::<NotNan<f64>>(n, k), expected_result);
+    }
+
+    #[rstest]
+    #[case(0, 0, Ratio::from_integer(1))]
+    #[case(5, 0, Ratio::from_integer(1))]
+    #[case(100, 0, Ratio::from_integer(1))]
+    #[case(1, 1, Ratio::from_integer(1))]
+    #[case(2, 2, Ratio::from_integer(1))]
+    #[case(3, 3, Ratio::from_integer(1))]
+    #[case(4, 4, Ratio::from_integer(1))]
+    #[case(5, 5, Ratio::from_integer(1))]
+    #[case(5, 6, Ratio::from_integer(0))]
+    #[case(4, 1, Ratio::from_integer(4))]
+    #[case(4, 2, Ratio::from_integer(6))]
+    #[case(4, 3, Ratio::from_integer(4))]
+    #[case(4, 4, Ratio::from_integer(1))]
+    #[case(30, 15, Ratio::from_integer(155_117_520))]
+    fn test_binomial_ratio(
+        #[case] n: usize,
+        #[case] k: usize,
+        #[case] expected_result: Ratio<i128>,
+    ) {
+        assert_eq!(binomial::<Ratio<i128>>(n, k), expected_result);
+    }
 
     #[test]
     fn test_bernoulli_sequence() {

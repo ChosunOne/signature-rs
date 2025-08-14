@@ -9,7 +9,7 @@ use crate::{
     lyndon::{Generator, LyndonWord},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct LieSeries<T: Generator, U: Arith + Send + Sync> {
     /// The Lyndon basis for the series
     basis: Vec<LyndonWord<T>>,

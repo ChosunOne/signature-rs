@@ -60,8 +60,8 @@ pub fn goldberg_coeff_numerator<U: Arith>(q: &[usize], a_first: bool) -> U {
                 h = d.clone() / U::from_i128(FACTORIALS[l]).expect("Failed to convert from i128");
             } else if a_current && i == m - 2 {
                 h = d.clone()
-                    / U::from_i128(FACTORIALS[r] * FACTORIALS[q[i + 1]])
-                        .expect("Faield to convert from i128");
+                    / (U::from_i128(FACTORIALS[r]).expect("Failed to convert from i128")
+                        * U::from_i128(FACTORIALS[q[i + 1]]).expect("Faield to convert from i128"));
             }
             c[(l - 1) * n] = h;
             for k in 2..l {
@@ -76,11 +76,12 @@ pub fn goldberg_coeff_numerator<U: Arith>(q: &[usize], a_first: bool) -> U {
                     for j in 1..=q[i + 1] {
                         if l > r + j && c[k - 2 + n * (l - r - j - 1)] != U::zero() {
                             h += c[k - 2 + n * (l - r - j - 1)].clone()
-                                / U::from_i128(FACTORIALS[r]).expect("Failed to convert from i128")
-                                * U::from_i128(FACTORIALS[j]).expect(
-                                    "Faield to convert from
+                                / (U::from_i128(FACTORIALS[r])
+                                    .expect("Failed to convert from i128")
+                                    * U::from_i128(FACTORIALS[j]).expect(
+                                        "Faield to convert from
 * i128",
-                                );
+                                    ));
                         }
                     }
                 }
