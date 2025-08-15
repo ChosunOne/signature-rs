@@ -200,6 +200,7 @@ mod test {
 
     #[rstest]
     #[case(
+        3,
         array![
             [0.0, 0., 0.],
             [1.0, 2.0, 3.0],
@@ -221,6 +222,7 @@ mod test {
             0.,
         ])]
     #[case(
+        3,
         array![
             [0.0, 0., 0.],
             [1.0, 2.0, 3.0],
@@ -243,6 +245,7 @@ mod test {
             1.166667,
         ])]
     #[case(
+        3,
         array![
             [0.0, 0., 0.],
             [1.0, 2.0, 3.0],
@@ -267,6 +270,7 @@ mod test {
             7.666667,
         ])]
     #[case(
+        3,
         array![
             [0.0, 0., 0.],
             [-0.077, 0.042, -0.067],
@@ -290,19 +294,64 @@ mod test {
           -0.038903,
            0.001568,
         ])]
+    #[case(
+        4,
+        array![
+            [0.0, 0., 0.],
+            [1.0, 2.0, 3.0],
+            [6.0, 5.0, 4.0],
+        ],
+        vec![
+            6.000000,
+            5.000000,
+            4.000000,
+            -3.500000,
+            -7.000000,
+            -3.500000,
+            2.333333,
+            4.666667,
+            -0.583333,
+            3.500000,
+            0.000000,
+            2.333333,
+            0.583333,
+            1.166667,
+            1.458333,
+            2.916667,
+            -3.791667,
+            -3.208333,
+            -12.250000,
+            -9.333333,
+            -1.458333,
+            1.750000,
+            3.500000,
+            2.916667,
+            -3.791667,
+            6.708333,
+            2.625000,
+            7.291667,
+            1.750000,
+            1.750000,
+            -3.208333,
+            0.875000,
+        ]
+    )]
     fn test_log_sig_builder_from_path(
+        #[case] max_degree: usize,
         #[case] path: Array2<f64>,
         #[case] expected_coefficients: Vec<f64>,
     ) {
         let builder = LogSignatureBuilder::<u8>::new()
-            .with_max_degree(3)
+            .with_max_degree(max_degree)
             .with_num_dimensions(3);
         let path = path.mapv(|v| NotNan::new(v).expect("value not to be a number"));
         let log_sig = builder.build_from_path(&path);
         for (i, c) in log_sig.series.commutator_basis.iter().enumerate() {
             println!("{i}: {} \t {c}", log_sig.series.basis[i]);
         }
-        dbg!(&log_sig.series.coefficients);
+        for (i, c) in log_sig.series.coefficients.iter().enumerate() {
+            println!("[{i}]: {c}");
+        }
         assert_eq!(
             log_sig.series.coefficients.len(),
             expected_coefficients.len()
