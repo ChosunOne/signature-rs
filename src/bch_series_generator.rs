@@ -675,7 +675,6 @@ mod test {
             .zip(expected_left_factor.iter())
             .enumerate()
         {
-            dbg!(i);
             assert_eq!(term, expected_term);
         }
         let expected_right_factor = [
@@ -694,14 +693,12 @@ mod test {
             4, // ABABB
             1, // ABBBB
         ];
-        dbg!(&lie_series.right_factor);
         for (i, (term, expected_term)) in lie_series
             .right_factor
             .iter()
             .zip(expected_right_factor.iter())
             .enumerate()
         {
-            dbg!(i);
             assert_eq!(term, expected_term);
         }
 
@@ -727,7 +724,6 @@ mod test {
             .zip(expected_multi_degree_indices.iter())
             .enumerate()
         {
-            dbg!(i);
             assert_eq!(term, expected_term);
         }
     }
@@ -763,13 +759,11 @@ mod test {
             Ratio::new(-1, 120), // ABABB
             Ratio::new(-1, 720), // ABBBB
         ];
-        dbg!(&goldberg_coefficients);
         for (i, (term, expected_term)) in goldberg_coefficients
             .iter()
             .zip(expected_goldberg_coefficients.iter())
             .enumerate()
         {
-            dbg!(i);
             assert_eq!(term, expected_term);
         }
     }
@@ -796,13 +790,11 @@ mod test {
             Ratio::new(-1, 720),
         ];
 
-        dbg!(&bch_coefficients);
         for (i, (term, expected_term)) in bch_coefficients
             .iter()
             .zip(expected_bch_coefficients.iter())
             .enumerate()
         {
-            dbg!(i);
             assert_eq!(term, expected_term);
         }
     }

@@ -12,7 +12,7 @@ use crate::{
 #[derive(Debug, Default, Clone)]
 pub struct LieSeries<T: Generator, U: Arith + Send + Sync> {
     /// The Lyndon basis for the series
-    basis: Vec<LyndonWord<T>>,
+    pub basis: Vec<LyndonWord<T>>,
     /// The commutator basis for the series
     pub commutator_basis: Vec<CommutatorTerm<U, T>>,
     /// A map for converting arbitrary commutator terms to basis elements
@@ -235,6 +235,7 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
 
     /// Calculates the lie bracket `[A, B]` for a lie series for terms within the commutator basis.
     fn commutator(&self, other: &Self) -> Self::Output {
+        println!("COMMUTATOR START");
         let mut coefficients = vec![U::default(); self.coefficients.len()];
         for i in 0..self.coefficients.len() {
             let a = &self.commutator_basis[i];
@@ -244,6 +245,43 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
                 }
                 let b = &other.commutator_basis[j];
                 let comm_term = comm![a, b];
+
+                // Handle potential Jacobi identity
+                if !self.commutator_basis_map.contains_key(&comm_term) {
+                    let Some((left_term, right_term)) = comm_term.jacobi_identity() else {
+                        continue;
+                    };
+
+                    let Some(left_basis_term) = self.commutator_basis_map.get(&left_term) else {
+                        continue;
+                    };
+                    let Some(right_basis_term) = self.commutator_basis_map.get(&right_term) else {
+                        continue;
+                    };
+
+                    let left_basis_index = self.commutator_basis_index_map[left_basis_term];
+                    let right_basis_index = self.commutator_basis_index_map[right_basis_term];
+                    let CommutatorTerm::Expression(l_comm_expr) = left_basis_term else {
+                        panic!("Failed to create commutator expression from term");
+                    };
+                    let CommutatorTerm::Expression(r_comm_expr) = right_basis_term else {
+                        panic!("Failed to create commutator expression from term");
+                    };
+
+                    dbg!(left_basis_index);
+                    dbg!(self[i].clone() * other[j].clone() * l_comm_expr.coefficient.clone());
+
+                    dbg!(right_basis_index);
+                    dbg!(self[i].clone() * other[j].clone() * r_comm_expr.coefficient.clone());
+
+                    println!("{comm_term}");
+                    coefficients[left_basis_index] +=
+                        self[i].clone() * other[j].clone() * l_comm_expr.coefficient.clone();
+                    coefficients[right_basis_index] +=
+                        self[i].clone() * other[j].clone() * r_comm_expr.coefficient.clone();
+                    continue;
+                }
+
                 let Some(basis_term) = self.commutator_basis_map.get(&comm_term) else {
                     continue;
                 };
@@ -253,10 +291,17 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
                     panic!("Failed to create commutator expression from term");
                 };
 
+                println!("comm_term: {comm_term}");
+                println!("basis_index: {basis_index}");
+                println!(
+                    "coefficients[{basis_index}] += {:?}",
+                    self[i].clone() * other[j].clone() * comm_expr.coefficient.clone()
+                );
                 coefficients[basis_index] +=
                     self[i].clone() * other[j].clone() * comm_expr.coefficient.clone();
             }
         }
+        println!("COMMUTATOR END");
         Self {
             basis: self.basis.clone(),
             commutator_basis: self.commutator_basis.clone(),

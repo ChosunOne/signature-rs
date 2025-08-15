@@ -15,17 +15,13 @@ use std::{
 };
 
 #[derive(Default, Debug)]
-pub struct LogSignatureBuilder<
-    T: Generator + Default + Send + Sync = u8,
-    U: Arith + Send + Sync = NotNan<f64>,
-> {
+pub struct LogSignatureBuilder<T: Generator + Default + Send + Sync = u8> {
     /// The maximum degree of terms to include in the log signature
     max_degree: usize,
     lyndon_basis: LyndonBasis<T>,
-    bch_series: LieSeries<u8, U>,
 }
 
-impl<T: Generator + Default + Send + Sync, U: Arith + Send + Sync> LogSignatureBuilder<T, U> {
+impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -56,7 +52,7 @@ impl<T: Generator + Default + Send + Sync, U: Arith + Send + Sync> LogSignatureB
     }
 
     #[must_use]
-    pub fn build(&self) -> LogSignature<T, U> {
+    pub fn build<U: Arith + Send + Sync>(&self) -> LogSignature<T, U> {
         let bch_basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
         let bch_series = BchSeriesGenerator::new(bch_basis, self.max_degree).generate_lie_series();
         let basis = self.lyndon_basis.generate_basis(self.max_degree);
@@ -66,7 +62,7 @@ impl<T: Generator + Default + Send + Sync, U: Arith + Send + Sync> LogSignatureB
     }
 
     #[must_use]
-    pub fn build_from_path<D: Dimension + RemoveAxis>(
+    pub fn build_from_path<D: Dimension + RemoveAxis, U: Arith + Send + Sync>(
         &self,
         path: &Array<U, D>,
     ) -> LogSignature<T, U> {
@@ -77,9 +73,7 @@ impl<T: Generator + Default + Send + Sync, U: Arith + Send + Sync> LogSignatureB
             let start = window.index_axis(Axis(0), 0);
             let end = window.index_axis(Axis(0), 1);
             let displacement = (&end - &start).iter().cloned().collect::<Vec<_>>();
-            log_sig_segment
-                .series
-                .coefficients
+            log_sig_segment.series.coefficients[..self.lyndon_basis.alphabet_size]
                 .clone_from_slice(&displacement[..self.lyndon_basis.alphabet_size]);
             log_sig.concatenate_assign(&log_sig_segment);
         }
@@ -197,13 +191,134 @@ fn evaluate_commutator_term<T: Generator, U: Arith + Send + Sync>(
 
 #[cfg(test)]
 mod test {
+    use ndarray::{Array2, array};
     use num_rational::Ratio;
+    use num_traits::ToPrimitive;
+    use rstest::rstest;
 
     use super::*;
 
+    #[rstest]
+    #[case(
+        array![
+            [0.0, 0., 0.],
+            [1.0, 2.0, 3.0],
+        ],
+        vec![
+            1.000000,
+            2.000000,
+            3.000000,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+            0.,
+        ])]
+    #[case(
+        array![
+            [0.0, 0., 0.],
+            [1.0, 2.0, 3.0],
+            [6.0, 5.0, 4.0],
+        ],
+        vec![
+            6.,
+            5.,
+            4.,
+            -3.5,
+            -7.,
+            -3.5,
+            2.333333,
+            4.666667,
+            -0.583333,
+            3.5,
+            0.,
+            2.333333,
+            0.583333,
+            1.166667,
+        ])]
+    // #[case(
+    //     array![
+    //         [0.0, 0., 0.],
+    //         [1.0, 2.0, 3.0],
+    //         [6.0, 5.0, 4.0],
+    //         [7.0, 8.0, 9.0],
+    //         [12.0, 11.0, 10.0]
+    //     ],
+    //     vec![
+    //         12.000000,
+    //         11.000000,
+    //         10.000000,
+    //         -6.500000,
+    //         -13.000000,
+    //         -6.500000,
+    //         -1.166667,
+    //         -2.333333,
+    //         4.416667,
+    //         6.500000,
+    //         16.500000,
+    //         15.333333,
+    //         -4.416667,
+    //         7.666667,
+    //     ])]
+    // #[case(
+    //     array![
+    //         [0.0, 0., 0.],
+    //         [-0.077, 0.042, -0.067],
+    //         [-0.154, 0.675, 0.006],
+    //         [0.916, 1.177, -0.139],
+    //         [1.095, 0.823, -0.261]
+    //     ],
+    //     vec![
+    //        1.095000,
+    //        0.823000,
+    //       -0.261000,
+    //       -0.690006,
+    //       -0.040871,
+    //       -0.124105,
+    //        0.098690,
+    //       -0.004304,
+    //        0.146613,
+    //        0.024960,
+    //        0.044713,
+    //       -0.000215,
+    //       -0.038903,
+    //        0.001568,
+    //     ])]
+    fn test_log_sig_builder_from_path(
+        #[case] path: Array2<f64>,
+        #[case] expected_coefficients: Vec<f64>,
+    ) {
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_max_degree(3)
+            .with_num_dimensions(3);
+        let path = path.mapv(|v| NotNan::new(v).expect("value not to be a number"));
+        let log_sig = builder.build_from_path(&path);
+        for (i, c) in log_sig.series.commutator_basis.iter().enumerate() {
+            println!("{i}: {} \t {c}", log_sig.series.basis[i]);
+        }
+        dbg!(&log_sig.series.coefficients);
+        assert_eq!(
+            log_sig.series.coefficients.len(),
+            expected_coefficients.len()
+        );
+        for (i, &c) in expected_coefficients.iter().enumerate() {
+            assert!(
+                (c - log_sig.series.coefficients[i].to_f64().unwrap()).abs() < 0.0001,
+                "{i}: {} != {c}",
+                log_sig.series.coefficients[i].to_f64().unwrap()
+            );
+        }
+    }
+
     #[test]
     fn test_log_sig_concat() {
-        let builder = LogSignatureBuilder::<u8, Ratio<i128>>::new()
+        let builder = LogSignatureBuilder::<u8>::new()
             .with_num_dimensions(2)
             .with_max_degree(3);
         let mut a = builder.build();

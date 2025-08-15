@@ -652,7 +652,6 @@ mod test {
         ];
         assert_eq!(mu.len(), expected_mu.len());
         for (i, (term, expected_term)) in mu.iter().zip(expected_mu.iter()).enumerate() {
-            dbg!(i);
             assert_eq!(term, expected_term);
         }
     }
@@ -671,7 +670,6 @@ mod test {
             .zip(expected_num_words_per_degree.iter())
             .enumerate()
         {
-            dbg!(i);
             assert_eq!(term, expected_term);
         }
     }

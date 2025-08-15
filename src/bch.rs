@@ -148,8 +148,6 @@ mod test {
         #[case] a_first: bool,
         #[case] expected_coeff: Ratio<i128>,
     ) {
-        dbg!(&q_m);
-        dbg!(a_first);
         let n: usize = q_m.iter().sum();
         let coeff = Ratio::new(
             goldberg_coeff_numerator::<i128>(&q_m, a_first),

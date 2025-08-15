@@ -296,9 +296,7 @@ mod test {
         #[case] paths: Vec<Vec<usize>>,
     ) -> Result<(), LyndonWordError> {
         let word = letters.parse::<LyndonWord<char>>()?;
-        dbg!(&word);
         let tree = RootedTree::from(word);
-        dbg!(&tree);
         assert_eq!(tree.degree(), letters.len());
         assert_eq!(tree.color, letters.chars().collect::<Vec<_>>()[0]);
         for (path, expected_color) in paths.iter().zip(letters.chars().skip(1)) {
@@ -350,15 +348,10 @@ mod test {
         #[case] word_2_letters: &str,
     ) -> Result<(), LyndonWordError> {
         let word_1 = word_1_letters.parse::<LyndonWord<char>>()?;
-        dbg!(&word_1);
         let word_2 = word_2_letters.parse::<LyndonWord<char>>()?;
-        dbg!(&word_2);
         let mut tree_1 = RootedTree::from(word_1);
-        dbg!(&tree_1);
         let tree_2 = RootedTree::from(word_2);
-        dbg!(&tree_2);
         tree_1.graft(tree_2);
-        dbg!(&tree_1);
         let reconstructed_word = LyndonWord::try_from(&tree_1)?;
         let expected_word = (word_1_letters.to_owned() + word_2_letters)
             .as_str()
@@ -478,7 +471,6 @@ mod test {
             .zip(expected_s.iter())
             .enumerate()
         {
-            dbg!(i);
             assert_eq!(&s_ui.partitions, expected_s_ui);
         }
     }

@@ -1,7 +1,7 @@
 use crate::{
     lyndon::{Generator, LyndonWord}, Arith
 };
-use std::{fmt::Debug, ops::{Mul, Neg}, hash::Hash};
+use std::{fmt::{Debug, Display}, hash::Hash, ops::{Mul, Neg}};
 
 
 pub trait Commutator<Rhs = Self> {
@@ -30,6 +30,15 @@ macro_rules! comm {
 pub enum CommutatorTerm<T: Arith, U: Clone + Debug + Hash + PartialEq + PartialOrd> {
     Atom(U),
     Expression(CommutatorExpression<T, U>),
+}
+
+impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Display for CommutatorTerm<T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Atom(a) => write!(f, "{a:?}"),
+            Self::Expression(e) => write!(f, "{e}")
+        }
+    }
 }
 
 
@@ -63,6 +72,35 @@ impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Commuta
                     }
                 }
             }
+        }
+    }
+
+    /// Uses the anti-symmetry property to produce the form `[[A, B], C] = [A, [B, C]] - [B, [A, C]]`
+    pub fn jacobi_identity(&self) -> Option<(Self, Self)> {
+        match self {
+            CommutatorTerm::Atom(_) => None,
+            CommutatorTerm::Expression(e) => {
+                // Check if expression is already in basis form
+                let CommutatorTerm::Expression(e_l) = &*e.left else { return None};
+                let a = e_l.left.clone();
+                let b = e_l.right.clone();
+                let c = e.right.clone();
+
+                let mut left_term = {
+                    let CommutatorTerm::Expression(mut e1) = comm![a, comm![b, c]] else { return None };
+                    e1.coefficient = e.coefficient.clone();
+                    CommutatorTerm::Expression(e1)
+                };
+                left_term.lyndon_sort();
+                let mut right_term = {
+                    let CommutatorTerm::Expression(mut e2) = comm![b, comm![a, c]] else { return None };
+                    e2.coefficient = -e.coefficient.clone();
+                    CommutatorTerm::Expression(e2)
+                };
+                right_term.lyndon_sort();
+
+                Some((left_term, right_term))
+            },
         }
     }
 }
@@ -190,6 +228,19 @@ impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash>
             coefficient: -self.coefficient.clone(),
             left: self.right.clone(),
             right: self.left.clone(),
+        }
+    }
+}
+
+impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Display for CommutatorExpression<T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.coefficient.is_one() {
+            write!(f, "[{}, {}]", self.left, self.right)
+        } else if self.coefficient == -T::one() {
+            write!(f, "-[{}, {}]", self.left, self.right)
+        } 
+        else {
+            write!(f, "{:?} * [{}, {}]", self.coefficient, self.left, self.right)
         }
     }
 }
@@ -659,6 +710,18 @@ mod test {
     ) {
         term.lyndon_sort();
         assert_eq!(term, expected_term);
+    }
+
+    #[rstest]
+    #[case(comm![comm![CommutatorTerm::Atom('A'), CommutatorTerm::Atom('B')], CommutatorTerm::Atom('C')], comm![CommutatorTerm::Atom('A'), comm![CommutatorTerm::Atom('B'), CommutatorTerm::Atom('C')]], CommutatorTerm::Expression(CommutatorExpression {
+        coefficient: 1,
+        left: Box::new(comm![CommutatorTerm::Atom('A'), CommutatorTerm::Atom('C')]),
+        right: Box::new(CommutatorTerm::Atom('B')),
+    }))]
+    fn test_commutator_term_jacobi_identity(#[case] term: CommutatorTerm<i128, char>, #[case] expected_left_term: CommutatorTerm<i128, char>, #[case] expected_right_term: CommutatorTerm<i128, char>) {
+        let Some((left_term, right_term)) = term.jacobi_identity() else { panic!("Failed to create jacobi identity"); };
+        assert_eq!(left_term, expected_left_term);
+        assert_eq!(right_term, expected_right_term);
     }
 
     #[rstest]
