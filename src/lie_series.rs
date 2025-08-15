@@ -213,9 +213,26 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
                 let term = comm![a, b];
                 let mut lyndon_term = term.clone();
                 lyndon_term.lyndon_sort();
+
                 // Only include terms that are in our basis
                 if commutator_basis_index_map.contains_key(&lyndon_term) {
-                    commutator_basis_map.insert(term, lyndon_term);
+                    let neg_term = {
+                        let CommutatorTerm::Expression(mut neg_exp) = term.clone() else {
+                            panic!("Failed to create expression from term");
+                        };
+                        neg_exp.coefficient = -neg_exp.coefficient;
+                        CommutatorTerm::Expression(neg_exp)
+                    };
+                    let neg_lyndon_term = {
+                        let CommutatorTerm::Expression(mut neg_exp) = lyndon_term.clone() else {
+                            panic!("Failed to create expression from term");
+                        };
+                        neg_exp.coefficient = -neg_exp.coefficient;
+                        CommutatorTerm::Expression(neg_exp)
+                    };
+
+                    commutator_basis_map.insert(term, lyndon_term.clone());
+                    commutator_basis_map.insert(neg_term, neg_lyndon_term);
                 }
             }
         }
@@ -235,7 +252,6 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
 
     /// Calculates the lie bracket `[A, B]` for a lie series for terms within the commutator basis.
     fn commutator(&self, other: &Self) -> Self::Output {
-        println!("COMMUTATOR START");
         let mut coefficients = vec![U::default(); self.coefficients.len()];
         for i in 0..self.coefficients.len() {
             let a = &self.commutator_basis[i];
@@ -248,7 +264,9 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
 
                 // Handle potential Jacobi identity
                 if !self.commutator_basis_map.contains_key(&comm_term) {
-                    let Some((left_term, right_term)) = comm_term.jacobi_identity() else {
+                    let mut lyndon_comm_term = comm_term.clone();
+                    lyndon_comm_term.lyndon_sort();
+                    let Some((left_term, right_term)) = lyndon_comm_term.jacobi_identity() else {
                         continue;
                     };
 
@@ -268,13 +286,6 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
                         panic!("Failed to create commutator expression from term");
                     };
 
-                    dbg!(left_basis_index);
-                    dbg!(self[i].clone() * other[j].clone() * l_comm_expr.coefficient.clone());
-
-                    dbg!(right_basis_index);
-                    dbg!(self[i].clone() * other[j].clone() * r_comm_expr.coefficient.clone());
-
-                    println!("{comm_term}");
                     coefficients[left_basis_index] +=
                         self[i].clone() * other[j].clone() * l_comm_expr.coefficient.clone();
                     coefficients[right_basis_index] +=
@@ -291,17 +302,10 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
                     panic!("Failed to create commutator expression from term");
                 };
 
-                println!("comm_term: {comm_term}");
-                println!("basis_index: {basis_index}");
-                println!(
-                    "coefficients[{basis_index}] += {:?}",
-                    self[i].clone() * other[j].clone() * comm_expr.coefficient.clone()
-                );
                 coefficients[basis_index] +=
                     self[i].clone() * other[j].clone() * comm_expr.coefficient.clone();
             }
         }
-        println!("COMMUTATOR END");
         Self {
             basis: self.basis.clone(),
             commutator_basis: self.commutator_basis.clone(),
@@ -319,10 +323,19 @@ mod test {
     use super::*;
 
     #[rstest]
-    #[case(2, vec![1, 2, 3], vec![4, 5, 6], vec![0, 0, -3])]
-    #[case(2, vec![3, 2, 1], vec![1, 2, 3], vec![0, 0, 4])]
-    #[case(3, vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9, 10], vec![0, 0, -5, -10, 5])]
+    #[case(2, 2, vec![1, 2, 3], vec![4, 5, 6], vec![0, 0, -3])]
+    #[case(2, 2, vec![3, 2, 1], vec![1, 2, 3], vec![0, 0, 4])]
+    #[case(2, 3, vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9, 10], vec![0, 0, -5, -10, 5])]
+    #[case(3, 3,
+        vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![5, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![0, 0, 0, -7, -14, -7, 0, 0, 0, 0, 0, 0, 0, 0])]
+    #[case(3, 3,
+        vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![0, 0, 0, -7, -14, -7, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![0, 0, 0, 0, 0, 0, -7, -14, 14, 14, 49, 42, -14, 21])]
     fn test_lie_series_commutation(
+        #[case] num_generators: usize,
         #[case] basis_depth: usize,
         #[case] a_coefficients: Vec<i128>,
         #[case] b_coefficients: Vec<i128>,
@@ -332,7 +345,8 @@ mod test {
 
         use crate::lyndon::{LyndonBasis, Sort};
 
-        let basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical).generate_basis(basis_depth);
+        let basis = LyndonBasis::<u8>::new(num_generators, Sort::Lexicographical)
+            .generate_basis(basis_depth);
         let a_coefficients = a_coefficients
             .into_iter()
             .map(Ratio::<i128>::from_integer)
@@ -349,6 +363,14 @@ mod test {
             .collect::<Vec<_>>();
 
         let series = comm![a, b];
-        assert_eq!(series.coefficients, expected_coefficients);
+        assert_eq!(series.coefficients.len(), expected_coefficients.len());
+        dbg!(&series.coefficients);
+        for (i, c) in series.coefficients.iter().enumerate() {
+            assert_eq!(
+                *c, expected_coefficients[i],
+                "{i}: {c:?} != {:?}",
+                expected_coefficients[i]
+            );
+        }
     }
 }

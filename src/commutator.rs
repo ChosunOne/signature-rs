@@ -88,13 +88,13 @@ impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Commuta
 
                 let mut left_term = {
                     let CommutatorTerm::Expression(mut e1) = comm![a, comm![b, c]] else { return None };
-                    e1.coefficient = e.coefficient.clone();
+                    e1.coefficient *= e.coefficient.clone();
                     CommutatorTerm::Expression(e1)
                 };
                 left_term.lyndon_sort();
                 let mut right_term = {
                     let CommutatorTerm::Expression(mut e2) = comm![b, comm![a, c]] else { return None };
-                    e2.coefficient = -e.coefficient.clone();
+                    e2.coefficient *= -e.coefficient.clone();
                     CommutatorTerm::Expression(e2)
                 };
                 right_term.lyndon_sort();
