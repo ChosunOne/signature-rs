@@ -198,11 +198,7 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
         let mut commutator_basis_index_map = HashMap::new();
         for (i, a) in commutator_basis.iter().enumerate() {
             commutator_basis_index_map.insert(a.clone(), i);
-            if let CommutatorTerm::Expression(e) = a {
-                let mut e = e.clone();
-                e.coefficient = -e.coefficient.clone();
-                commutator_basis_index_map.insert(CommutatorTerm::Expression(e), i);
-            }
+            commutator_basis_index_map.insert(-a.clone(), i);
         }
 
         for a in &commutator_basis {
@@ -216,20 +212,8 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
 
                 // Only include terms that are in our basis
                 if commutator_basis_index_map.contains_key(&lyndon_term) {
-                    let neg_term = {
-                        let CommutatorTerm::Expression(mut neg_exp) = term.clone() else {
-                            panic!("Failed to create expression from term");
-                        };
-                        neg_exp.coefficient = -neg_exp.coefficient;
-                        CommutatorTerm::Expression(neg_exp)
-                    };
-                    let neg_lyndon_term = {
-                        let CommutatorTerm::Expression(mut neg_exp) = lyndon_term.clone() else {
-                            panic!("Failed to create expression from term");
-                        };
-                        neg_exp.coefficient = -neg_exp.coefficient;
-                        CommutatorTerm::Expression(neg_exp)
-                    };
+                    let neg_term = -term.clone();
+                    let neg_lyndon_term = -lyndon_term.clone();
 
                     commutator_basis_map.insert(term, lyndon_term.clone());
                     commutator_basis_map.insert(neg_term, neg_lyndon_term);
@@ -279,17 +263,25 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
 
                     let left_basis_index = self.commutator_basis_index_map[left_basis_term];
                     let right_basis_index = self.commutator_basis_index_map[right_basis_term];
-                    let CommutatorTerm::Expression(l_comm_expr) = left_basis_term else {
+                    let CommutatorTerm::Expression {
+                        coefficient: l_coefficient,
+                        ..
+                    } = left_basis_term
+                    else {
                         panic!("Failed to create commutator expression from term");
                     };
-                    let CommutatorTerm::Expression(r_comm_expr) = right_basis_term else {
+                    let CommutatorTerm::Expression {
+                        coefficient: r_coefficient,
+                        ..
+                    } = right_basis_term
+                    else {
                         panic!("Failed to create commutator expression from term");
                     };
 
                     coefficients[left_basis_index] +=
-                        self[i].clone() * other[j].clone() * l_comm_expr.coefficient.clone();
+                        self[i].clone() * other[j].clone() * l_coefficient.clone();
                     coefficients[right_basis_index] +=
-                        self[i].clone() * other[j].clone() * r_comm_expr.coefficient.clone();
+                        self[i].clone() * other[j].clone() * r_coefficient.clone();
                     continue;
                 }
 
@@ -298,12 +290,12 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
                 };
 
                 let basis_index = self.commutator_basis_index_map[basis_term];
-                let CommutatorTerm::Expression(comm_expr) = basis_term else {
+                let CommutatorTerm::Expression { coefficient, .. } = basis_term else {
                     panic!("Failed to create commutator expression from term");
                 };
 
                 coefficients[basis_index] +=
-                    self[i].clone() * other[j].clone() * comm_expr.coefficient.clone();
+                    self[i].clone() * other[j].clone() * coefficient.clone();
             }
         }
         Self {

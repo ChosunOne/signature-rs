@@ -1,4 +1,4 @@
-use ndarray::{Array, Axis, Dimension, RemoveAxis, s};
+use ndarray::{Array, Axis, Dimension, RemoveAxis};
 
 use crate::{
     Arith, LieSeriesGenerator,
@@ -11,6 +11,7 @@ use crate::{
 use ordered_float::NotNan;
 use std::{
     collections::HashMap,
+    fmt::Display,
     ops::{Index, IndexMut},
 };
 
@@ -88,7 +89,9 @@ pub struct LogSignature<T: Generator + Send + Sync = u8, U: Arith + Send + Sync 
     pub bch_series: LieSeries<u8, U>,
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Send + Sync> Index<usize> for LogSignature<T, U> {
+impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<usize>
+    for LogSignature<T, U>
+{
     type Output = U;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -96,7 +99,7 @@ impl<T: Generator + Send + Sync, U: Arith + Send + Sync> Index<usize> for LogSig
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Send + Sync> Index<LyndonWord<T>>
+impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<LyndonWord<T>>
     for LogSignature<T, U>
 {
     type Output = U;
@@ -106,7 +109,7 @@ impl<T: Generator + Send + Sync, U: Arith + Send + Sync> Index<LyndonWord<T>>
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Send + Sync> Index<&LyndonWord<T>>
+impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<&LyndonWord<T>>
     for LogSignature<T, U>
 {
     type Output = U;
@@ -116,13 +119,15 @@ impl<T: Generator + Send + Sync, U: Arith + Send + Sync> Index<&LyndonWord<T>>
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Send + Sync> IndexMut<usize> for LogSignature<T, U> {
+impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> IndexMut<usize>
+    for LogSignature<T, U>
+{
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.series[index]
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Send + Sync> IndexMut<LyndonWord<T>>
+impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> IndexMut<LyndonWord<T>>
     for LogSignature<T, U>
 {
     fn index_mut(&mut self, index: LyndonWord<T>) -> &mut Self::Output {
@@ -130,7 +135,7 @@ impl<T: Generator + Send + Sync, U: Arith + Send + Sync> IndexMut<LyndonWord<T>>
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Send + Sync> IndexMut<&LyndonWord<T>>
+impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> IndexMut<&LyndonWord<T>>
     for LogSignature<T, U>
 {
     fn index_mut(&mut self, index: &LyndonWord<T>) -> &mut Self::Output {
@@ -175,13 +180,13 @@ fn evaluate_commutator_term<T: Generator, U: Arith + Send + Sync>(
     computed_commutations: &mut HashMap<CommutatorTerm<U, u8>, LieSeries<T, U>>,
 ) -> LieSeries<T, U> {
     match term {
-        &CommutatorTerm::Atom(a) => series[a as usize].clone(),
-        t @ CommutatorTerm::Expression(e) => {
+        &CommutatorTerm::Atom { atom: a, .. } => series[a as usize].clone(),
+        t @ CommutatorTerm::Expression { left, right, .. } => {
             if computed_commutations.contains_key(t) {
                 return computed_commutations[t].clone();
             }
-            let a = evaluate_commutator_term(&e.left, series, computed_commutations);
-            let b = evaluate_commutator_term(&e.right, series, computed_commutations);
+            let a = evaluate_commutator_term(left, series, computed_commutations);
+            let b = evaluate_commutator_term(right, series, computed_commutations);
             let result = comm![a, b];
             computed_commutations.insert(t.clone(), result.clone());
             result

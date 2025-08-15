@@ -28,47 +28,106 @@ macro_rules! comm {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CommutatorTerm<T: Arith, U: Clone + Debug + Hash + PartialEq + PartialOrd> {
-    Atom(U),
-    Expression(CommutatorExpression<T, U>),
+    Atom{
+        coefficient: T,
+        atom: U,
+    },
+    Expression{
+        coefficient: T,
+        left: Box<Self>,
+        right: Box<Self>,
+    },
 }
 
-impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Display for CommutatorTerm<T, U> {
+impl<T: Arith + Display, U: Clone + Display + Debug + PartialEq + PartialOrd + Hash> Display for CommutatorTerm<T, U> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Atom(a) => write!(f, "{a:?}"),
-            Self::Expression(e) => write!(f, "{e}")
+            Self::Atom{ coefficient, atom} => {
+                if coefficient.is_one() {
+                    write!(f, "{atom}")
+                } else {
+                    write!(f, "{coefficient} * {atom}")
+                }
+            }
+            Self::Expression { coefficient, left, right} => {
+                if coefficient.is_one() {
+                    write!(f, "[{left}, {right}]")
+                } else {
+                    write!(f, "{coefficient} * [{left}, {right}]")
+                }
+            }
+        }
+    }
+}
+
+impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Mul<T> for CommutatorTerm<T, U> {
+    type Output = Self;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        match self {
+            Self::Atom { coefficient, atom } => {
+                Self::Atom {
+                    coefficient: coefficient * rhs,
+                    atom
+                }
+            } ,
+            Self::Expression { coefficient, left, right } => {
+                Self::Expression { coefficient: coefficient * rhs, left, right }
+            }
+        }
+    }
+}
+
+impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Neg for CommutatorTerm<T, U> {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        match self {
+            Self::Atom { coefficient, atom} => {
+                Self::Atom {
+                    coefficient: coefficient.neg(),
+                    atom
+                }
+            },
+            Self::Expression { coefficient, left, right} => {
+                Self::Expression {
+                    coefficient: coefficient.neg(),
+                    left,
+                    right
+                }
+            }
         }
     }
 }
 
 
-impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> CommutatorTerm<T, U> {
+impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> CommutatorTerm<T, U> {
     pub fn lyndon_sort(&mut self) {
         match self {
             // Do nothing, already sorted
-            CommutatorTerm::Atom(_) => {}
-            CommutatorTerm::Expression(e) => {
-                e.left.lyndon_sort();
-                e.right.lyndon_sort();
-                if let Some(o) = e.left.partial_cmp(&e.right) { match o {
-                    std::cmp::Ordering::Equal => e.coefficient = T::zero(),
+            CommutatorTerm::Atom { .. } => {}
+            CommutatorTerm::Expression{coefficient,  left, right} => {
+                left.lyndon_sort();
+                right.lyndon_sort();
+                if let Some(o) = left.partial_cmp(&right) { match o {
+                    std::cmp::Ordering::Equal => *coefficient = T::zero(),
                     std::cmp::Ordering::Greater => {
-                        e.coefficient = -e.coefficient.clone();
-                        std::mem::swap(&mut e.left, &mut e.right);
+                        *coefficient = -coefficient.clone();
+                        std::mem::swap(left, right);
                     }
                     _ => {}
                 } }
                 // Propagate up coefficients
-                if let CommutatorTerm::Expression(e2) = &mut *e.left {
-                    e.coefficient *= e2.coefficient.clone();
-                    if e2.coefficient == -T::one() {
-                        e2.coefficient = -e2.coefficient.clone();
+                if let CommutatorTerm::Expression{ coefficient: c2, ..} = &mut **left {
+                    *coefficient *= c2.clone();
+                    if *c2 == -T::one() {
+                        *c2 = -c2.clone();
                     }
                 }
-                if let CommutatorTerm::Expression(e2) = &mut *e.right {
-                    e.coefficient *= e2.coefficient.clone();
-                    if e2.coefficient == -T::one() {
-                        e2.coefficient = -e2.coefficient.clone();
+                if let CommutatorTerm::Expression{ coefficient: c2, ..} = &mut **right {
+                    *coefficient *= c2.clone();
+                    if *c2 == -T::one() {
+                        *c2 = -c2.clone();
                     }
                 }
             }
@@ -78,25 +137,17 @@ impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Commuta
     /// Uses the anti-symmetry property to produce the form `[[A, B], C] = [A, [B, C]] - [B, [A, C]]`
     pub fn jacobi_identity(&self) -> Option<(Self, Self)> {
         match self {
-            CommutatorTerm::Atom(_) => None,
-            CommutatorTerm::Expression(e) => {
+            CommutatorTerm::Atom{ .. } => None,
+            CommutatorTerm::Expression { coefficient, left, right} => {
                 // Check if expression is already in basis form
-                let CommutatorTerm::Expression(e_l) = &*e.left else { return None};
-                let a = e_l.left.clone();
-                let b = e_l.right.clone();
-                let c = e.right.clone();
+                let CommutatorTerm::Expression{ left: l_left, right: l_right, ..} = &**left else { return None};
+                let a = l_left.clone();
+                let b = l_right.clone();
+                let c = right.clone();
 
-                let mut left_term = {
-                    let CommutatorTerm::Expression(mut e1) = comm![a, comm![b, c]] else { return None };
-                    e1.coefficient *= e.coefficient.clone();
-                    CommutatorTerm::Expression(e1)
-                };
+                let mut left_term = comm![a, comm![b, c]] * coefficient.clone();
                 left_term.lyndon_sort();
-                let mut right_term = {
-                    let CommutatorTerm::Expression(mut e2) = comm![b, comm![a, c]] else { return None };
-                    e2.coefficient *= -e.coefficient.clone();
-                    CommutatorTerm::Expression(e2)
-                };
+                let mut right_term = comm![b, comm![a, c]] * -coefficient.clone();
                 right_term.lyndon_sort();
 
                 Some((left_term, right_term))
@@ -105,74 +156,75 @@ impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Commuta
     }
 }
 
-impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Commutator<&Self>
+impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Commutator<&Self>
     for CommutatorTerm<T, U>
 {
     type Output = Self;
 
     fn commutator(&self, other: &Self) -> Self::Output {
         match (self, other) {
-            (a @ CommutatorTerm::Atom(e1), b @ CommutatorTerm::Atom(e2)) => {
-                let coefficient = if e1 == e2 { T::zero() } else { T::one() };
-                CommutatorTerm::Expression(CommutatorExpression {
-                    coefficient,
-                    left: Box::new(a.clone()),
-                    right: Box::new(b.clone()),
-                })
-            }
-            (a @ CommutatorTerm::Atom(_), CommutatorTerm::Expression(e)) => {
-                let coefficient = e.coefficient.clone();
-                let mut right = e.clone();
-                right.coefficient = T::one();
-                let right = Box::new(CommutatorTerm::Expression(right));
-
-                CommutatorTerm::Expression(CommutatorExpression {
-                    coefficient,
-                    left: Box::new(a.clone()),
-                    right,
-                })
-            }
-            (CommutatorTerm::Expression(e), b @ CommutatorTerm::Atom(_)) => {
-                let coefficient = e.coefficient.clone();
-                let mut left = e.clone();
-                left.coefficient = T::one();
-                let left = Box::new(CommutatorTerm::Expression(left));
-                CommutatorTerm::Expression(CommutatorExpression {
+            (a @ CommutatorTerm::Atom {coefficient: c1, atom: a1}, 
+                b @ CommutatorTerm::Atom {coefficient: c2, atom: a2}) => {
+                let coefficient = if  a == b { T::zero() } else { c1.clone() * c2.clone() };
+                let left = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: a1.clone()});
+                let right = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: a2.clone()});
+                CommutatorTerm::Expression{
                     coefficient,
                     left,
-                    right: Box::new(b.clone()),
-                })
+                    right,
+                }
             }
-            (CommutatorTerm::Expression(e1), CommutatorTerm::Expression(e2)) => {
-                let coefficient = if e1 == e2 {
+            (CommutatorTerm::Atom {coefficient: c1, atom}, 
+                CommutatorTerm::Expression {coefficient: c2, left: l1, right}) => {
+                let coefficient = c1.clone() * c2.clone();
+                let left = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: atom.clone()});
+                let right = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l1.clone(), right: right.clone()});
+
+                CommutatorTerm::Expression{
+                    coefficient,
+                    left,
+                    right,
+                }
+            }
+            (CommutatorTerm::Expression {coefficient: c1, left: l1, right: r1}, 
+                CommutatorTerm::Atom{ coefficient: c2, atom }) => {
+                let coefficient = c1.clone() * c2.clone();
+                let left = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone() });
+                let right = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: atom.clone()});
+                CommutatorTerm::Expression {
+                    coefficient,
+                    left,
+                    right
+                }
+            }
+            (a @ CommutatorTerm::Expression {coefficient: c1, left: l1, right: r1},
+                b @ CommutatorTerm::Expression {coefficient: c2, left: l2, right: r2}) => {
+                let coefficient = if a == b {
                     T::zero()
                 } else {
-                    e1.coefficient.clone() * e2.coefficient.clone()
+                    c1.clone() * c2.clone()
                 };
-                let mut left = e1.clone();
-                left.coefficient = T::one();
-                let left = Box::new(CommutatorTerm::Expression(left));
-                let mut right = e2.clone();
-                right.coefficient = T::one();
-                let right = Box::new(CommutatorTerm::Expression(right));
-                CommutatorTerm::Expression(CommutatorExpression {
+                let left = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone()});
+                let right = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l2.clone(), right: r2.clone()});
+
+                CommutatorTerm::Expression {
                     coefficient,
                     left,
                     right,
-                })
+                }
             }
         }
     }
 }
 
-impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> PartialOrd
+impl<T: Arith , U: Clone + Debug + PartialEq + PartialOrd + Hash> PartialOrd
     for CommutatorTerm<T, U>
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (CommutatorTerm::Atom(a), CommutatorTerm::Atom(b)) => a.partial_cmp(b),
-            (CommutatorTerm::Atom(_), CommutatorTerm::Expression(b)) => {
-                match self.partial_cmp(&(*b.left)) {
+            (CommutatorTerm::Atom { atom: a1, ..}, CommutatorTerm::Atom { atom: a2, ..}) => a1.partial_cmp(a2),
+            (CommutatorTerm::Atom { .. }, CommutatorTerm::Expression { left, .. }) => {
+                match self.partial_cmp(&(*left)) {
                     Some(o) => match o {
                         std::cmp::Ordering::Equal => Some(std::cmp::Ordering::Less),
                         _ => Some(o),
@@ -180,8 +232,8 @@ impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Partial
                     None => None,
                 }
             }
-            (CommutatorTerm::Expression(e), CommutatorTerm::Atom(_)) => {
-                match (*e.left).partial_cmp(other) {
+            (CommutatorTerm::Expression { left, ..}, CommutatorTerm::Atom { .. }) => {
+                match (**left).partial_cmp(other) {
                     Some(o) => match o {
                         std::cmp::Ordering::Equal => Some(std::cmp::Ordering::Greater),
                         _ => Some(o),
@@ -189,79 +241,16 @@ impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Partial
                     None => None,
                 }
             }
-            (CommutatorTerm::Expression(s_e), CommutatorTerm::Expression(o_e)) => {
-                match s_e.left.partial_cmp(&o_e.left) {
+            (CommutatorTerm::Expression {left: l1, right: r1, ..}, 
+                CommutatorTerm::Expression {left: l2, right: r2, ..}) => {
+                match l1.partial_cmp(&l2) {
                     Some(o) => match o {
-                        std::cmp::Ordering::Equal => s_e.right.partial_cmp(&o_e.right),
+                        std::cmp::Ordering::Equal => r1.partial_cmp(&r2),
                         _ => Some(o),
                     },
                     None => None,
                 }
             }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommutatorExpressionError {
-    TooShort,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CommutatorExpression<
-    T: Debug + Arith,
-    U: Clone + Debug + PartialEq + PartialOrd + Hash
-> {
-    pub coefficient: T,
-    pub left: Box<CommutatorTerm<T, U>>,
-    pub right: Box<CommutatorTerm<T, U>>,
-}
-
-
-impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash>
-    CommutatorExpression<T, U>
-{
-    /// Implements `[A, B] = -[B, A]`
-    #[must_use]
-    pub fn anti_symm(&self) -> Self {
-        Self {
-            coefficient: -self.coefficient.clone(),
-            left: self.right.clone(),
-            right: self.left.clone(),
-        }
-    }
-}
-
-impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Display for CommutatorExpression<T, U> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.coefficient.is_one() {
-            write!(f, "[{}, {}]", self.left, self.right)
-        } else if self.coefficient == -T::one() {
-            write!(f, "-[{}, {}]", self.left, self.right)
-        } 
-        else {
-            write!(f, "{:?} * [{}, {}]", self.coefficient, self.left, self.right)
-        }
-    }
-}
-
-impl<T: Debug + Arith, U: Clone + Debug + PartialEq + PartialOrd + Hash> Commutator
-    for CommutatorExpression<T, U>
-{
-    type Output = Self;
-
-    fn commutator(&self, other: Self) -> Self::Output {
-        let coefficient = self.coefficient.clone() * other.coefficient.clone();
-        let mut left = self.clone();
-        left.coefficient = T::one();
-        let left = Box::new(CommutatorTerm::Expression(left));
-        let mut right = other.clone();
-        right.coefficient = T::one();
-        let right = Box::new(CommutatorTerm::Expression(right));
-        CommutatorExpression {
-            coefficient,
-            left,
-            right,
         }
     }
 }
@@ -271,41 +260,25 @@ impl<T: Arith, U: Generator + Debug + Clone + Hash> From<&LyndonWord<U>>
 {
     fn from(value: &LyndonWord<U>) -> Self {
         if value.len() == 1 {
-            return CommutatorTerm::Atom(value.letters[0]);
-        }
-        CommutatorTerm::Expression(value.try_into().expect("Failed to make expression"))
-    }
-}
-
-impl<T: Arith, U: Generator + Debug + Clone + Hash> TryFrom<&LyndonWord<U>>
-    for CommutatorExpression<T, U>
-{
-    type Error = CommutatorExpressionError;
-
-    fn try_from(value: &LyndonWord<U>) -> Result<Self, Self::Error> {
-        if value.len() <= 1 {
-            return Err(CommutatorExpressionError::TooShort);
+            return CommutatorTerm::Atom{coefficient: T::one(), atom: value.letters[0]};
         }
 
         let (left, right) = value.factorize();
         let left = if left.len() == 1 {
-            Box::new(CommutatorTerm::Atom(left.letters[0]))
+            Box::new(CommutatorTerm::Atom {coefficient: T::one(), atom: left.letters[0]})
         } else {
-            Box::new(CommutatorTerm::Expression(Self::try_from(&left)?))
+            Box::new(Self::from(&left))
         };
         let right = if right.len() == 1 {
-            Box::new(CommutatorTerm::Atom(right.letters[0]))
+            Box::new(CommutatorTerm::Atom {coefficient: T::one(), atom: right.letters[0]})
         } else {
-            Box::new(CommutatorTerm::Expression(Self::try_from(&right)?))
+            Box::new(Self::from(&right))
         };
 
-        Ok(Self {
-            coefficient: T::one(),
-            left,
-            right,
-        })
+        Self::Expression { coefficient: T::one(), left, right }
     }
 }
+
 
 /// This can represent terms of the form `αe_1⋅⋅⋅e_n`
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -364,26 +337,26 @@ impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd + Hash, U: Arith> Neg 
 }
 
 
-impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd + Hash, U: Arith> From<&CommutatorTerm<U, T>>
+impl<T: Clone + Debug + Display + Eq + Ord + PartialEq + PartialOrd + Hash, U: Arith + Display> From<&CommutatorTerm<U, T>>
     for Vec<FormalIndeterminate<T, U>>
 {
     fn from(value: &CommutatorTerm<U, T>) -> Self {
         match value {
-            CommutatorTerm::Atom(a) => vec![FormalIndeterminate::<T, U> {
-                coefficient: U::one(),
-                symbols: vec![a.clone()],
+            CommutatorTerm::Atom { coefficient, atom} => vec![FormalIndeterminate::<T, U> {
+                coefficient: coefficient.clone(),
+                symbols: vec![atom.clone()],
             }],
-            CommutatorTerm::Expression(e) => {
-                let mut left = Self::from(&*e.left);
-                if let CommutatorTerm::Expression(l) = &*e.left {
+            CommutatorTerm::Expression { left: l1, right: r1, ..} => {
+                let mut left = Self::from(&**l1);
+                if let CommutatorTerm::Expression { coefficient: c_l, ..} = &**l1 {
                     for e_i in &mut left {
-                        e_i.coefficient *= l.coefficient.clone();
+                        e_i.coefficient *= c_l.clone();
                     }
                 }
-                let mut right = Self::from(&*e.right);
-                if let CommutatorTerm::Expression(r) = &*e.right {
+                let mut right = Self::from(&**r1);
+                if let CommutatorTerm::Expression { coefficient: c_r, ..} = &**r1 {
                     for e_i in &mut right {
-                        e_i.coefficient *= r.coefficient.clone();
+                        e_i.coefficient *= c_r.clone();
                     }
                 }
 
@@ -430,45 +403,45 @@ mod test {
 
     #[rstest]
     #[case(
-        CommutatorTerm::<i128, char>::Atom('A'),
-        CommutatorTerm::<i128, char>::Atom('B'),
-        CommutatorTerm::Expression(CommutatorExpression {
+        CommutatorTerm::<i128, char>::Atom {atom: 'A', coefficient: 1},
+        CommutatorTerm::<i128, char>::Atom {atom: 'B', coefficient: 1},
+        CommutatorTerm::Expression {
         coefficient: 1,
-        left: Box::new(CommutatorTerm::<i128, char>::Atom('A')),
-        right: Box::new(CommutatorTerm::<i128, char>::Atom('B')),
-    }))]
+        left: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'A', coefficient: 1}),
+        right: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'B', coefficient: 1}),
+    })]
     #[case(
-        CommutatorTerm::<i128, char>::Atom('B'),
-        CommutatorTerm::<i128, char>::Atom('A'),
-        CommutatorTerm::Expression(CommutatorExpression {
+        CommutatorTerm::<i128, char>::Atom {atom: 'B', coefficient: 1},
+        CommutatorTerm::<i128, char>::Atom {atom: 'A', coefficient: 1},
+        CommutatorTerm::Expression {
             coefficient: 1,
-            left: Box::new(CommutatorTerm::<i128, char>::Atom('B')),
-            right: Box::new(CommutatorTerm::<i128, char>::Atom('A')),
-        }))]
+            left: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'B', coefficient: 1 }),
+            right: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'A', coefficient: 1 }),
+        })]
     #[case(
-        CommutatorTerm::<i128, char>::Expression(CommutatorExpression {
+        CommutatorTerm::<i128, char>::Expression {
             coefficient: 2,
-            left: Box::new(CommutatorTerm::<i128, char>::Atom('A')),
-            right: Box::new(CommutatorTerm::<i128, char>::Atom('B')
-        )}),
-        CommutatorTerm::<i128, char>::Expression(CommutatorExpression {
+            left: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'A', coefficient: 1 }),
+            right: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'B', coefficient: 1 })
+        },
+        CommutatorTerm::<i128, char>::Expression {
             coefficient: 3,
-            left: Box::new(CommutatorTerm::<i128, char>::Atom('B')),
-            right: Box::new(CommutatorTerm::<i128, char>::Atom('A'))
-        }),
-        CommutatorTerm::Expression(CommutatorExpression {
+            left: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'B', coefficient: 1}),
+            right: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'A', coefficient: 1})
+        },
+        CommutatorTerm::Expression {
             coefficient: 6,
-            left: Box::new(CommutatorTerm::<i128, char>::Expression(CommutatorExpression {
+            left: Box::new(CommutatorTerm::<i128, char>::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::<i128, char>::Atom('A')),
-                right: Box::new(CommutatorTerm::<i128, char>::Atom('B')
-            )})),
-            right: Box::new(CommutatorTerm::<i128, char>::Expression(CommutatorExpression {
+                left: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'A', coefficient: 1}),
+                right: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'B', coefficient: 1})
+            }),
+            right: Box::new(CommutatorTerm::<i128, char>::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::<i128, char>::Atom('B')),
-                right: Box::new(CommutatorTerm::<i128, char>::Atom('A'))
-            })),
-    }))]
+                left: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'B', coefficient: 1}),
+                right: Box::new(CommutatorTerm::<i128, char>::Atom { atom: 'A', coefficient: 1})
+            }),
+    })]
     fn test_commutator_terms(
         #[case] a: CommutatorTerm<i128, char>,
         #[case] b: CommutatorTerm<i128, char>,
@@ -478,20 +451,6 @@ mod test {
         assert_eq!(term, expected_term);
     }
 
-    #[rstest]
-    #[case("AB", CommutatorExpression::<i128, char> { coefficient: 1, left: Box::new(CommutatorTerm::<i128, char>::Atom('A')), right: Box::new(CommutatorTerm::<i128, char>::Atom('B'))})]
-    #[case("AAB", CommutatorExpression::<i128, char> {coefficient: 1, left: Box::new(CommutatorTerm::<i128, char>::Atom('A')), right: Box::new(CommutatorTerm::Expression(CommutatorExpression::<i128, char> { coefficient: 1, left: Box::new(CommutatorTerm::<i128, char>::Atom('A')), right: Box::new(CommutatorTerm::Atom('B')) })) })]
-    fn test_commutator_expression(
-        #[case] word: &str,
-        #[case] expected_expression: CommutatorExpression<i128, char>,
-    ) -> Result<(), LyndonWordError> {
-        let word = word.parse::<LyndonWord<char>>()?;
-        let expression = CommutatorExpression::<i128, char>::try_from(&word)
-            .expect("Failed to create expression");
-        assert_eq!(expression, expected_expression);
-
-        Ok(())
-    }
 
     #[rstest]
     #[case("AB", "ABB", Ordering::Less)]
@@ -504,72 +463,61 @@ mod test {
     ) -> Result<(), LyndonWordError> {
         let word_1 = word_1.parse::<LyndonWord<char>>()?;
         let word_2 = word_2.parse::<LyndonWord<char>>()?;
-        let exp_1 = CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char>::try_from(&word_1)
-                .expect("Failed to create expression"),
-        );
-        let exp_2 = CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char>::try_from(&word_2)
-                .expect("Failed to create expression"),
-        );
+        let exp_1 = CommutatorTerm::<i32, char>::from(&word_1);
+        let exp_2 = CommutatorTerm::from(&word_2);
         assert_eq!(exp_1.partial_cmp(&exp_2), Some(expected_ordering));
 
         Ok(())
     }
 
     #[rstest]
-    #[case(CommutatorTerm::Atom('A'), CommutatorTerm::Atom('B'), Ordering::Less)]
+    #[case(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }, CommutatorTerm::Atom { atom: 'B', coefficient: 1 }, Ordering::Less)]
     #[case(
-        CommutatorTerm::Atom('B'),
-        CommutatorTerm::Atom('A'),
+        CommutatorTerm::Atom { atom: 'B', coefficient: 1 },
+        CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
         Ordering::Greater
     )]
-    #[case(CommutatorTerm::Atom('A'), CommutatorTerm::Atom('A'), Ordering::Equal)]
-    #[case(CommutatorTerm::Atom('A'), CommutatorTerm::Atom('A'), Ordering::Equal)]
+    #[case(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }, CommutatorTerm::Atom { atom: 'A', coefficient: 1 }, Ordering::Equal)]
+    #[case(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }, CommutatorTerm::Atom { atom: 'A', coefficient: 1 }, Ordering::Equal)]
     #[case(
-        CommutatorTerm::Atom('A'),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
         Ordering::Less)]
     #[case(
-        CommutatorTerm::Atom('B'),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Atom { atom: 'B', coefficient: 1 },
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
         Ordering::Greater)]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
-        CommutatorTerm::Atom('A'),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
+        CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
         Ordering::Greater)]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
-        CommutatorTerm::Atom('B'),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
+        CommutatorTerm::Atom { atom: 'B', coefficient: 1 },
         Ordering::Less)]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
-        CommutatorTerm::Atom('A'),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
+        CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
         Ordering::Greater)]
     fn test_commutator_term_ordering(
         #[case] term_1: CommutatorTerm<i128, char>,
@@ -581,128 +529,116 @@ mod test {
 
     #[rstest]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('B')),
-                right: Box::new(CommutatorTerm::Atom('A'))
-            }),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+                left: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 })
+            },
+        CommutatorTerm::Expression {
                 coefficient: -1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
     )]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
     )]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
+            CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('B')),
-                right: Box::new(CommutatorTerm::Atom('A'))
-            })),
-                right: Box::new(CommutatorTerm::Atom('B'))
+                left: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 })
             }),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
+        CommutatorTerm::Expression {
                 coefficient: -1,
                 left: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
+            CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            })),
-                right: Box::new(CommutatorTerm::Atom('B'))
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
             }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            },
     )]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression { 
                 coefficient: 1,
                 left: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
+            CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('B')),
-                right: Box::new(CommutatorTerm::Atom('A'))
-            })),
-                right: Box::new(CommutatorTerm::Atom('A'))
+                left: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 })
             }),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+                right: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 })
+            },
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
                 right: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
+            CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            })),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
             }),
+            },
     )]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('A'))
-            }),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 })
+            },
+        CommutatorTerm::Expression {
                 coefficient: 0,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('A'))
-            }),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 })
+            },
     )]
     #[case(
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+        CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
+            CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('B')),
-                right: Box::new(CommutatorTerm::Atom('A'))
-            })),
-                right: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
-                coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            }))
+                left: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 })
             }),
-        CommutatorTerm::Expression(
-            CommutatorExpression::<i128, char> {
+                right: Box::new(
+            CommutatorTerm::Expression {
+                coefficient: 1,
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            })
+            },
+        CommutatorTerm::Expression {
                 coefficient: 0,
                 left: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
+            CommutatorTerm::Expression {
                 coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            })),
-                right: Box::new(
-            CommutatorTerm::Expression(CommutatorExpression::<i128, char> {
-                coefficient: 1,
-                left: Box::new(CommutatorTerm::Atom('A')),
-                right: Box::new(CommutatorTerm::Atom('B'))
-            })),
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
             }),
+                right: Box::new(
+            CommutatorTerm::Expression {
+                coefficient: 1,
+                left: Box::new(CommutatorTerm::Atom { atom: 'A', coefficient: 1 }),
+                right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 })
+            }),
+            },
     )]
     fn test_commutator_term_lyndon_sorting(
         #[case] mut term: CommutatorTerm<i128, char>,
@@ -713,21 +649,40 @@ mod test {
     }
 
     #[rstest]
-    #[case(comm![comm![CommutatorTerm::Atom('A'), CommutatorTerm::Atom('B')], CommutatorTerm::Atom('C')], comm![CommutatorTerm::Atom('A'), comm![CommutatorTerm::Atom('B'), CommutatorTerm::Atom('C')]], CommutatorTerm::Expression(CommutatorExpression {
-        coefficient: 1,
-        left: Box::new(comm![CommutatorTerm::Atom('A'), CommutatorTerm::Atom('C')]),
-        right: Box::new(CommutatorTerm::Atom('B')),
-    }))]
-    fn test_commutator_term_jacobi_identity(#[case] term: CommutatorTerm<i128, char>, #[case] expected_left_term: CommutatorTerm<i128, char>, #[case] expected_right_term: CommutatorTerm<i128, char>) {
-        let Some((left_term, right_term)) = term.jacobi_identity() else { panic!("Failed to create jacobi identity"); };
-        assert_eq!(left_term, expected_left_term);
-        assert_eq!(right_term, expected_right_term);
+    #[case(
+        comm![
+            comm![
+                CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
+                CommutatorTerm::Atom { atom: 'B', coefficient: 1 }],
+            CommutatorTerm::Atom { atom: 'C', coefficient: 1 }],
+        comm![
+            CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
+            comm![
+                CommutatorTerm::Atom { atom: 'B', coefficient: 1 },
+                CommutatorTerm::Atom { atom: 'C', coefficient: 1 }]
+        ], 
+        CommutatorTerm::Expression {
+            coefficient: 1,
+            left: Box::new(comm![
+                CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
+                CommutatorTerm::Atom { atom: 'C', coefficient: 1 }]),
+            right: Box::new(CommutatorTerm::Atom { atom: 'B', coefficient: 1 }),
+    })]
+    fn test_commutator_term_jacobi_identity(
+        #[case] term: CommutatorTerm<i128, char>,
+        #[case] expected_left_term: CommutatorTerm<i128, char>,
+        #[case] expected_right_term: CommutatorTerm<i128, char>) {
+        let Some((left_term, right_term)) = term.jacobi_identity() else {
+            panic!("Failed to create jacobi identity");
+        };
+        assert_eq!(left_term, expected_left_term, "{left_term} != {expected_left_term}");
+        assert_eq!(right_term, expected_right_term, "{right_term} != {expected_right_term}");
     }
 
     #[rstest]
     #[case(
-        CommutatorTerm::Atom('A'),
-        CommutatorTerm::Atom('B'),
+        CommutatorTerm::Atom { atom: 'A', coefficient: 1 },
+        CommutatorTerm::Atom { atom: 'B', coefficient: 1 },
         vec![
             FormalIndeterminate::<char, i128> { 
                 coefficient: 1,
@@ -739,8 +694,8 @@ mod test {
             }
         ])]
     #[case(
-        comm![CommutatorTerm::Atom('A'), CommutatorTerm::Atom('B')],
-        comm![CommutatorTerm::Atom('C'), CommutatorTerm::Atom('D')],
+        comm![CommutatorTerm::Atom { atom: 'A', coefficient: 1 }, CommutatorTerm::Atom { atom: 'B', coefficient: 1 }],
+        comm![CommutatorTerm::Atom { atom: 'C', coefficient: 1 }, CommutatorTerm::Atom { atom: 'D', coefficient: 1 }],
         vec![
             FormalIndeterminate::<char, i128> {
                 coefficient: 1,
