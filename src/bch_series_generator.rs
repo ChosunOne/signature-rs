@@ -3,8 +3,9 @@ use crate::{
     bch::{bch_denominator, goldberg_coeff_numerator},
     bernoulli_sequence, binomial,
     constants::FACTORIALS,
+    generators::Generator,
     lie_series::LieSeries,
-    lyndon::{Generator, LyndonBasis, LyndonWord, Sort},
+    lyndon::{LyndonBasis, LyndonWord, Sort},
     rooted_tree::{GraphPartitionTable, RootedTree},
 };
 use bitvec::prelude::*;

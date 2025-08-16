@@ -4,13 +4,14 @@ use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, RemAssign, S
 
 use num_traits::{FromPrimitive, Num};
 
+use crate::generators::Generator;
 use crate::lie_series::LieSeries;
-use crate::lyndon::Generator;
 
 pub mod bch;
 pub mod bch_series_generator;
 pub mod commutator;
 pub mod constants;
+pub mod generators;
 pub mod lie_series;
 pub mod log_sig;
 pub mod lyndon;

@@ -6,7 +6,8 @@ use crate::Arith;
 use crate::{
     comm,
     commutator::{Commutator, CommutatorTerm},
-    lyndon::{Generator, LyndonWord},
+    generators::Generator,
+    lyndon::LyndonWord,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -16,7 +17,7 @@ pub struct LieSeries<T: Generator, U: Arith + Send + Sync> {
     /// The commutator basis for the series
     pub commutator_basis: Vec<CommutatorTerm<U, T>>,
     /// A map for converting arbitrary commutator terms to basis elements
-    commutator_basis_map: HashMap<CommutatorTerm<U, T>, CommutatorTerm<U, T>>,
+    pub commutator_basis_map: HashMap<CommutatorTerm<U, T>, CommutatorTerm<U, T>>,
     /// A map for locating a given term's index in the basis
     commutator_basis_index_map: HashMap<CommutatorTerm<U, T>, usize>,
     /// The coefficients for each of the terms in the series
@@ -190,6 +191,11 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
     #[must_use]
     pub fn new(basis: Vec<LyndonWord<T>>, coefficients: Vec<U>) -> Self {
         let mut commutator_basis = Vec::<CommutatorTerm<U, T>>::with_capacity(basis.len());
+        let max_degree = if basis.is_empty() {
+            0
+        } else {
+            basis[basis.len() - 1].len()
+        };
         for word in &basis {
             commutator_basis.push(CommutatorTerm::from(word));
         }
@@ -197,13 +203,13 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
 
         let mut commutator_basis_index_map = HashMap::new();
         for (i, a) in commutator_basis.iter().enumerate() {
+            commutator_basis_map.insert(a.clone(), a.clone());
             commutator_basis_index_map.insert(a.clone(), i);
-            commutator_basis_index_map.insert(-a.clone(), i);
         }
 
         for a in &commutator_basis {
             for b in &commutator_basis {
-                if a == b {
+                if a == b || max_degree < a.degree() + b.degree() {
                     continue;
                 }
                 let term = comm![a, b];
@@ -212,11 +218,8 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
 
                 // Only include terms that are in our basis
                 if commutator_basis_index_map.contains_key(&lyndon_term) {
-                    let neg_term = -term.clone();
-                    let neg_lyndon_term = -lyndon_term.clone();
-
                     commutator_basis_map.insert(term, lyndon_term.clone());
-                    commutator_basis_map.insert(neg_term, neg_lyndon_term);
+                } else {
                 }
             }
         }
@@ -237,9 +240,23 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
     /// Calculates the lie bracket `[A, B]` for a lie series for terms within the commutator basis.
     fn commutator(&self, other: &Self) -> Self::Output {
         let mut coefficients = vec![U::default(); self.coefficients.len()];
-        for i in 0..self.coefficients.len() {
+
+        let self_nonzero_coefficients = self
+            .coefficients
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_zero())
+            .map(|x| x.0);
+        let other_nonzero_coefficients = other
+            .coefficients
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_zero())
+            .map(|x| x.0);
+
+        for i in self_nonzero_coefficients {
             let a = &self.commutator_basis[i];
-            for j in 0..other.coefficients.len() {
+            for j in other_nonzero_coefficients.clone() {
                 if i == j {
                     continue;
                 }
@@ -326,6 +343,26 @@ mod test {
         vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         vec![0, 0, 0, -7, -14, -7, 0, 0, 0, 0, 0, 0, 0, 0],
         vec![0, 0, 0, 0, 0, 0, -7, -14, 14, 14, 49, 42, -14, 21])]
+    #[case(3, 4,
+        vec![
+            1, 2, 3, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            5, 3, 1, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+    )]
     fn test_lie_series_commutation(
         #[case] num_generators: usize,
         #[case] basis_depth: usize,

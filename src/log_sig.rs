@@ -5,8 +5,9 @@ use crate::{
     bch_series_generator::BchSeriesGenerator,
     comm,
     commutator::{Commutator, CommutatorTerm},
+    generators::Generator,
     lie_series::LieSeries,
-    lyndon::{Generator, LyndonBasis, LyndonWord, Sort},
+    lyndon::{LyndonBasis, LyndonWord, Sort},
 };
 use ordered_float::NotNan;
 use std::{

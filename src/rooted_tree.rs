@@ -4,7 +4,10 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use crate::lyndon::{Generator, LyndonWord, LyndonWordError};
+use crate::{
+    generators::Generator,
+    lyndon::{LyndonWord, LyndonWordError},
+};
 #[cfg(feature = "progress")]
 use indicatif::{ProgressBar, ProgressStyle};
 
