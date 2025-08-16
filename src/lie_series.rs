@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::{Add, AddAssign, Index, IndexMut, Mul, Sub, SubAssign};
 
@@ -17,11 +17,12 @@ pub struct LieSeries<T: Generator, U: Arith + Send + Sync> {
     /// The commutator basis for the series
     pub commutator_basis: Vec<CommutatorTerm<U, T>>,
     /// A map for converting arbitrary commutator terms to basis elements
-    pub commutator_basis_map: HashMap<CommutatorTerm<U, T>, CommutatorTerm<U, T>>,
+    pub commutator_basis_map: HashMap<CommutatorTerm<U, T>, Vec<CommutatorTerm<U, T>>>,
     /// A map for locating a given term's index in the basis
     commutator_basis_index_map: HashMap<CommutatorTerm<U, T>, usize>,
     /// The coefficients for each of the terms in the series
     pub coefficients: Vec<U>,
+    max_degree: usize,
 }
 
 impl<T: Generator, U: Arith + Send + Sync> Index<usize> for LieSeries<T, U> {
@@ -88,6 +89,7 @@ impl<T: Generator, U: Arith + Clone + Send + Sync> Add for &LieSeries<T, U> {
             commutator_basis_map: self.commutator_basis_map.clone(),
             commutator_basis_index_map: self.commutator_basis_index_map.clone(),
             coefficients,
+            max_degree: self.max_degree,
         }
     }
 }
@@ -133,6 +135,7 @@ impl<T: Generator, U: Arith + Send + Sync> Sub for &LieSeries<T, U> {
             commutator_basis_map: self.commutator_basis_map.clone(),
             commutator_basis_index_map: self.commutator_basis_index_map.clone(),
             coefficients,
+            max_degree: self.max_degree,
         }
     }
 }
@@ -199,11 +202,11 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
         for word in &basis {
             commutator_basis.push(CommutatorTerm::from(word));
         }
+        let commutator_basis_set = commutator_basis.iter().cloned().collect::<HashSet<_>>();
         let mut commutator_basis_map = HashMap::new();
 
         let mut commutator_basis_index_map = HashMap::new();
         for (i, a) in commutator_basis.iter().enumerate() {
-            commutator_basis_map.insert(a.clone(), a.clone());
             commutator_basis_index_map.insert(a.clone(), i);
         }
 
@@ -216,11 +219,9 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
                 let mut lyndon_term = term.clone();
                 lyndon_term.lyndon_sort();
 
-                // Only include terms that are in our basis
-                if commutator_basis_index_map.contains_key(&lyndon_term) {
-                    commutator_basis_map.insert(term, lyndon_term.clone());
-                } else {
-                }
+                let basis_terms = lyndon_term.lyndon_basis_elements(&commutator_basis_set);
+
+                commutator_basis_map.insert(term, basis_terms);
             }
         }
 
@@ -230,6 +231,7 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
             commutator_basis_map,
             commutator_basis_index_map,
             coefficients,
+            max_degree,
         }
     }
 }
@@ -257,62 +259,38 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
         for i in self_nonzero_coefficients {
             let a = &self.commutator_basis[i];
             for j in other_nonzero_coefficients.clone() {
-                if i == j {
+                let b = &other.commutator_basis[j];
+                if i == j || a.degree() + b.degree() > self.max_degree {
                     continue;
                 }
-                let b = &other.commutator_basis[j];
                 let comm_term = comm![a, b];
 
-                // Handle potential Jacobi identity
-                if !self.commutator_basis_map.contains_key(&comm_term) {
-                    let mut lyndon_comm_term = comm_term.clone();
-                    lyndon_comm_term.lyndon_sort();
-                    let Some((left_term, right_term)) = lyndon_comm_term.jacobi_identity() else {
-                        continue;
-                    };
-
-                    let Some(left_basis_term) = self.commutator_basis_map.get(&left_term) else {
-                        continue;
-                    };
-                    let Some(right_basis_term) = self.commutator_basis_map.get(&right_term) else {
-                        continue;
-                    };
-
-                    let left_basis_index = self.commutator_basis_index_map[left_basis_term];
-                    let right_basis_index = self.commutator_basis_index_map[right_basis_term];
-                    let CommutatorTerm::Expression {
-                        coefficient: l_coefficient,
-                        ..
-                    } = left_basis_term
-                    else {
-                        panic!("Failed to create commutator expression from term");
-                    };
-                    let CommutatorTerm::Expression {
-                        coefficient: r_coefficient,
-                        ..
-                    } = right_basis_term
-                    else {
-                        panic!("Failed to create commutator expression from term");
-                    };
-
-                    coefficients[left_basis_index] +=
-                        self[i].clone() * other[j].clone() * l_coefficient.clone();
-                    coefficients[right_basis_index] +=
-                        self[i].clone() * other[j].clone() * r_coefficient.clone();
+                let Some(basis_terms) = self.commutator_basis_map.get(&comm_term) else {
                     continue;
+                };
+
+                for basis_term in basis_terms {
+                    let basis_term_key = match basis_term {
+                        CommutatorTerm::Atom { atom, .. } => CommutatorTerm::Atom {
+                            coefficient: U::one(),
+                            atom: *atom,
+                        },
+                        CommutatorTerm::Expression { left, right, .. } => {
+                            CommutatorTerm::Expression {
+                                coefficient: U::one(),
+                                left: left.clone(),
+                                right: right.clone(),
+                            }
+                        }
+                    };
+                    let basis_index = self.commutator_basis_index_map[&basis_term_key];
+                    let CommutatorTerm::Expression { coefficient, .. } = basis_term else {
+                        panic!("Failed to create commutator expression from term");
+                    };
+
+                    coefficients[basis_index] +=
+                        self[i].clone() * other[j].clone() * coefficient.clone();
                 }
-
-                let Some(basis_term) = self.commutator_basis_map.get(&comm_term) else {
-                    continue;
-                };
-
-                let basis_index = self.commutator_basis_index_map[basis_term];
-                let CommutatorTerm::Expression { coefficient, .. } = basis_term else {
-                    panic!("Failed to create commutator expression from term");
-                };
-
-                coefficients[basis_index] +=
-                    self[i].clone() * other[j].clone() * coefficient.clone();
             }
         }
         Self {
@@ -321,6 +299,7 @@ impl<T: Generator + Debug + Clone, U: Arith + Send + Sync> Commutator<&Self> for
             commutator_basis_map: self.commutator_basis_map.clone(),
             commutator_basis_index_map: self.commutator_basis_index_map.clone(),
             coefficients,
+            max_degree: self.max_degree,
         }
     }
 }
@@ -357,7 +336,7 @@ mod test {
             0, 0, 0, 0, 0, 0, 0, 0
         ],
         vec![
-            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, -7, -14, -7, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0
@@ -381,6 +360,7 @@ mod test {
             .map(Ratio::<i128>::from_integer)
             .collect::<Vec<_>>();
         let a = LieSeries::new(basis.clone(), a_coefficients);
+
         let b_coefficients = b_coefficients
             .into_iter()
             .map(Ratio::<i128>::from_integer)

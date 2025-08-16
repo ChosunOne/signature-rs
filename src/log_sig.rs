@@ -202,6 +202,8 @@ mod test {
     use num_traits::ToPrimitive;
     use rstest::rstest;
 
+    use crate::generators::ENotation;
+
     use super::*;
 
     #[rstest]
@@ -347,7 +349,7 @@ mod test {
         #[case] path: Array2<f64>,
         #[case] expected_coefficients: Vec<f64>,
     ) {
-        let builder = LogSignatureBuilder::<u8>::new()
+        let builder = LogSignatureBuilder::<ENotation>::new()
             .with_max_degree(max_degree)
             .with_num_dimensions(3);
         let path = path.mapv(|v| NotNan::new(v).expect("value not to be a number"));

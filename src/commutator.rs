@@ -291,8 +291,11 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
     }
 
     fn lyndon_basis_elements_rec(&self, lyndon_basis_set: &HashSet<Self>, visited_set: &mut HashSet<Self>) -> Vec<Self> {
-        let mut basis_elements = vec![];
-        if lyndon_basis_set.contains(self) {
+        let self_key = match self {
+            CommutatorTerm::Atom {  atom, .. } => CommutatorTerm::Atom { coefficient: T::one(), atom: atom.clone() },
+            CommutatorTerm::Expression {  left, right, .. } => CommutatorTerm::Expression { coefficient: T::one(), left: left.clone(), right: right.clone() },
+        };
+        if lyndon_basis_set.contains(&self_key) {
             return vec![self.clone()];
         }
         if visited_set.contains(self) {
@@ -302,6 +305,7 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
         let Some((left_term, right_term)) = self.jacobi_identity() else {
             return vec![];
         };
+        let mut basis_elements = vec![];
         let left_term_key = match &left_term {
             CommutatorTerm::Atom {  atom, .. } => CommutatorTerm::Atom {
                 coefficient: T::one(),
