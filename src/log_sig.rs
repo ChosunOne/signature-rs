@@ -57,10 +57,8 @@ impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
     pub fn build<U: Arith + Send + Sync>(&self) -> LogSignature<T, U> {
         let bch_basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
         let bch_series = BchSeriesGenerator::new(bch_basis, self.max_degree).generate_lie_series();
-        println!("Generating basis");
         let basis = self.lyndon_basis.generate_basis(self.max_degree);
         let coefficients = vec![U::default(); basis.len()];
-        println!("Building series");
         let series = LieSeries::<T, U>::new(basis, coefficients);
         LogSignature::<T, U> { series, bch_series }
     }
@@ -70,11 +68,9 @@ impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
         &self,
         path: &Array<U, D>,
     ) -> LogSignature<T, U> {
-        println!("Building log sig");
         let mut log_sig = self.build();
         let mut log_sig_segment = log_sig.clone();
 
-        println!("Concatenating log sigs");
         for window in path.axis_windows(Axis(0), 2) {
             let start = window.index_axis(Axis(0), 0);
             let end = window.index_axis(Axis(0), 1);

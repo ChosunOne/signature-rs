@@ -194,14 +194,14 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
             CommutatorTerm::Expression{coefficient,  left, right} => {
                 left.lyndon_sort();
                 right.lyndon_sort();
-                if let Some(o) = left.partial_cmp(&right) { match o {
+                match left.cmp(&right) {
                     std::cmp::Ordering::Equal => *coefficient = T::zero(),
                     std::cmp::Ordering::Greater => {
                         *coefficient = -coefficient.clone();
                         std::mem::swap(left, right);
                     }
-                    _ => {}
-                } }
+                    std::cmp::Ordering::Less => {}
+                }
                 // Propagate up coefficients
                 if let CommutatorTerm::Expression{ coefficient: c2, ..} = &mut **left {
                     *coefficient *= c2.clone();
@@ -257,38 +257,6 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
         }
     }
 
-    fn reduce_commutator_terms(terms: Vec<Self>) -> Vec<Self> {
-        let mut term_expr_map = HashMap::<(Box<Self>, Box<Self>), T>::new();
-        let mut term_atom_map = HashMap::<U, T>::new();
-        for term in terms {
-            match term {
-                CommutatorTerm::Atom { coefficient, atom } => {
-                    if term_atom_map.contains_key(&atom) {
-                        *term_atom_map.get_mut(&atom).unwrap() += coefficient;
-                    } else {
-                        term_atom_map.insert(atom, coefficient);
-                    }
-                },
-                CommutatorTerm::Expression { coefficient, left, right } => {
-                    if term_expr_map.contains_key(&(left.clone(), right.clone())) {
-                        *term_expr_map.get_mut(&(left, right)).unwrap() += coefficient;
-                    } else {
-                        term_expr_map.insert((left, right), coefficient);
-                    }
-                },
-            }
-        }
-        let mut reduced_terms = term_atom_map.into_iter().map(|(k, v)| CommutatorTerm::Atom { coefficient: v, atom: k}).collect::<Vec<_>>();
-        let mut term_exprs = term_expr_map.into_iter().map(|(k, v)| CommutatorTerm::Expression { 
-            coefficient: v,
-            left: k.0,
-            right: k.1,
-        }).collect::<Vec<_>>();
-
-        reduced_terms.append(&mut term_exprs);
-        reduced_terms.sort();
-        reduced_terms.into_iter().filter(|x| !x.is_zero()).collect()
-    }
 
     /// Returns the term with the unit coefficient
     #[must_use]
@@ -387,7 +355,6 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
         let mut budget = 0;
 
         while let Some(mut t) = term_queue.pop() {
-            println!("term_queue_len: {}", term_queue.len());
             budget += 1;
             if budget > 100 {
                 panic!("Budget exceeded");
@@ -397,13 +364,11 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
                 lyndon_basis_terms.entry(t.unit()).and_modify(|x| *x.coefficient_mut() += t.coefficient().clone()).or_insert(t);
                 continue;
             }
-            println!("t = {t:#?}");
             let mut t1 = t.clone();
             let mut t2 = t.clone();
             let s1 = t1.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
             let s2 = t2.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
 
-            println!("s = {s1:#?}");
 
             if s1.is_zero() || s2.is_zero() || s1.left().unwrap() == s1.right().unwrap() {
                 continue;
@@ -417,12 +382,8 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
                 (a, b)
             };
 
-            println!("a = {a:#?}");
-            println!("b = {b:#?}");
 
             let s_dprime = s1.right().unwrap();
-
-            println!("s\" = {s_dprime:#?}");
 
             let new_s_1 = Self::Expression {
                 coefficient: s1.coefficient().clone(),
@@ -438,9 +399,6 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
 
             *s1 = new_s_1;
             *s2 = new_s_2;
-
-            println!("t1 = {t1:#?}");
-            println!("t2 = {t2:#?}");
 
             if lyndon_basis_set.contains(&t1.unit()) {
                 lyndon_basis_terms.entry(t1.unit()).and_modify(|x| *x.coefficient_mut() += t1.coefficient().clone()).or_insert(t1);
@@ -535,21 +493,21 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> PartialOr
 impl<T: Arith, U: Debug + Clone + Ord + Hash> Ord for CommutatorTerm<T, U> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (CommutatorTerm::Atom { atom: a1, ..}, CommutatorTerm::Atom { atom: a2, ..}) => a1.cmp(a2),
-            (CommutatorTerm::Atom { .. }, CommutatorTerm::Expression { left, .. }) => {
+            (Self::Atom { atom: a1, ..}, Self::Atom { atom: a2, ..}) => a1.cmp(a2),
+            (Self::Atom { .. }, Self::Expression { left, .. }) => {
                 match self.cmp(left) {
                     std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
                     o => o,
                 }
             }
-            (CommutatorTerm::Expression { left, ..}, CommutatorTerm::Atom { .. }) => {
+            (Self::Expression { left, ..}, Self::Atom { .. }) => {
                 match (**left).cmp(other) {
                     std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
                     o => o,
                 }
             }
-            (CommutatorTerm::Expression {left: l1, right: r1, ..}, 
-                CommutatorTerm::Expression {left: l2, right: r2, ..}) => {
+            (Self::Expression {left: l1, right: r1, ..}, 
+                Self::Expression {left: l2, right: r2, ..}) => {
                 match l1.cmp(l2) {
                     std::cmp::Ordering::Equal => r1.cmp(r2),
                     o => o,
@@ -580,7 +538,10 @@ impl<T: Arith, U: Generator + Debug + Clone + Ord + Hash> From<&LyndonWord<U>>
             Box::new(Self::from(&right))
         };
 
-        Self::Expression { coefficient: T::one(), left, right }
+        let mut result = Self::Expression { coefficient: T::one(), left, right };
+        result.lyndon_sort();
+        *result.coefficient_mut() = T::one();
+        result
     }
 }
 
@@ -774,6 +735,7 @@ mod test {
     #[case("AB", "ABB", Ordering::Less)]
     #[case("ABB", "AB", Ordering::Greater)]
     #[case("AB", "AB", Ordering::Equal)]
+    #[case("AC", "ABB", Ordering::Less)]
     fn test_commutator_expression_ordering(
         #[case] word_1: &str,
         #[case] word_2: &str,
@@ -783,7 +745,7 @@ mod test {
         let word_2 = word_2.parse::<LyndonWord<char>>()?;
         let exp_1 = CommutatorTerm::<i32, char>::from(&word_1);
         let exp_2 = CommutatorTerm::from(&word_2);
-        assert_eq!(exp_1.partial_cmp(&exp_2), Some(expected_ordering));
+        assert_eq!(exp_1.cmp(&exp_2), expected_ordering);
 
         Ok(())
     }
@@ -1014,6 +976,24 @@ mod test {
             ]
         ],
     )]
+    #[case(
+        4,
+        5,
+        - comm![
+            comm![
+                CommutatorTerm::from('A'),
+                comm![
+                    comm![
+                        CommutatorTerm::from('A'),
+                        CommutatorTerm::from('B')
+                    ],
+                    CommutatorTerm::from('B')
+                ]
+            ],
+            CommutatorTerm::from('C')
+        ],
+        vec![]
+    )]
     fn test_commutator_decomposition(
         #[case] num_generators: usize,
         #[case] max_degree: usize,
@@ -1023,12 +1003,26 @@ mod test {
             use crate::lyndon::Sort;
 
         expected_basis_terms.sort();
+        println!("term: {term}");
         let basis = LyndonBasis::<char>::new(num_generators, Sort::Lexicographical);
         let basis_set = basis
             .generate_basis(max_degree)
             .iter()
             .map(CommutatorTerm::<i128, char>::from)
             .collect::<HashSet<_>>();
+        
+
+        let mut basis_vec = basis_set.iter().collect::<Vec<_>>();
+        basis_vec.sort();
+        println!("Commutator Basis");
+        for (i, term) in basis_vec.into_iter().enumerate() {
+            let basis_str = format!("{term}");
+            if term.degree() == 5 && !basis_str.contains('D') {
+                println!("{i}: {term}");
+            }
+        }
+        println!();
+
         let basis_terms = term.lyndon_basis_decomposition(&basis_set);
         assert_eq!(basis_terms.len(), expected_basis_terms.len());
         for (basis_term, expected_basis_term) in basis_terms.iter().zip(&expected_basis_terms) {
