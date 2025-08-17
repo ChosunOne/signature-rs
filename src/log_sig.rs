@@ -1,4 +1,4 @@
-use ndarray::{Array, Axis, Dimension, RemoveAxis};
+use ndarray::{Array, ArrayView, Axis, Dimension, RemoveAxis};
 
 use crate::{
     Arith, LieSeriesGenerator,
@@ -66,7 +66,7 @@ impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
     #[must_use]
     pub fn build_from_path<D: Dimension + RemoveAxis, U: Arith + Send + Sync>(
         &self,
-        path: &Array<U, D>,
+        path: &ArrayView<U, D>,
     ) -> LogSignature<T, U> {
         let mut log_sig = self.build();
         let mut log_sig_segment = log_sig.clone();
@@ -503,11 +503,13 @@ mod test {
         #[case] path: Array2<f64>,
         #[case] expected_coefficients: Vec<f64>,
     ) {
+        use ndarray::s;
+
         let builder = LogSignatureBuilder::<ENotation>::new()
             .with_max_degree(max_degree)
             .with_num_dimensions(num_dimensions);
         let path = path.mapv(|v| NotNan::new(v).expect("value to be a number"));
-        let log_sig = builder.build_from_path(&path);
+        let log_sig = builder.build_from_path(&path.slice(s![.., ..]));
         for (i, c) in log_sig.series.commutator_basis.iter().enumerate() {
             println!("{i}: {} \t {c}", log_sig.series.basis[i]);
         }
@@ -559,10 +561,29 @@ mod test {
         #[case] max_degree: usize,
         #[case] path: Array2<f64>,
     ) {
+        use ndarray::s;
+
         let builder = LogSignatureBuilder::<u8>::new()
             .with_num_dimensions(num_dimensions)
             .with_max_degree(max_degree);
         let path = path.mapv(|v| NotNan::new(v).expect("value to be a number"));
-        todo!()
+
+        dbg!(&path.slice(s![0..2, ..]));
+
+        let log_sig_1 = builder.build_from_path(&path.slice(s![0..=1, ..]));
+        let log_sig_2 = builder.build_from_path(&path.slice(s![1.., ..]));
+
+        let log_sig = builder.build_from_path(&path.slice(s![.., ..]));
+
+        let concatenated_log_sig = log_sig_1.concatenate(&log_sig_2);
+
+        for (concat_c, full_path_c) in concatenated_log_sig
+            .series
+            .coefficients
+            .iter()
+            .zip(log_sig.series.coefficients.iter())
+        {
+            assert_eq!(concat_c, full_path_c);
+        }
     }
 }

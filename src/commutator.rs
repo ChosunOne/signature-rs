@@ -814,7 +814,7 @@ mod test {
         ]
     )]
     #[case(
-        comm![
+comm![
             CommutatorTerm::from('A'),
             CommutatorTerm::from('B')
         ],
@@ -827,7 +827,7 @@ mod test {
         comm![
             comm![
                 CommutatorTerm::from('B'),
-                CommutatorTerm::from('A')
+CommutatorTerm::from('A')
             ],
             CommutatorTerm::from('B')
         ],
@@ -987,7 +987,60 @@ mod test {
             ],
             CommutatorTerm::from('C')
         ],
-        vec![]
+        vec![
+            -comm![
+                CommutatorTerm::from('A'),
+                comm![
+                    CommutatorTerm::from('A'),
+                    comm![
+                        CommutatorTerm::from('B'),
+                        comm![
+                            CommutatorTerm::from('B'),
+                            CommutatorTerm::from('C')
+                        ]
+                    ]
+                ]
+            ],
+            -2 * comm![
+                CommutatorTerm::<i128, char>::from('A'),
+                comm![
+                    comm![
+                        CommutatorTerm::from('A'),
+                        comm![
+                            CommutatorTerm::from('B'),
+                            CommutatorTerm::from('C')
+                        ]
+                    ],
+                    CommutatorTerm::from('B')
+                ]
+            ],
+            -comm![
+                CommutatorTerm::from('A'),
+                comm![
+                    comm![
+                        comm![
+                            CommutatorTerm::from('A'),
+                            CommutatorTerm::from('C')
+                        ],
+                        CommutatorTerm::from('B')
+                    ],
+                    CommutatorTerm::from('B')
+                ]
+            ],
+            -comm![
+                comm![
+                    CommutatorTerm::from('A'),
+                    CommutatorTerm::from('C')
+                ],
+                comm![
+                    comm![
+                        CommutatorTerm::from('A'),
+                        CommutatorTerm::from('B')
+                    ],
+                    CommutatorTerm::from('B')
+                ]
+            ]
+        ]
     )]
     fn test_commutator_decomposition(
         #[case] num_generators: usize,
@@ -1019,6 +1072,7 @@ mod test {
         println!();
 
         let basis_terms = term.lyndon_basis_decomposition(&basis_set);
+        dbg!(&basis_terms);
         assert_eq!(basis_terms.len(), expected_basis_terms.len());
         for (basis_term, expected_basis_term) in basis_terms.iter().zip(&expected_basis_terms) {
             assert_eq!(basis_term, expected_basis_term, "{basis_term} != {expected_basis_term}");

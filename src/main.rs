@@ -1,4 +1,4 @@
-use ndarray::{Array2, array};
+use ndarray::{Array2, array, s};
 use ordered_float::NotNan;
 use signature_rs::log_sig::LogSignatureBuilder;
 
@@ -30,7 +30,7 @@ pub fn main() {
         ],
     ];
     let path = path.mapv(|v| NotNan::new(v).expect("value to be a number"));
-    let log_sig = builder.build_from_path(&path);
+    let log_sig = builder.build_from_path(&path.slice(s![.., ..]));
 
     for (i, c) in log_sig.series.coefficients.iter().enumerate() {
         println!("[{i}]: {c}");
