@@ -352,13 +352,8 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
         let mut lyndon_basis_terms = HashMap::<Self, Self>::new();
         let mut term_queue = vec![self.clone()];
 
-        let mut budget = 0;
 
         while let Some(mut t) = term_queue.pop() {
-            budget += 1;
-            if budget > 100 {
-                panic!("Budget exceeded");
-            }
             t.lyndon_sort();
             if lyndon_basis_set.contains(&t.unit()) {
                 lyndon_basis_terms.entry(t.unit()).and_modify(|x| *x.coefficient_mut() += t.coefficient().clone()).or_insert(t);

@@ -546,4 +546,23 @@ mod test {
         ];
         assert_eq!(c.series.coefficients, expected_coefficients);
     }
+
+    #[rstest]
+    #[case(5, 5, array![
+        [1., 2., 3., 4., 5.],
+        [6., 7., 8., 9., 10.],
+        [11., 12., 13., 14., 15.],
+        [16., 17., 18., 19., 20.],
+    ])]
+    fn test_log_sig_concat_from_path(
+        #[case] num_dimensions: usize,
+        #[case] max_degree: usize,
+        #[case] path: Array2<f64>,
+    ) {
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(num_dimensions)
+            .with_max_degree(max_degree);
+        let path = path.mapv(|v| NotNan::new(v).expect("value to be a number"));
+        todo!()
+    }
 }
