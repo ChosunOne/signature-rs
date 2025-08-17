@@ -212,6 +212,7 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
 
         for a in &commutator_basis {
             for b in &commutator_basis {
+                println!("Calculating basis terms for [{a:?}, {b:?}]");
                 if a == b || max_degree < a.degree() + b.degree() {
                     continue;
                 }
@@ -224,6 +225,8 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
                 commutator_basis_map.insert(term, basis_terms);
             }
         }
+
+        println!("Done");
 
         Self {
             basis,

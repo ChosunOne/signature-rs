@@ -381,20 +381,31 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
             return vec![self.clone()];
         }
 
-        let mut lyndon_basis_terms = vec![];
+        let mut lyndon_basis_terms = HashMap::<Self, Self>::new();
         let mut term_queue = vec![self.clone()];
 
+        let mut budget = 0;
+
         while let Some(mut t) = term_queue.pop() {
+            println!("term_queue_len: {}", term_queue.len());
+            budget += 1;
+            if budget > 100 {
+                panic!("Budget exceeded");
+            }
             t.lyndon_sort();
             if lyndon_basis_set.contains(&t.unit()) {
-                lyndon_basis_terms.push(t);
+                lyndon_basis_terms.entry(t.unit()).and_modify(|x| *x.coefficient_mut() += t.coefficient().clone()).or_insert(t);
                 continue;
             }
+            println!("t = {t:#?}");
             let mut t1 = t.clone();
             let mut t2 = t.clone();
             let s1 = t1.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
             let s2 = t2.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
-            if s1.is_zero() || s2.is_zero() {
+
+            println!("s = {s1:#?}");
+
+            if s1.is_zero() || s2.is_zero() || s1.left().unwrap() == s1.right().unwrap() {
                 continue;
             }
 
@@ -406,7 +417,12 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
                 (a, b)
             };
 
+            println!("a = {a:#?}");
+            println!("b = {b:#?}");
+
             let s_dprime = s1.right().unwrap();
+
+            println!("s\" = {s_dprime:#?}");
 
             let new_s_1 = Self::Expression {
                 coefficient: s1.coefficient().clone(),
@@ -423,30 +439,24 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
             *s1 = new_s_1;
             *s2 = new_s_2;
 
+            println!("t1 = {t1:#?}");
+            println!("t2 = {t2:#?}");
+
             if lyndon_basis_set.contains(&t1.unit()) {
-                lyndon_basis_terms.push(t1);
+                lyndon_basis_terms.entry(t1.unit()).and_modify(|x| *x.coefficient_mut() += t1.coefficient().clone()).or_insert(t1);
             } else {
                 term_queue.push(t1);
             }
 
             if lyndon_basis_set.contains(&t2.unit()) {
-                lyndon_basis_terms.push(t2);
+                lyndon_basis_terms.entry(t2.unit()).and_modify(|x| *x.coefficient_mut() += t2.coefficient().clone()).or_insert(t2);
             } else {
                 term_queue.push(t2);
             }
         }
 
-        let mut basis_map = HashMap::<Self, Self>::new();
 
-        for term in lyndon_basis_terms {
-            if basis_map.contains_key(&term.unit()) {
-                *basis_map.get_mut(&term.unit()).unwrap().coefficient_mut() += term.coefficient().clone();
-            } else {
-                basis_map.insert(term.unit(), term);
-            }
-        }
-
-        let mut lyndon_basis_terms = basis_map.into_values().collect::<Vec<_>>();
+        let mut lyndon_basis_terms = lyndon_basis_terms.into_values().collect::<Vec<_>>();
 
         lyndon_basis_terms.sort();
         lyndon_basis_terms
