@@ -1,24 +1,57 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     hash::Hash,
     ops::{Index, IndexMut},
 };
 
-use crate::{
-    generators::Generator,
-    lyndon::{LyndonWord, LyndonWordError},
-};
 #[cfg(feature = "progress")]
 use indicatif::{ProgressBar, ProgressStyle};
+use lyndon_rs::lyndon::{LyndonWord, LyndonWordError};
 
-#[derive(Default, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RootedTree<T: Generator> {
+pub struct RootedTree<T> {
     color: T,
     children: Vec<RootedTree<T>>,
     degree: usize,
 }
 
-impl<T: Generator> RootedTree<T> {
+impl<T: Clone> Clone for RootedTree<T> {
+    fn clone(&self) -> Self {
+        Self {
+            color: self.color.clone(),
+            children: self.children.clone(),
+            degree: self.degree.clone(),
+        }
+    }
+}
+
+impl<T: Debug> Debug for RootedTree<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootedTree")
+            .field("color", &self.color)
+            .field("children", &self.children)
+            .field("degree", &self.degree)
+            .finish()
+    }
+}
+
+impl<T: PartialEq> PartialEq for RootedTree<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.color == other.color && self.children == other.children && self.degree == other.degree
+    }
+}
+
+impl<T: Eq> Eq for RootedTree<T> {}
+
+impl<T: Hash> Hash for RootedTree<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.color.hash(state);
+        self.children.hash(state);
+        self.degree.hash(state);
+    }
+}
+
+impl<T> RootedTree<T> {
     pub fn new(color: T) -> Self {
         Self {
             color,
@@ -27,35 +60,11 @@ impl<T: Generator> RootedTree<T> {
         }
     }
 
-    pub fn graft(&mut self, tree: RootedTree<T>) {
-        self.degree += tree.degree;
-        self.children.push(tree);
-        self.canonicalize();
-    }
-
     pub fn degree(&self) -> usize {
         self.degree
     }
 
-    pub fn factorize(&self) -> Option<(RootedTree<T>, RootedTree<T>)> {
-        if self.degree == 1 {
-            return None;
-        }
-
-        let mut children = self.children.clone();
-
-        let w = children
-            .pop()
-            .expect("There to be a child for a tree with degree > 1");
-        let mut v = Self::new(self.color);
-        for child in children {
-            v.graft(child);
-        }
-
-        Some((v, w))
-    }
-
-    fn get_node(&self, path: &[usize]) -> &Self {
+    pub fn get_node(&self, path: &[usize]) -> &Self {
         let mut current = self;
         for &index in path {
             current = &current.children[index];
@@ -63,31 +72,12 @@ impl<T: Generator> RootedTree<T> {
         current
     }
 
-    fn get_node_mut(&mut self, path: &[usize]) -> &mut Self {
+    pub fn get_node_mut(&mut self, path: &[usize]) -> &mut Self {
         let mut current = self;
         for &index in path {
             current = &mut current.children[index];
         }
         current
-    }
-
-    fn to_letters(&self) -> Vec<T> {
-        let mut letters = vec![self.color];
-
-        for child in &self.children {
-            letters.extend(child.to_letters());
-        }
-
-        letters
-    }
-
-    /// Sort the tree in canonical order, which is by color then by children
-    fn canonicalize(&mut self) {
-        for child in &mut self.children {
-            child.canonicalize();
-        }
-
-        self.children.sort_by_key(|x| (x.degree, x.color));
     }
 
     fn count_degrees(&mut self) -> usize {
@@ -102,10 +92,56 @@ impl<T: Generator> RootedTree<T> {
     }
 }
 
-impl<T: Generator> From<LyndonWord<T>> for RootedTree<T> {
+impl<T: Clone> RootedTree<T> {
+    fn to_letters(&self) -> Vec<T> {
+        let mut letters = vec![self.color.clone()];
+
+        for child in &self.children {
+            letters.extend(child.to_letters());
+        }
+
+        letters
+    }
+}
+
+impl<T: Clone + Ord> RootedTree<T> {
+    pub fn factorize(&self) -> Option<(RootedTree<T>, RootedTree<T>)> {
+        if self.degree == 1 {
+            return None;
+        }
+
+        let mut children = self.children.clone();
+
+        let w = children
+            .pop()
+            .expect("There to be a child for a tree with degree > 1");
+        let mut v = Self::new(self.color.clone());
+        for child in children {
+            v.graft(child);
+        }
+
+        Some((v, w))
+    }
+    pub fn graft(&mut self, tree: RootedTree<T>) {
+        self.degree += tree.degree;
+        self.children.push(tree);
+        self.canonicalize();
+    }
+
+    /// Sort the tree in canonical order, which is by color then by children
+    fn canonicalize(&mut self) {
+        for child in &mut self.children {
+            child.canonicalize();
+        }
+
+        self.children.sort_by_key(|x| (x.degree, x.color.clone()));
+    }
+}
+
+impl<T: Clone + Ord> From<LyndonWord<T>> for RootedTree<T> {
     fn from(value: LyndonWord<T>) -> Self {
         if value.len() == 1 {
-            return Self::new(value.letters[0]);
+            return Self::new(value.letters[0].clone());
         }
 
         let (v, w) = value.factorize();
@@ -120,7 +156,7 @@ impl<T: Generator> From<LyndonWord<T>> for RootedTree<T> {
     }
 }
 
-impl<T: Generator> TryFrom<&RootedTree<T>> for LyndonWord<T> {
+impl<T: Clone + Ord> TryFrom<&RootedTree<T>> for LyndonWord<T> {
     type Error = LyndonWordError;
     fn try_from(value: &RootedTree<T>) -> Result<Self, Self::Error> {
         let letters = value.to_letters();
@@ -152,14 +188,55 @@ impl IndexMut<usize> for EdgePartitions {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct GraphPartitionTable<T: Generator> {
+pub struct GraphPartitionTable<T> {
     t_n: Vec<RootedTree<T>>,
     degree: Vec<usize>,
     s: Vec<EdgePartitions>,
 }
 
-impl<T: Generator> GraphPartitionTable<T> {
+impl<T: Debug> Debug for GraphPartitionTable<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphPartitionTable")
+            .field("t_n", &self.t_n)
+            .field("degree", &self.degree)
+            .field("s", &self.s)
+            .finish()
+    }
+}
+
+impl<T: Clone> Clone for GraphPartitionTable<T> {
+    fn clone(&self) -> Self {
+        Self {
+            t_n: self.t_n.clone(),
+            degree: self.degree.clone(),
+            s: self.s.clone(),
+        }
+    }
+}
+
+impl<T> GraphPartitionTable<T> {
+    #[must_use]
+    pub fn partitions(&self, i: usize) -> &EdgePartitions {
+        &self.s[i]
+    }
+
+    #[must_use]
+    pub fn degree(&self, i: usize) -> usize {
+        self.degree[i]
+    }
+
+    #[must_use]
+    pub fn tree(&self, i: usize) -> &RootedTree<T> {
+        &self.t_n[i]
+    }
+
+    #[must_use]
+    pub fn tm_n(&self) -> usize {
+        self.t_n.len()
+    }
+}
+
+impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
     #[must_use]
     pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
         #[cfg(feature = "progress")]
@@ -247,35 +324,14 @@ impl<T: Generator> GraphPartitionTable<T> {
 
         Self { t_n, degree, s }
     }
-
-    #[must_use]
-    pub fn partitions(&self, i: usize) -> &EdgePartitions {
-        &self.s[i]
-    }
-
-    #[must_use]
-    pub fn degree(&self, i: usize) -> usize {
-        self.degree[i]
-    }
-
-    #[must_use]
-    pub fn tree(&self, i: usize) -> &RootedTree<T> {
-        &self.t_n[i]
-    }
-
-    #[must_use]
-    pub fn tm_n(&self) -> usize {
-        self.t_n.len()
-    }
 }
 
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
 
+    use lyndon_rs::lyndon::{LyndonBasis, Sort};
     use rstest::rstest;
-
-    use crate::lyndon::{LyndonBasis, Sort};
 
     use super::*;
 
@@ -468,12 +524,7 @@ mod test {
             vec![(m_n, 0), (m_n, 0)],                     // (A) <- (A) -> (A)
             vec![(m_n, 1), (2, 0)],                       // (B) <- (A) -> (A)
         ];
-        for (i, (s_ui, expected_s_ui)) in graph_partition_table
-            .s
-            .iter()
-            .zip(expected_s.iter())
-            .enumerate()
-        {
+        for (s_ui, expected_s_ui) in graph_partition_table.s.iter().zip(expected_s.iter()) {
             assert_eq!(&s_ui.partitions, expected_s_ui);
         }
     }

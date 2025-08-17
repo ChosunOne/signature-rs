@@ -3,8 +3,9 @@ use std::{
     hash::Hash,
 };
 
-pub trait Generator:
-    Debug + Copy + PartialEq + PartialOrd + Ord + Clone + Display + Eq + Hash
+pub trait Generator
+where
+    Self: Sized,
 {
     fn alphabet(size: usize) -> Vec<Self>;
 }

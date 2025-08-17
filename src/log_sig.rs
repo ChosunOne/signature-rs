@@ -1,29 +1,56 @@
-use ndarray::{Array, ArrayView, Axis, Dimension, RemoveAxis};
-
-use crate::{
-    Arith, LieSeriesGenerator,
-    bch_series_generator::BchSeriesGenerator,
-    comm,
-    commutator::{Commutator, CommutatorTerm},
+use commutator_rs::{Commutator, CommutatorTerm, comm};
+use lie_rs::LieSeriesGenerator;
+use lie_rs::{LieSeries, bch_series_generator::BchSeriesGenerator};
+use lyndon_rs::lyndon::LyndonWord;
+use lyndon_rs::{
     generators::Generator,
-    lie_series::LieSeries,
-    lyndon::{LyndonBasis, LyndonWord, Sort},
+    lyndon::{LyndonBasis, Sort},
 };
+use ndarray::{ArrayView, Axis, Dimension, RemoveAxis};
+
+use num_traits::{FromPrimitive, One, Zero};
 use ordered_float::NotNan;
+use std::ops::{Mul, Sub};
 use std::{
     collections::HashMap,
-    fmt::Display,
-    ops::{Index, IndexMut},
+    fmt::Debug,
+    hash::Hash,
+    ops::{AddAssign, Div, Index, IndexMut, MulAssign, Neg, SubAssign},
 };
 
-#[derive(Default, Debug)]
-pub struct LogSignatureBuilder<T: Generator + Default + Send + Sync = u8> {
+pub struct LogSignatureBuilder<T> {
     /// The maximum degree of terms to include in the log signature
     max_degree: usize,
     lyndon_basis: LyndonBasis<T>,
 }
 
-impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
+impl<T: Debug> Debug for LogSignatureBuilder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogSignatureBuilder")
+            .field("max_degree", &self.max_degree)
+            .field("lyndon_basis", &self.lyndon_basis)
+            .finish()
+    }
+}
+
+impl<T> Copy for LogSignatureBuilder<T> {}
+
+impl<T> Clone for LogSignatureBuilder<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Default for LogSignatureBuilder<T> {
+    fn default() -> Self {
+        Self {
+            max_degree: usize::default(),
+            lyndon_basis: LyndonBasis::default(),
+        }
+    }
+}
+
+impl<T> LogSignatureBuilder<T> {
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -52,9 +79,30 @@ impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
     pub fn num_dimensions(&self) -> usize {
         self.lyndon_basis.alphabet_size
     }
+}
 
+impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T> {
     #[must_use]
-    pub fn build<U: Arith + Send + Sync>(&self) -> LogSignature<T, U> {
+    pub fn build<
+        U: Clone
+            + Default
+            + AddAssign
+            + Div<Output = U>
+            + FromPrimitive
+            + Neg<Output = U>
+            + One
+            + Ord
+            + Hash
+            + Send
+            + Sync
+            + Zero
+            + SubAssign
+            + MulAssign
+            + Send
+            + Sync,
+    >(
+        &self,
+    ) -> LogSignature<T, U> {
         let bch_basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
         let bch_series = BchSeriesGenerator::new(bch_basis, self.max_degree).generate_lie_series();
         let basis = self.lyndon_basis.generate_basis(self.max_degree);
@@ -64,7 +112,24 @@ impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
     }
 
     #[must_use]
-    pub fn build_from_path<D: Dimension + RemoveAxis, U: Arith + Send + Sync>(
+    pub fn build_from_path<
+        D: Dimension + RemoveAxis,
+        U: Clone
+            + Default
+            + AddAssign
+            + Div<Output = U>
+            + FromPrimitive
+            + Neg<Output = U>
+            + One
+            + Ord
+            + Hash
+            + Send
+            + Sync
+            + Zero
+            + SubAssign
+            + MulAssign
+            + Sub<Output = U>,
+    >(
         &self,
         path: &ArrayView<U, D>,
     ) -> LogSignature<T, U> {
@@ -84,15 +149,30 @@ impl<T: Generator + Default + Send + Sync> LogSignatureBuilder<T> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LogSignature<T: Generator + Send + Sync = u8, U: Arith + Send + Sync = NotNan<f64>> {
+pub struct LogSignature<T = u8, U = NotNan<f64>> {
     pub series: LieSeries<T, U>,
     pub bch_series: LieSeries<u8, U>,
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<usize>
-    for LogSignature<T, U>
-{
+impl<T: Debug, U: Debug> Debug for LogSignature<T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogSignature")
+            .field("series", &self.series)
+            .field("bch_series", &self.bch_series)
+            .finish()
+    }
+}
+
+impl<T: Clone, U: Clone> Clone for LogSignature<T, U> {
+    fn clone(&self) -> Self {
+        Self {
+            series: self.series.clone(),
+            bch_series: self.bch_series.clone(),
+        }
+    }
+}
+
+impl<T, U> Index<usize> for LogSignature<T, U> {
     type Output = U;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -100,8 +180,10 @@ impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<usize>
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<LyndonWord<T>>
-    for LogSignature<T, U>
+impl<
+    T: Clone + Ord + Generator + Hash,
+    U: Clone + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash,
+> Index<LyndonWord<T>> for LogSignature<T, U>
 {
     type Output = U;
 
@@ -110,8 +192,10 @@ impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<LyndonW
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<&LyndonWord<T>>
-    for LogSignature<T, U>
+impl<
+    T: Clone + Ord + Generator + Hash,
+    U: Clone + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash,
+> Index<&LyndonWord<T>> for LogSignature<T, U>
 {
     type Output = U;
 
@@ -120,31 +204,46 @@ impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> Index<&Lyndon
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> IndexMut<usize>
-    for LogSignature<T, U>
-{
+impl<T, U> IndexMut<usize> for LogSignature<T, U> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.series[index]
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> IndexMut<LyndonWord<T>>
-    for LogSignature<T, U>
+impl<
+    T: Clone + Ord + Generator + Hash,
+    U: Clone + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash,
+> IndexMut<LyndonWord<T>> for LogSignature<T, U>
 {
     fn index_mut(&mut self, index: LyndonWord<T>) -> &mut Self::Output {
         &mut self.series[index]
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Display + Send + Sync> IndexMut<&LyndonWord<T>>
-    for LogSignature<T, U>
+impl<
+    T: Clone + Ord + Generator + Hash,
+    U: Clone + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash,
+> IndexMut<&LyndonWord<T>> for LogSignature<T, U>
 {
     fn index_mut(&mut self, index: &LyndonWord<T>) -> &mut Self::Output {
         &mut self.series[index]
     }
 }
 
-impl<T: Generator + Send + Sync, U: Arith + Send + Sync> LogSignature<T, U> {
+impl<
+    T: Clone + Ord + Generator + Hash,
+    U: Clone
+        + Mul<Output = U>
+        + MulAssign
+        + AddAssign
+        + Hash
+        + Eq
+        + Default
+        + One
+        + Zero
+        + Neg<Output = U>,
+> LogSignature<T, U>
+{
     #[must_use]
     pub fn concatenate(&self, rhs: &Self) -> Self {
         let mut computed_commutations = HashMap::new();
@@ -175,7 +274,10 @@ impl<T: Generator + Send + Sync, U: Arith + Send + Sync> LogSignature<T, U> {
     }
 }
 
-fn evaluate_commutator_term<T: Generator, U: Arith + Send + Sync>(
+fn evaluate_commutator_term<
+    T: Clone + Ord + Generator + Hash,
+    U: Clone + Eq + Hash + Default + One + Zero + MulAssign + Neg<Output = U> + AddAssign,
+>(
     term: &CommutatorTerm<U, u8>,
     series: &[&LieSeries<T, U>],
     computed_commutations: &mut HashMap<CommutatorTerm<U, u8>, LieSeries<T, U>>,
@@ -201,8 +303,6 @@ mod test {
     use num_rational::Ratio;
     use num_traits::ToPrimitive;
     use rstest::rstest;
-
-    use crate::generators::ENotation;
 
     use super::*;
 
@@ -503,6 +603,7 @@ mod test {
         #[case] path: Array2<f64>,
         #[case] expected_coefficients: Vec<f64>,
     ) {
+        use lyndon_rs::generators::ENotation;
         use ndarray::s;
 
         let builder = LogSignatureBuilder::<ENotation>::new()

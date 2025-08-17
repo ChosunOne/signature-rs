@@ -1,7 +1,8 @@
-use crate::{
-    Arith,
-    constants::{FACTORIALS, PRIMES},
-};
+use std::ops::{AddAssign, Div, Mul, MulAssign, Neg};
+
+use num_traits::{FromPrimitive, One, Zero};
+
+use crate::constants::{FACTORIALS, PRIMES};
 
 #[must_use]
 pub fn p_adic_expansion(n: usize, p: i128) -> Vec<i128> {
@@ -25,7 +26,7 @@ pub fn s_p(n: usize, p: i128) -> i128 {
 }
 
 #[must_use]
-pub fn bch_denominator<U: Arith>(n: usize) -> U {
+pub fn bch_denominator<U: One + FromPrimitive + MulAssign>(n: usize) -> U {
     let primes = PRIMES.iter().filter(|&&x| x < n as i128);
     let mut prod = U::one();
     for &p in primes {
@@ -41,7 +42,21 @@ pub fn bch_denominator<U: Arith>(n: usize) -> U {
 
 /// Calculates the numerator of the Goldberg coefficient.
 #[must_use]
-pub fn goldberg_coeff_numerator<U: Arith>(q: &[usize], a_first: bool) -> U {
+pub fn goldberg_coeff_numerator<
+    U: Clone
+        + One
+        + Zero
+        + FromPrimitive
+        + AddAssign
+        + Div<Output = U>
+        + Mul<Output = U>
+        + MulAssign
+        + Neg<Output = U>
+        + PartialEq,
+>(
+    q: &[usize],
+    a_first: bool,
+) -> U {
     let n = q.iter().sum();
     let d: U =
         U::from_i128(FACTORIALS[n]).expect("failed to convert form i128") * bch_denominator(n);

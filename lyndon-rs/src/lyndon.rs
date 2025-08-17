@@ -7,104 +7,67 @@ use std::{
     str::FromStr,
 };
 
-#[cfg(feature = "progress")]
-use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
 
 use crate::generators::Generator;
 
-#[derive(Copy, Clone, Default, Debug)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub enum Sort {
     #[default]
     Lexicographical,
     Topological,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-pub struct LyndonBasis<T: Generator = u8> {
+pub struct LyndonBasis<T> {
     pub alphabet_size: usize,
     sort: Sort,
     _generator: PhantomData<T>,
 }
 
-impl<T: Generator> LyndonBasis<T> {
+impl<T> Copy for LyndonBasis<T> {}
+
+impl<T> Clone for LyndonBasis<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Default for LyndonBasis<T> {
+    fn default() -> Self {
+        Self {
+            alphabet_size: usize::default(),
+            sort: Sort::default(),
+            _generator: PhantomData,
+        }
+    }
+}
+
+impl<T> Debug for LyndonBasis<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LyndonBasis")
+            .field("alphabet_size", &self.alphabet_size)
+            .field("sort", &self.sort)
+            .finish()
+    }
+}
+
+impl<T> PartialEq for LyndonBasis<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.alphabet_size == other.alphabet_size
+            && self.sort == other.sort
+            && self._generator == other._generator
+    }
+}
+
+impl<T> Eq for LyndonBasis<T> {}
+
+impl<T> LyndonBasis<T> {
     #[must_use]
     pub fn new(alphabet_size: usize, sort: Sort) -> Self {
         Self {
             alphabet_size,
             sort,
             _generator: PhantomData,
-        }
-    }
-
-    #[must_use]
-    pub fn generate_basis(&self, max_length: usize) -> Vec<LyndonWord<T>> {
-        #[cfg(feature = "progress")]
-        let style = ProgressStyle::with_template(
-            "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
-        )
-        .unwrap()
-        .progress_chars("=>-");
-        let total_words: usize = self.number_of_words_per_degree(max_length).iter().sum();
-
-        #[cfg(feature = "progress")]
-        let pb = ProgressBar::new(total_words as u64).with_style(style.clone());
-        #[cfg(feature = "progress")]
-        {
-            pb.set_message("Generating Lyndon Basis ");
-            pb.tick();
-        }
-
-        let alphabet = T::alphabet(self.alphabet_size);
-        let letter_index: HashMap<_, _> = alphabet
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, v)| (v, i))
-            .collect();
-        let mut basis = Vec::with_capacity(total_words);
-        if max_length == 0 {
-            return basis;
-        }
-        let mut w = vec![];
-
-        loop {
-            if w.is_empty() {
-                w = vec![alphabet[0]];
-            } else {
-                *w.last_mut().unwrap() = alphabet[letter_index[w.last().unwrap()] + 1];
-            }
-
-            if !w.is_empty()
-                && w.len() <= max_length
-                && *w.last().unwrap() <= alphabet[self.alphabet_size - 1]
-            {
-                basis.push(LyndonWord::try_from(w.clone()).expect("To make a lyndon word"));
-
-                #[cfg(feature = "progress")]
-                pb.inc(1);
-
-                let m = w.len();
-                while w.len() < max_length {
-                    w.push(w[w.len() % m]);
-                }
-            }
-
-            while !w.is_empty() && *w.last().unwrap() >= alphabet[self.alphabet_size - 1] {
-                w.pop();
-            }
-
-            if w.is_empty() {
-                break;
-            }
-        }
-        basis.sort_by_key(|word| (word.len(), word.letters.clone()));
-        #[cfg(feature = "progress")]
-        pb.finish();
-
-        match self.sort {
-            Sort::Lexicographical => basis,
-            Sort::Topological => Self::topological_sort(&basis),
         }
     }
 
@@ -132,25 +95,66 @@ impl<T: Generator> LyndonBasis<T> {
 
         words_per_degree
     }
+}
+
+impl<T: Generator + Clone + Eq + Hash + Ord> LyndonBasis<T> {
+    #[must_use]
+    pub fn generate_basis(&self, max_length: usize) -> Vec<LyndonWord<T>> {
+        let total_words: usize = self.number_of_words_per_degree(max_length).iter().sum();
+
+        let alphabet = T::alphabet(self.alphabet_size);
+        let letter_index: HashMap<_, _> = alphabet
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, v)| (v, i))
+            .collect();
+        let mut basis = Vec::with_capacity(total_words);
+        if max_length == 0 {
+            return basis;
+        }
+        let mut w: Vec<T> = vec![];
+
+        loop {
+            if let Some(l) = w.last_mut() {
+                let i = letter_index[&*l];
+                *l = alphabet[i + 1].clone();
+            } else {
+                w.push(alphabet[0].clone());
+            }
+
+            if let Some(l) = w.last()
+                && w.len() <= max_length
+                && l.clone() <= alphabet[self.alphabet_size - 1]
+            {
+                basis.push(LyndonWord::try_from(w.clone()).expect("To make a lyndon word"));
+
+                let m = w.len();
+                while w.len() < max_length {
+                    w.push(w[w.len() % m].clone());
+                }
+            }
+
+            while !w.is_empty() && *w.last().unwrap() >= alphabet[self.alphabet_size - 1] {
+                w.pop();
+            }
+
+            if w.is_empty() {
+                break;
+            }
+        }
+        basis.sort_by_key(|word| (word.len(), word.letters.clone()));
+
+        match self.sort {
+            Sort::Lexicographical => basis,
+            Sort::Topological => Self::topological_sort(&basis),
+        }
+    }
 
     fn topological_sort(basis: &[LyndonWord<T>]) -> Vec<LyndonWord<T>> {
-        #[cfg(feature = "progress")]
-        let style = ProgressStyle::with_template(
-            "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
-        )
-        .unwrap()
-        .progress_chars("=>-");
         let max_length = basis.last().map_or(0, LyndonWord::len);
         let mut sorted_basis = Vec::with_capacity(basis.len());
         let mut sorted_basis_index = HashMap::new();
-
-        #[cfg(feature = "progress")]
-        let pb = ProgressBar::new(max_length as u64).with_style(style.clone());
-        #[cfg(feature = "progress")]
-        {
-            pb.set_message("Performing Topological Sort ");
-            pb.tick();
-        }
 
         for level in 1..=max_length {
             let mut unsorted_words_by_level = basis
@@ -165,8 +169,6 @@ impl<T: Generator> LyndonBasis<T> {
                     sorted_basis_index.insert(word.clone(), sorted_basis.len());
                     sorted_basis.push(word.clone());
                 }
-                #[cfg(feature = "progress")]
-                pb.inc(1);
 
                 continue;
             }
@@ -180,11 +182,7 @@ impl<T: Generator> LyndonBasis<T> {
                 sorted_basis_index.insert(word.clone(), sorted_basis.len());
                 sorted_basis.push(word.clone());
             }
-            #[cfg(feature = "progress")]
-            pb.inc(1);
         }
-        #[cfg(feature = "progress")]
-        pb.finish();
 
         sorted_basis
     }
@@ -204,12 +202,11 @@ pub fn moebius_mu(max_degree: usize) -> Vec<i64> {
     mu
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LyndonWord<T: Generator> {
+pub struct LyndonWord<T> {
     pub letters: Vec<T>,
 }
 
-impl<T: Generator> Display for LyndonWord<T> {
+impl<T: Display> Display for LyndonWord<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for letter in &self.letters {
             write!(f, "{letter}")?;
@@ -218,55 +215,49 @@ impl<T: Generator> Display for LyndonWord<T> {
     }
 }
 
-impl<T: Generator> LyndonWord<T> {
-    fn is_lyndon(word: &[T]) -> bool {
-        let n = word.len();
-        if n == 0 {
-            return false;
-        }
-
-        let mut i = 0;
-        let mut j = 1;
-        while j < n {
-            match word[i].cmp(&word[j]) {
-                std::cmp::Ordering::Equal => {
-                    i += 1;
-                    j += 1;
-                }
-                std::cmp::Ordering::Less => {
-                    i = 0;
-                    j += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    return false;
-                }
-            }
-        }
-
-        let period = j - i;
-        period == n
+impl<T: Debug> Debug for LyndonWord<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LyndonWord")
+            .field("letters", &self.letters)
+            .finish()
     }
+}
 
-    #[must_use]
-    pub fn factorize(&self) -> (LyndonWord<T>, LyndonWord<T>) {
-        let n = self.letters.len();
-        assert!(n > 1, "Word length must be greater than 1.");
-
-        let mut v = vec![];
-        let mut w = vec![];
-        for split in 1..n {
-            if Self::is_lyndon(&self.letters[split..]) {
-                v = self.letters[..split].to_vec();
-                w = self.letters[split..].to_vec();
-                break;
-            }
+impl<T: Clone> Clone for LyndonWord<T> {
+    fn clone(&self) -> Self {
+        Self {
+            letters: self.letters.clone(),
         }
-        (
-            Self::try_from(v).expect("A factorized lyndon word should produce a lyndon word"),
-            Self::try_from(w).expect("A factorized lyndon word should produce a lyndon word"),
-        )
     }
+}
 
+impl<T: PartialEq> PartialEq for LyndonWord<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.letters == other.letters
+    }
+}
+
+impl<T: Eq> Eq for LyndonWord<T> {}
+
+impl<T: PartialEq + PartialOrd> PartialOrd for LyndonWord<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.letters.partial_cmp(&other.letters)
+    }
+}
+
+impl<T: Ord> Ord for LyndonWord<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.letters.cmp(&other.letters)
+    }
+}
+
+impl<T: Hash> Hash for LyndonWord<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.letters.hash(state);
+    }
+}
+
+impl<T> LyndonWord<T> {
     #[must_use]
     pub fn len(&self) -> usize {
         self.letters.len()
@@ -276,7 +267,8 @@ impl<T: Generator> LyndonWord<T> {
     pub fn is_empty(&self) -> bool {
         self.letters.is_empty()
     }
-
+}
+impl<T: PartialEq> LyndonWord<T> {
     /// Computes the canonical Goldberg representation of the Lyndon word
     #[must_use]
     pub fn goldberg(&self) -> Vec<usize> {
@@ -307,7 +299,39 @@ impl<T: Generator> LyndonWord<T> {
 
         partition
     }
+}
 
+impl<T: Ord> LyndonWord<T> {
+    fn is_lyndon(word: &[T]) -> bool {
+        let n = word.len();
+        if n == 0 {
+            return false;
+        }
+
+        let mut i = 0;
+        let mut j = 1;
+        while j < n {
+            match word[i].cmp(&word[j]) {
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    i = 0;
+                    j += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    return false;
+                }
+            }
+        }
+
+        let period = j - i;
+        period == n
+    }
+}
+
+impl<T: Clone + Generator + Ord> LyndonWord<T> {
     #[must_use]
     pub fn right_factors(&self) -> Vec<Self> {
         let alphabet = T::alphabet(1);
@@ -326,7 +350,29 @@ impl<T: Generator> LyndonWord<T> {
     }
 }
 
-impl<T: Generator> Mul for LyndonWord<T> {
+impl<T: Clone + Ord> LyndonWord<T> {
+    #[must_use]
+    pub fn factorize(&self) -> (LyndonWord<T>, LyndonWord<T>) {
+        let n = self.letters.len();
+        assert!(n > 1, "Word length must be greater than 1.");
+
+        let mut v = vec![];
+        let mut w = vec![];
+        for split in 1..n {
+            if Self::is_lyndon(&self.letters[split..]) {
+                v = self.letters[..split].to_vec();
+                w = self.letters[split..].to_vec();
+                break;
+            }
+        }
+        (
+            Self::try_from(v).expect("A factorized lyndon word should produce a lyndon word"),
+            Self::try_from(w).expect("A factorized lyndon word should produce a lyndon word"),
+        )
+    }
+}
+
+impl<T: Clone + Ord> Mul for LyndonWord<T> {
     type Output = Result<Self, LyndonWordError>;
 
     fn mul(self, rhs: Self) -> Self::Output {
@@ -342,7 +388,7 @@ pub enum LyndonWordError {
     InvalidLetter,
 }
 
-impl<T: Generator> TryFrom<Vec<T>> for LyndonWord<T> {
+impl<T: Ord> TryFrom<Vec<T>> for LyndonWord<T> {
     type Error = LyndonWordError;
 
     fn try_from(value: Vec<T>) -> Result<Self, Self::Error> {
@@ -498,10 +544,9 @@ mod test {
             num_words_per_degree.len(),
             expected_num_words_per_degree.len()
         );
-        for (i, (term, expected_term)) in num_words_per_degree
+        for (term, expected_term) in num_words_per_degree
             .iter()
             .zip(expected_num_words_per_degree.iter())
-            .enumerate()
         {
             assert_eq!(term, expected_term);
         }

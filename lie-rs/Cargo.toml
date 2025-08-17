@@ -1,0 +1,21 @@
+[package]
+name = "lie-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+commutator-rs = {path = "../commutator-rs"}
+lyndon-rs = {path = "../lyndon-rs"}
+num-traits = "^0.2.19"
+rayon = "^1.11.0"
+bitvec = "^1.0.1"
+indicatif = {version = "^0.18.0", optional = true}
+
+[dev-dependencies]
+rstest = "^0.26.1"
+num-rational = "^0.4.2"
+ordered-float = "^5.0.0"
+
+[features]
+default = []
+progress = ["indicatif"]
