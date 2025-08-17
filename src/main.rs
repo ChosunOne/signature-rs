@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use signature_rs::comm;
-use signature_rs::commutator::{Commutator, CommutatorTerm};
+use signature_rs::commutator::{Commutator, CommutatorTerm, FormalIndeterminate};
 use signature_rs::generators::ENotation;
 use signature_rs::lie_series::LieSeries;
 use signature_rs::lyndon::{LyndonBasis, Sort};
@@ -63,9 +63,56 @@ pub fn main() {
                 left: left.clone(),
                 right: right.clone(),
             };
-            if !series_a.commutator_basis_map.contains_key(&term_key) {
+            if !series_a.commutator_basis_index_map.contains_key(&term_key) {
                 non_basis_terms.push(term.clone());
             }
         }
+    }
+
+    println!("Non-basis terms");
+    for (i, term) in non_basis_terms.iter().enumerate() {
+        println!("{i}: {term}");
+    }
+    println!();
+
+    println!("Non-basis Commutator Basis Map");
+    for (i, non_basis_term) in non_basis_terms.iter().enumerate() {
+        let non_basis_term_key = match non_basis_term {
+            CommutatorTerm::Atom { atom, .. } => CommutatorTerm::Atom {
+                coefficient: 1,
+                atom: *atom,
+            },
+            CommutatorTerm::Expression { left, right, .. } => CommutatorTerm::Expression {
+                coefficient: 1,
+                left: left.clone(),
+                right: right.clone(),
+            },
+        };
+
+        let v = &series_a.commutator_basis_map[&non_basis_term_key];
+
+        print!("{i}: [");
+        for basis_term in v {
+            print!("{basis_term}, ");
+        }
+        print!("]");
+        println!();
+
+        // println!("Indeterminate expansion");
+        // for basis_term in v {
+        //     println!("{basis_term}");
+        //     let indeterminates = Vec::<FormalIndeterminate<ENotation, i32>>::from(basis_term);
+        //     for indeterminate in &indeterminates {
+        //         println!("{indeterminate}");
+        //     }
+        //     println!();
+        // }
+        //
+        // println!("Non-basis indeterminate expansion");
+        // let indeterminates = Vec::<FormalIndeterminate<ENotation, i32>>::from(&non_basis_term_key);
+        // for indeterminate in &indeterminates {
+        //     println!("{indeterminate}");
+        // }
+        // println!();
     }
 }

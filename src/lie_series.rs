@@ -19,7 +19,7 @@ pub struct LieSeries<T: Generator, U: Arith + Send + Sync> {
     /// A map for converting arbitrary commutator terms to basis elements
     pub commutator_basis_map: HashMap<CommutatorTerm<U, T>, Vec<CommutatorTerm<U, T>>>,
     /// A map for locating a given term's index in the basis
-    commutator_basis_index_map: HashMap<CommutatorTerm<U, T>, usize>,
+    pub commutator_basis_index_map: HashMap<CommutatorTerm<U, T>, usize>,
     /// The coefficients for each of the terms in the series
     pub coefficients: Vec<U>,
     max_degree: usize,
@@ -219,7 +219,7 @@ impl<T: Generator, U: Arith + Send + Sync> LieSeries<T, U> {
                 let mut lyndon_term = term.clone();
                 lyndon_term.lyndon_sort();
 
-                let basis_terms = lyndon_term.lyndon_basis_elements(&commutator_basis_set);
+                let basis_terms = lyndon_term.lyndon_basis_decomposition(&commutator_basis_set);
 
                 commutator_basis_map.insert(term, basis_terms);
             }
@@ -340,6 +340,26 @@ mod test {
             0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0
+        ],
+    )]
+    #[case(3, 4,
+        vec![
+            1, 2, 3, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            0, 0, 0, -7, -14, -7, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            0, 0, 0, 0, 0, 0, -7, -14,
+            14, 14, 49, 42, -14, 21, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
         ],
     )]
     fn test_lie_series_commutation(

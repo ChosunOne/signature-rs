@@ -290,58 +290,166 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
         reduced_terms.into_iter().filter(|x| !x.is_zero()).collect()
     }
 
-    fn lyndon_basis_elements_rec(&self, lyndon_basis_set: &HashSet<Self>, visited_set: &mut HashSet<Self>) -> Vec<Self> {
-        let self_key = match self {
-            CommutatorTerm::Atom {  atom, .. } => CommutatorTerm::Atom { coefficient: T::one(), atom: atom.clone() },
-            CommutatorTerm::Expression {  left, right, .. } => CommutatorTerm::Expression { coefficient: T::one(), left: left.clone(), right: right.clone() },
+    /// Returns the term with the unit coefficient
+    #[must_use]
+    pub fn unit(&self) -> Self {
+        match self {
+            Self::Atom {  atom, .. } => Self::Atom {
+                coefficient: T::one(),
+                atom: atom.clone()
+            },
+            Self::Expression { left, right, ..} =>
+            Self::Expression {
+                coefficient: T::one(),
+                left: left.clone(),
+                right: right.clone() }
+        }
+    }
+
+    fn coefficient(&self) -> &T {
+        match self {
+            Self::Atom { coefficient, ..} | Self::Expression { coefficient, ..} => coefficient
+        }
+    }
+
+
+    fn coefficient_mut(&mut self) -> &mut T {
+        match self {
+            Self::Atom { coefficient, ..} | Self::Expression { coefficient, ..} => coefficient
+        }
+    }
+
+    fn left(&self) -> Option<&Self> {
+        match self {
+            CommutatorTerm::Atom { .. } => None,
+            CommutatorTerm::Expression { left, .. } => Some(left),
+        }
+    }
+
+    fn right(&self) -> Option<&Self> {
+        match self {
+            CommutatorTerm::Atom { .. } => None,
+            CommutatorTerm::Expression { right, .. } => Some(right),
+        }
+    }
+
+    fn left_mut(&mut self) -> Option<&mut Self> {
+        match self {
+            CommutatorTerm::Atom { .. } => None,
+            CommutatorTerm::Expression { left, .. } => Some(left),
+        }
+    }
+
+    fn right_mut(&mut self) -> Option<&mut Self> {
+        match self {
+            CommutatorTerm::Atom { .. } => None,
+            CommutatorTerm::Expression { right, .. } => Some(right),
+        }
+    }
+
+    fn find_decomposition_subterm_mut(&mut self, lyndon_basis_set: &HashSet<Self>) -> Option<&mut Self> {
+        if let Self::Atom {..} = self {
+            return None;
+        }
+        if lyndon_basis_set.contains(&self.unit()) {
+            return None;
+        }
+
+        let Self::Expression { left, right, ..} = self else {
+            return None;
         };
-        if lyndon_basis_set.contains(&self_key) {
+
+        if let Some(result) = left.find_decomposition_subterm_mut(lyndon_basis_set) {
+            return Some(unsafe {
+                std::ptr::from_mut(result).as_mut().unwrap()
+            })
+        }
+
+
+        if let Some(result) = right.find_decomposition_subterm_mut(lyndon_basis_set) {
+            return Some(unsafe {
+                std::ptr::from_mut(result).as_mut().unwrap()
+            })
+        }
+
+        Some(self)
+    }
+
+    #[must_use]
+    pub fn lyndon_basis_decomposition(&self, lyndon_basis_set: &HashSet<Self>) -> Vec<Self> {
+        if lyndon_basis_set.contains(&self.unit()) {
             return vec![self.clone()];
         }
-        if visited_set.contains(self) {
-            return vec![];
+
+        let mut lyndon_basis_terms = vec![];
+        let mut term_queue = vec![self.clone()];
+
+        while let Some(mut t) = term_queue.pop() {
+            t.lyndon_sort();
+            if lyndon_basis_set.contains(&t.unit()) {
+                lyndon_basis_terms.push(t);
+                continue;
+            }
+            let mut t1 = t.clone();
+            let mut t2 = t.clone();
+            let s1 = t1.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
+            let s2 = t2.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
+            if s1.is_zero() || s2.is_zero() {
+                continue;
+            }
+
+            let (a, b) = {
+                let s_prime = s1.left().unwrap();
+                assert!(s_prime.left().is_some(), "Expected s' to be an expression, got: \n\ts' = {s_prime:?} \n\ts1 = {s1:?}");
+                let a = s_prime.left().unwrap();
+                let b = s_prime.right().unwrap();
+                (a, b)
+            };
+
+            let s_dprime = s1.right().unwrap();
+
+            let new_s_1 = Self::Expression {
+                coefficient: s1.coefficient().clone(),
+                left: Box::new(comm![a, s_dprime]),
+                right: Box::new(b.clone())
+            };
+
+            let new_s_2 = Self::Expression {
+                coefficient: s2.coefficient().clone(),
+                left: Box::new(a.clone()),
+                right: Box::new(comm![b, s_dprime])
+            };
+
+            *s1 = new_s_1;
+            *s2 = new_s_2;
+
+            if lyndon_basis_set.contains(&t1.unit()) {
+                lyndon_basis_terms.push(t1);
+            } else {
+                term_queue.push(t1);
+            }
+
+            if lyndon_basis_set.contains(&t2.unit()) {
+                lyndon_basis_terms.push(t2);
+            } else {
+                term_queue.push(t2);
+            }
         }
-        visited_set.insert(self.clone());
-        let Some((left_term, right_term)) = self.jacobi_identity() else {
-            return vec![];
-        };
-        let mut basis_elements = vec![];
-        let left_term_key = match &left_term {
-            CommutatorTerm::Atom {  atom, .. } => CommutatorTerm::Atom {
-                coefficient: T::one(),
-                atom: atom.clone(),
-            },
-            CommutatorTerm::Expression {  left, right, .. } => CommutatorTerm::Expression { coefficient: T::one(), left: left.clone(), right: right.clone() }
-        };
 
-        if lyndon_basis_set.contains(&left_term_key) {
-            basis_elements.push(left_term);
-        } else {
-            let mut left_basis_elements = left_term.lyndon_basis_elements_rec(lyndon_basis_set, visited_set);
-            basis_elements.append(&mut left_basis_elements);
+        let mut basis_map = HashMap::<Self, Self>::new();
+
+        for term in lyndon_basis_terms {
+            if basis_map.contains_key(&term.unit()) {
+                *basis_map.get_mut(&term.unit()).unwrap().coefficient_mut() += term.coefficient().clone();
+            } else {
+                basis_map.insert(term.unit(), term);
+            }
         }
 
-        let right_term_key = match &right_term {
-            CommutatorTerm::Atom {  atom, .. } => CommutatorTerm::Atom {
-                coefficient: T::one(),
-                atom: atom.clone(),
-            },
-            CommutatorTerm::Expression {  left, right, .. } => CommutatorTerm::Expression { coefficient: T::one(), left: left.clone(), right: right.clone() }
-        };
+        let mut lyndon_basis_terms = basis_map.into_values().collect::<Vec<_>>();
 
-        if lyndon_basis_set.contains(&right_term_key) {
-            basis_elements.push(right_term);
-        } else {
-            let mut right_basis_elements = right_term.lyndon_basis_elements_rec(lyndon_basis_set, visited_set);
-            basis_elements.append(&mut right_basis_elements);
-        }
-
-        Self::reduce_commutator_terms(basis_elements)
-    }
-    /// Decomposes a commutator term into a lyndon basis
-    pub fn lyndon_basis_elements(&self, lyndon_basis_set: &HashSet<Self>) -> Vec<Self> {
-        let mut visited_set = HashSet::new();
-        self.lyndon_basis_elements_rec(lyndon_basis_set, &mut visited_set)
+        lyndon_basis_terms.sort();
+        lyndon_basis_terms
     }
 }
 
@@ -352,51 +460,51 @@ impl<T: Arith, U: Clone + Debug + PartialEq + PartialOrd + Ord + Hash> Commutato
 
     fn commutator(&self, other: &Self) -> Self::Output {
         match (self, other) {
-            (a @ CommutatorTerm::Atom {coefficient: c1, atom: a1}, 
-                b @ CommutatorTerm::Atom {coefficient: c2, atom: a2}) => {
+            (a @ Self::Atom {coefficient: c1, atom: a1}, 
+                b @ Self::Atom {coefficient: c2, atom: a2}) => {
                 let coefficient = if  a == b { T::zero() } else { c1.clone() * c2.clone() };
-                let left = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: a1.clone()});
-                let right = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: a2.clone()});
-                CommutatorTerm::Expression{
+                let left = Box::new(Self::Atom { coefficient: T::one(), atom: a1.clone()});
+                let right = Box::new(Self::Atom { coefficient: T::one(), atom: a2.clone()});
+                Self::Expression{
                     coefficient,
                     left,
                     right,
                 }
             }
-            (CommutatorTerm::Atom {coefficient: c1, atom}, 
-                CommutatorTerm::Expression {coefficient: c2, left: l1, right}) => {
+            (Self::Atom {coefficient: c1, atom}, 
+                Self::Expression {coefficient: c2, left: l1, right}) => {
                 let coefficient = c1.clone() * c2.clone();
-                let left = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: atom.clone()});
-                let right = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l1.clone(), right: right.clone()});
+                let left = Box::new(Self::Atom { coefficient: T::one(), atom: atom.clone()});
+                let right = Box::new(Self::Expression { coefficient: T::one(), left: l1.clone(), right: right.clone()});
 
-                CommutatorTerm::Expression{
+                Self::Expression{
                     coefficient,
                     left,
                     right,
                 }
             }
-            (CommutatorTerm::Expression {coefficient: c1, left: l1, right: r1}, 
-                CommutatorTerm::Atom{ coefficient: c2, atom }) => {
+            (Self::Expression {coefficient: c1, left: l1, right: r1}, 
+                Self::Atom{ coefficient: c2, atom }) => {
                 let coefficient = c1.clone() * c2.clone();
-                let left = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone() });
-                let right = Box::new(CommutatorTerm::Atom { coefficient: T::one(), atom: atom.clone()});
-                CommutatorTerm::Expression {
+                let left = Box::new(Self::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone() });
+                let right = Box::new(Self::Atom { coefficient: T::one(), atom: atom.clone()});
+                Self::Expression {
                     coefficient,
                     left,
                     right
                 }
             }
-            (a @ CommutatorTerm::Expression {coefficient: c1, left: l1, right: r1},
-                b @ CommutatorTerm::Expression {coefficient: c2, left: l2, right: r2}) => {
+            (a @ Self::Expression {coefficient: c1, left: l1, right: r1},
+                b @ Self::Expression {coefficient: c2, left: l2, right: r2}) => {
                 let coefficient = if a == b {
                     T::zero()
                 } else {
                     c1.clone() * c2.clone()
                 };
-                let left = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone()});
-                let right = Box::new(CommutatorTerm::Expression { coefficient: T::one(), left: l2.clone(), right: r2.clone()});
+                let left = Box::new(Self::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone()});
+                let right = Box::new(Self::Expression { coefficient: T::one(), left: l2.clone(), right: r2.clone()});
 
-                CommutatorTerm::Expression {
+                Self::Expression {
                     coefficient,
                     left,
                     right,
@@ -472,6 +580,19 @@ impl<T: Arith, U: Generator + Debug + Clone + Ord + Hash> From<&LyndonWord<U>>
 pub struct FormalIndeterminate<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd + Hash, U: Arith> {
     coefficient: U,
     symbols: Vec<T>,
+}
+
+impl<T: Clone + Debug + Display + Eq + Ord + PartialEq + PartialOrd + Hash, U: Arith + Display> Display for FormalIndeterminate<T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.coefficient)?;
+        if !self.symbols.is_empty() {
+            write!(f, " * ", )?;
+            for symbol in &self.symbols {
+                write!(f, "{symbol}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<T: Clone + Debug + Eq + Ord + PartialEq + PartialOrd + Hash, U: Arith> Mul
@@ -846,53 +967,59 @@ mod test {
                     CommutatorTerm::<i128, char>::from('A'),
                     CommutatorTerm::from('B')
                 ],
-                CommutatorTerm::from('C')
-            ],
-            CommutatorTerm::from('B')
-        ],
-        vec![]
-    )]
-    #[case(
-        3,
-        4,
-        -14 * comm![
-            comm![
-                CommutatorTerm::<i128, char>::from('B'),
-                comm![
-                    CommutatorTerm::from('B'),
-                    CommutatorTerm::from('C')
-                ]
+                CommutatorTerm::from('B')
             ],
             CommutatorTerm::from('C')
         ],
         vec![
-            -14 * comm![
-                CommutatorTerm::<i128, char>::from('B'),
+            14 * comm![
                 comm![
+                    comm![
+                        CommutatorTerm::<i128, char>::from('A'),
+                        CommutatorTerm::from('C')
+                    ],
+                    CommutatorTerm::from('B')
+                ],
+                CommutatorTerm::from('B')
+            ],
+            28 * comm![
+                comm![
+                    CommutatorTerm::<i128, char>::from('A'),
                     comm![
                         CommutatorTerm::from('B'),
                         CommutatorTerm::from('C')
-                    ],
-                    CommutatorTerm::from('C')
+                    ]
+                ],
+                CommutatorTerm::from('B')
+            ],
+            14 * comm![
+                CommutatorTerm::<i128, char>::from('A'),
+                comm![
+                    CommutatorTerm::from('B'),
+                    comm![
+                        CommutatorTerm::from('B'),
+                        CommutatorTerm::from('C')
+                    ]
                 ]
             ]
-        ]
+        ],
     )]
     fn test_commutator_decomposition(
         #[case] num_generators: usize,
         #[case] max_degree: usize,
         #[case] term: CommutatorTerm<i128, char>,
-        #[case] expected_basis_terms: Vec<CommutatorTerm<i128, char>>
+        #[case] mut expected_basis_terms: Vec<CommutatorTerm<i128, char>>
     ) {
             use crate::lyndon::Sort;
 
+        expected_basis_terms.sort();
         let basis = LyndonBasis::<char>::new(num_generators, Sort::Lexicographical);
         let basis_set = basis
             .generate_basis(max_degree)
             .iter()
             .map(CommutatorTerm::<i128, char>::from)
             .collect::<HashSet<_>>();
-        let basis_terms = term.lyndon_basis_elements(&basis_set);
+        let basis_terms = term.lyndon_basis_decomposition(&basis_set);
         assert_eq!(basis_terms.len(), expected_basis_terms.len());
         for (basis_term, expected_basis_term) in basis_terms.iter().zip(&expected_basis_terms) {
             assert_eq!(basis_term, expected_basis_term, "{basis_term} != {expected_basis_term}");
