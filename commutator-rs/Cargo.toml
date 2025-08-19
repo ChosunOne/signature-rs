@@ -9,8 +9,8 @@ documentation = "https://docs.rs/commutator-rs"
 homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
-keywords = ["commutator", "lie", "algebra", "non-commutative", "bracket"]
-categories = ["mathematics", "algorithms"]
+keywords = ["commutator", "lie", "algebra", "combinatorics", "bracket"]
+categories = ["data-structures", "mathematics", "science"]
 
 [dependencies]
 lyndon-rs = {path = "../lyndon-rs"}

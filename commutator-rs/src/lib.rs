@@ -1,41 +1,22 @@
-//! # Commutator-RS
+//! # commutator-rs
 //!
-//! A Rust library for computing commutators in non-commutative algebras.
-//!
-//! ## Overview
-//!
-//! This library provides tools for working with commutators, which are fundamental
-//! operations in non-commutative algebra defined as [a, b] = ab - ba. Features include:
-//!
-//! - Generic commutator trait for custom types
-//! - Formal indeterminates for symbolic computation
-//! - Efficient representation of commutator expressions
+//! A Rust library for commutator operations.
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
-//! use commutator_rs::Commutator;
-//! use commutator_rs::formal_indeterminate::FormalIndeterminate;
+//! ```rust
+//! use commutator_rs::{prelude::*, comm};
 //!
-//! // Create formal indeterminates
-//! let x = FormalIndeterminate::new("x", 1.0);
-//! let y = FormalIndeterminate::new("y", 1.0);
+//! let x = CommutatorTerm::Atom { coefficient: 1, atom: 'x' };
+//! let y = CommutatorTerm::Atom { coefficient: 1, atom: 'y' };
 //!
-//! // Compute commutator [x, y] using the trait
-//! let result = x.commutator(&y);
+//! // Using the trait method
+//! let result1 = x.commutator(&y);
+//!
+//! // Using the comm! macro
+//! let result2 = comm![x, y];
+//! assert_eq!(result1, result2);
 //! ```
-//!
-//! ## Main Components
-//!
-//! - [`Commutator`]: Trait for types supporting commutator operations
-//! - [`CommutatorTerm`]: Represents terms in commutator expressions
-//! - [`FormalIndeterminate`](formal_indeterminate::FormalIndeterminate): Symbolic variables for formal computations
-//!
-//! ## Mathematical Background
-//!
-//! The commutator [a, b] = ab - ba measures how much two elements fail to commute.
-//! It is zero if and only if the elements commute (ab = ba). Commutators satisfy
-//! the Jacobi identity and form the basis of Lie algebra structure.
 
 pub mod commutator;
 pub mod formal_indeterminate;
@@ -44,7 +25,7 @@ pub mod formal_indeterminate;
 pub use commutator::{Commutator, CommutatorTerm};
 pub use formal_indeterminate::FormalIndeterminate;
 
-/// Prelude module for convenient imports
+/// Prelude module for imports
 pub mod prelude {
     pub use crate::commutator::{Commutator, CommutatorTerm};
     pub use crate::formal_indeterminate::FormalIndeterminate;

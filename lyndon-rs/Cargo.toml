@@ -9,8 +9,8 @@ documentation = "https://docs.rs/lyndon-rs"
 homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
-keywords = ["lyndon", "lie-algebra", "combinatorics", "free", "basis"]
-categories = ["mathematics", "algorithms", "data-structures"]
+keywords = ["lyndon", "lie", "combinatorics", "free", "algebra"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [dependencies]
 thiserror = "^2.0.15"

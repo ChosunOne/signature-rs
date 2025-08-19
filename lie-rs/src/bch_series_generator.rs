@@ -305,31 +305,31 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
                 ));
             }
 
-            let mut X = vec![0_i64; matrix_tree.matrices.len()];
+            let mut x = vec![0_i64; matrix_tree.matrices.len()];
             let mut stop = 0;
-            for x in 0..words_in_group.len() {
-                let i = words_in_group[x];
-                stop = if group_matrix_indices[x] > stop {
-                    group_matrix_indices[x]
+            for idx in 0..words_in_group.len() {
+                let i = words_in_group[idx];
+                stop = if group_matrix_indices[idx] > stop {
+                    group_matrix_indices[idx]
                 } else {
                     stop
                 };
 
                 let (num_right_factors, right_factors) = self.right_factors(i, self.max_degree);
                 let word = &self.basis[i];
-                matrix_tree.run(&mut X, word, stop);
+                matrix_tree.run(&mut x, word, stop);
 
                 let mut index_of_non_initial_generator = 0;
                 while word.letters[index_of_non_initial_generator] == alphabet[0] {
                     index_of_non_initial_generator += 1;
                 }
 
-                for y in 0..x {
+                for y in 0..idx {
                     let j = words_in_group[y];
                     let (previous_num_right_factors, previous_right_factors) =
                         self.right_factors(j, self.max_degree);
                     if index_of_non_initial_generator >= previous_num_right_factors {
-                        let d = X[group_matrix_indices[y]];
+                        let d = x[group_matrix_indices[y]];
                         if d != 0 {
                             for k in 0..=previous_num_right_factors.min(num_right_factors) {
                                 let previous_word_coefficient =
@@ -555,11 +555,10 @@ mod test {
             2, // ABABB
             7, // ABBBB
         ];
-        for (i, (term, expected_term)) in lie_series
+        for (term, expected_term) in lie_series
             .left_factor
             .iter()
             .zip(expected_left_factor.iter())
-            .enumerate()
         {
             assert_eq!(term, expected_term);
         }
@@ -579,11 +578,10 @@ mod test {
             4, // ABABB
             1, // ABBBB
         ];
-        for (i, (term, expected_term)) in lie_series
+        for (term, expected_term) in lie_series
             .right_factor
             .iter()
             .zip(expected_right_factor.iter())
-            .enumerate()
         {
             assert_eq!(term, expected_term);
         }
@@ -604,11 +602,10 @@ mod test {
             18, // ABABB
             19, // ABBBB
         ];
-        for (i, (term, expected_term)) in lie_series
+        for (term, expected_term) in lie_series
             .multi_degree
             .iter()
             .zip(expected_multi_degree_indices.iter())
-            .enumerate()
         {
             assert_eq!(term, expected_term);
         }
@@ -645,10 +642,9 @@ mod test {
             Ratio::new(-1, 120), // ABABB
             Ratio::new(-1, 720), // ABBBB
         ];
-        for (i, (term, expected_term)) in goldberg_coefficients
+        for (term, expected_term) in goldberg_coefficients
             .iter()
             .zip(expected_goldberg_coefficients.iter())
-            .enumerate()
         {
             assert_eq!(term, expected_term);
         }
@@ -676,10 +672,9 @@ mod test {
             Ratio::new(-1, 720),
         ];
 
-        for (i, (term, expected_term)) in bch_coefficients
+        for (term, expected_term) in bch_coefficients
             .iter()
             .zip(expected_bch_coefficients.iter())
-            .enumerate()
         {
             assert_eq!(term, expected_term);
         }

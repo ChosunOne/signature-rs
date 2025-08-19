@@ -733,9 +733,9 @@ checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
 name = "file_type"
-version = "0.8.8"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2f6ef2155b2573eb00e0cc1bb199606c3b031cce6c04037aca217f24c495e46"
+checksum = "1e010a05c6ddedefb1b5445f9cbc20969d586eaeb4d5dd10f0dba16e0898f16c"
 dependencies = [
  "phf",
 ]
@@ -2323,9 +2323,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.38.1"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9845d9dccf565065824e69f9f235fafba1587031eda353c1f1561cd6a6be78f4"
+checksum = "d200a41a7797e6461bd04e4e95c3347053a731c32c87f066f2f0dda22dbdbba8"
 dependencies = [
  "memchr",
  "serde",

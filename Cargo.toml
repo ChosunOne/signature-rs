@@ -2,6 +2,7 @@
 name = "signature-rs-bin"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89.0"
 license = "AGPL-3.0-only"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
@@ -22,7 +23,7 @@ commutator-rs = {path = "./commutator-rs"}
 signature-rs = {path = "./signature-rs"}
 clap = {version = "^4.5.45", features = ["derive"] }
 polars = { version = "^0.50.0", features = ["ndarray", "lazy", "csv", "parquet", "polars-io", "json"] }
-file_type = "^0.8.8"
+file_type = "^0.8.9"
 
 [dev-dependencies]
 

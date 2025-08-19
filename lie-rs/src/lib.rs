@@ -1,37 +1,18 @@
-//! # Lie-RS
+//! # lie-rs
 //!
-//! A Rust library for computations with Lie series and the Baker-Campbell-Hausdorff formula.
-//!
-//! ## Overview
-//!
-//! This library provides tools for working with formal Lie series and computing
-//! the Baker-Campbell-Hausdorff (BCH) formula, which gives the logarithm of the
-//! product of exponentials in non-commutative settings. Key features include:
-//!
-//! - Formal Lie series with algebraic operations
-//! - BCH formula computation using rooted trees
-//! - Efficient algorithms based on the work of Goldberg and others
-//! - Support for generic numeric types
+//! A Rust library for Lie series and Baker-Campbell-Hausdorff computations.
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
-//! use lie_rs::{LieSeries, bch_series_generator::BchSeriesGenerator};
-//! use lyndon_rs::generators::ENotation;
+//! ```rust
+//! use lie_rs::prelude::*;
+//! use lyndon_rs::prelude::*;
+//! use num_rational::Ratio;
 //!
-//! // Create a BCH series generator
-//! let generator = BchSeriesGenerator::<ENotation>::new(5, 2);
-//!
-//! // Generate the BCH series
-//! let bch_series = generator.generate_lie_series();
+//! let basis = LyndonBasis::<ENotation>::new(2, Sort::Lexicographical);
+//! let generator = BchSeriesGenerator::<ENotation>::new(basis, 5);
+//! let bch_series: LieSeries<ENotation, Ratio<i64>> = generator.generate_lie_series();
 //! ```
-//!
-//! ## Main Components
-//!
-//! - [`LieSeries`]: Represents a formal Lie series with coefficients
-//! - [`BchSeriesGenerator`](bch_series_generator::BchSeriesGenerator): Generates BCH series
-//! - [`LieSeriesGenerator`]: Trait for types that can generate Lie series
-//! - [`RootedTree`](rooted_tree::RootedTree): Trees used in BCH computations
 
 mod bch;
 pub mod bch_series_generator;
@@ -39,12 +20,12 @@ mod constants;
 pub mod lie_series;
 pub mod rooted_tree;
 
-use std::ops::{AddAssign, Div, MulAssign, Neg};
+use std::ops::{Div, MulAssign};
 
 // Re-export main types at crate root
-pub use lie_series::LieSeries;
 pub use bch_series_generator::{BchSeriesGenerator, Matrix2x2, MatrixTree};
-pub use rooted_tree::{RootedTree, EdgePartitions, GraphPartitionTable};
+pub use lie_series::LieSeries;
+pub use rooted_tree::{EdgePartitions, GraphPartitionTable, RootedTree};
 
 use num_traits::{FromPrimitive, One, Zero};
 
@@ -86,57 +67,10 @@ pub(crate) fn binomial<U: One + Zero + FromPrimitive + MulAssign + Div<Output = 
     num / den
 }
 
-/// Generates a sequence of Bernoulli numbers up to the specified maximum index.
-///
-/// Bernoulli numbers B_n are rational numbers that appear in the series expansions
-/// of many important mathematical functions. This implementation uses the recursive
-/// formula based on binomial coefficients and applies the positive sign convention
-/// for B_1 = +1/2.
-#[must_use]
-pub(crate) fn bernoulli_sequence<
-    U: Clone
-        + Default
-        + One
-        + Zero
-        + FromPrimitive
-        + Neg<Output = U>
-        + Div<Output = U>
-        + AddAssign
-        + MulAssign,
->(
-    max_n: usize,
-) -> Vec<U> {
-    let mut b = vec![U::default(); max_n + 1];
-
-    b[0] = U::one();
-    if max_n > 0 {
-        b[1] = -U::one() / U::from_u8(2).expect("Failed to convert from u8");
-    }
-
-    for n in 2..=max_n {
-        if n % 2 == 1 {
-            continue;
-        }
-        let mut sum = U::default();
-        for (k, b_k) in b.iter().enumerate().take(n) {
-            sum += binomial::<U>(n + 1, k) * b_k.clone();
-        }
-
-        b[n] = -sum / U::from_usize(n + 1).expect("Failed to convert from usize");
-    }
-
-    // Use positive sign convention
-    if max_n > 0 {
-        b[1] = -b[1].clone();
-    }
-
-    b
-}
-
 /// Prelude module for convenient imports
 pub mod prelude {
-    pub use crate::{LieSeries, LieSeriesGenerator};
     pub use crate::bch_series_generator::BchSeriesGenerator;
+    pub use crate::{LieSeries, LieSeriesGenerator};
 }
 
 #[cfg(test)]
@@ -209,27 +143,5 @@ mod test {
         #[case] expected_result: Ratio<i128>,
     ) {
         assert_eq!(binomial::<Ratio<i128>>(n, k), expected_result);
-    }
-
-    #[test]
-    fn test_bernoulli_sequence() {
-        let seq = bernoulli_sequence::<Ratio<i128>>(10);
-        let expected_seq = vec![
-            Ratio::new(1.into(), 1.into()),
-            Ratio::new(1.into(), 2.into()),
-            Ratio::new(1.into(), 6.into()),
-            Ratio::default(),
-            Ratio::new((-1).into(), 30.into()),
-            Ratio::default(),
-            Ratio::new(1.into(), 42.into()),
-            Ratio::default(),
-            Ratio::new((-1).into(), 30.into()),
-            Ratio::default(),
-            Ratio::new(5.into(), 66.into()),
-        ];
-        assert_eq!(seq.len(), expected_seq.len());
-        for (term, expected_term) in seq.iter().zip(&expected_seq) {
-            assert_eq!(term, expected_term);
-        }
     }
 }

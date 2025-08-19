@@ -9,8 +9,8 @@ documentation = "https://docs.rs/signature-rs"
 homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
-keywords = ["log-signature", "algebra", "lie", "rough-paths", "time-series"]
-categories = ["mathematics", "science", "algorithms", "data-structures"]
+keywords = ["log", "signature", "lie", "paths", "series"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [dependencies]
 ndarray = "^0.16.1"

@@ -10,7 +10,7 @@ homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
 keywords = ["lie", "bch", "algebra", "series", "baker"]
-categories = ["mathematics", "algorithms", "science"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [dependencies]
 commutator-rs = {path = "../commutator-rs"}

@@ -17,6 +17,17 @@ pub struct FormalIndeterminate<T, U> {
     pub symbols: Vec<T>,
 }
 
+impl<T, U> FormalIndeterminate<T, U> {
+    /// Creates a new formal indeterminate with the given symbols and coefficient.
+    #[must_use]
+    pub fn new(symbols: Vec<T>, coefficient: U) -> Self {
+        Self {
+            coefficient,
+            symbols,
+        }
+    }
+}
+
 impl<T: Display, U: Display> Display for FormalIndeterminate<T, U> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.coefficient)?;
