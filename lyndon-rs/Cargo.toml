@@ -1,12 +1,16 @@
 [package]
 name = "lyndon-rs"
 version = "0.1.0"
+authors = ["ChosunOne"]
 edition = "2024"
 license = "AGPL-3.0-only"
+description = "Lyndon words and Lyndon basis for free Lie algebras"
+documentation = "https://docs.rs/lyndon-rs"
+homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
-keywords = ["free", "lie", "algebra", "lyndon", "basis"]
-categories = ["data-structures", "mathematics", "science", "algorithms"]
+keywords = ["lyndon", "lie-algebra", "combinatorics", "free", "basis"]
+categories = ["mathematics", "algorithms", "data-structures"]
 
 [dependencies]
 thiserror = "^2.0.15"

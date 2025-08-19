@@ -1,3 +1,38 @@
+//! # Lie-RS
+//!
+//! A Rust library for computations with Lie series and the Baker-Campbell-Hausdorff formula.
+//!
+//! ## Overview
+//!
+//! This library provides tools for working with formal Lie series and computing
+//! the Baker-Campbell-Hausdorff (BCH) formula, which gives the logarithm of the
+//! product of exponentials in non-commutative settings. Key features include:
+//!
+//! - Formal Lie series with algebraic operations
+//! - BCH formula computation using rooted trees
+//! - Efficient algorithms based on the work of Goldberg and others
+//! - Support for generic numeric types
+//!
+//! ## Quick Start
+//!
+//! ```rust,ignore
+//! use lie_rs::{LieSeries, bch_series_generator::BchSeriesGenerator};
+//! use lyndon_rs::generators::ENotation;
+//!
+//! // Create a BCH series generator
+//! let generator = BchSeriesGenerator::<ENotation>::new(5, 2);
+//!
+//! // Generate the BCH series
+//! let bch_series = generator.generate_lie_series();
+//! ```
+//!
+//! ## Main Components
+//!
+//! - [`LieSeries`]: Represents a formal Lie series with coefficients
+//! - [`BchSeriesGenerator`](bch_series_generator::BchSeriesGenerator): Generates BCH series
+//! - [`LieSeriesGenerator`]: Trait for types that can generate Lie series
+//! - [`RootedTree`](rooted_tree::RootedTree): Trees used in BCH computations
+
 mod bch;
 pub mod bch_series_generator;
 mod constants;
@@ -6,7 +41,11 @@ pub mod rooted_tree;
 
 use std::ops::{AddAssign, Div, MulAssign, Neg};
 
+// Re-export main types at crate root
 pub use lie_series::LieSeries;
+pub use bch_series_generator::{BchSeriesGenerator, Matrix2x2, MatrixTree};
+pub use rooted_tree::{RootedTree, EdgePartitions, GraphPartitionTable};
+
 use num_traits::{FromPrimitive, One, Zero};
 
 /// Trait for types that can generate Lie series.
@@ -92,6 +131,12 @@ pub(crate) fn bernoulli_sequence<
     }
 
     b
+}
+
+/// Prelude module for convenient imports
+pub mod prelude {
+    pub use crate::{LieSeries, LieSeriesGenerator};
+    pub use crate::bch_series_generator::BchSeriesGenerator;
 }
 
 #[cfg(test)]

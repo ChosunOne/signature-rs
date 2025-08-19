@@ -1,12 +1,16 @@
 [package]
 name = "lie-rs"
 version = "0.1.0"
+authors = ["ChosunOne"]
 edition = "2024"
 license = "AGPL-3.0-only"
+description = "Lie series and Baker-Campbell-Hausdorff formula computations"
+documentation = "https://docs.rs/lie-rs"
+homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
-keywords = ["free", "lie", "algebra", "series", "baker"]
-categories = ["data-structures", "mathematics", "science", "algorithms"]
+keywords = ["lie", "bch", "algebra", "series", "baker"]
+categories = ["mathematics", "algorithms", "science"]
 
 [dependencies]
 commutator-rs = {path = "../commutator-rs"}
