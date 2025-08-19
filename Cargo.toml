@@ -1,23 +1,28 @@
 [package]
-name = "signature-rs"
+name = "signature-rs-bin"
 version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["lyndon-rs", "commutator-rs", "lie-rs"]
+members = ["lyndon-rs", "commutator-rs", "lie-rs", "signature-rs"]
 resolver = "3"
 
 [dependencies]
 ndarray = "^0.16.1"
-num-traits = "^0.2.19"
 ordered-float = "^5.0.0"
+num-traits = "^0.2.19"
 lie-rs = {path = "./lie-rs"}
 lyndon-rs = {path = "./lyndon-rs"}
 commutator-rs = {path = "./commutator-rs"}
+signature-rs = {path = "./signature-rs"}
+clap = {version = "^4.5.45", features = ["derive"] }
+polars = { version = "^0.50.0", features = ["ndarray", "lazy", "csv", "parquet", "polars-io", "json"] }
+file_type = "^0.8.9"
 
 [dev-dependencies]
-rstest = "^0.26.1"
-num-rational = "^0.4.2"
+
+[hints.polars]
+mostly-unused = true
 
 [profile.release]
 lto = true

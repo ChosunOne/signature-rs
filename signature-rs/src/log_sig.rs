@@ -9,7 +9,6 @@ use lyndon_rs::{
 use ndarray::{ArrayView, Axis, Dimension, RemoveAxis};
 
 use num_traits::{FromPrimitive, One, Zero};
-use ordered_float::NotNan;
 use std::ops::{Mul, Sub};
 use std::{
     collections::HashMap,
@@ -149,7 +148,7 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T
     }
 }
 
-pub struct LogSignature<T = u8, U = NotNan<f64>> {
+pub struct LogSignature<T, U> {
     pub series: LieSeries<T, U>,
     pub bch_series: LieSeries<u8, U>,
 }
@@ -605,6 +604,7 @@ mod test {
     ) {
         use lyndon_rs::generators::ENotation;
         use ndarray::s;
+        use ordered_float::NotNan;
 
         let builder = LogSignatureBuilder::<ENotation>::new()
             .with_max_degree(max_degree)
