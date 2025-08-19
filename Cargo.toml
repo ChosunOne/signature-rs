@@ -3,6 +3,10 @@ name = "signature-rs-bin"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
+repository = "https://github.com/ChosunOne/signature-rs"
+readme = "README.md"
+keywords = ["log", "signature", "algebra", "lie", "free"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [workspace]
 members = ["lyndon-rs", "commutator-rs", "lie-rs", "signature-rs"]

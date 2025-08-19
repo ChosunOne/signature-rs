@@ -3,6 +3,10 @@ name = "lie-rs"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
+repository = "https://github.com/ChosunOne/signature-rs"
+readme = "README.md"
+keywords = ["free", "lie", "algebra", "series", "baker"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [dependencies]
 commutator-rs = {path = "../commutator-rs"}
