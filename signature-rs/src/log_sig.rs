@@ -17,9 +17,15 @@ use std::{
     ops::{AddAssign, Div, Index, IndexMut, MulAssign, Neg, SubAssign},
 };
 
+/// Builder for constructing log signatures from path data.
+///
+/// The log signature is a mathematical transform that captures the geometry
+/// of a path by expressing it as a series in the free Lie algebra. This builder
+/// allows configuring the parameters and constructing log signatures from various inputs.
 pub struct LogSignatureBuilder<T> {
-    /// The maximum degree of terms to include in the log signature
+    /// The maximum degree of terms to include in the log signature computation.
     max_degree: usize,
+    /// The Lyndon basis configuration for the underlying algebra.
     lyndon_basis: LyndonBasis<T>,
 }
 
@@ -50,6 +56,7 @@ impl<T> Default for LogSignatureBuilder<T> {
 }
 
 impl<T> LogSignatureBuilder<T> {
+    /// Creates a new log signature builder with default settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -57,23 +64,33 @@ impl<T> LogSignatureBuilder<T> {
         }
     }
 
+    /// Sets the maximum degree of terms to include in the log signature.
+    ///
+    /// Higher degrees capture more complex geometric features but increase
+    /// computational complexity exponentially.
     #[must_use]
     pub fn with_max_degree(mut self, max_degree: usize) -> Self {
         self.max_degree = max_degree;
         self
     }
 
+    /// Sets the number of dimensions for the path data.
+    ///
+    /// This determines the size of the generator alphabet and should match
+    /// the dimensionality of the input path data.
     #[must_use]
     pub fn with_num_dimensions(mut self, num_dimensions: usize) -> Self {
         self.lyndon_basis.alphabet_size = num_dimensions;
         self
     }
 
+    /// Returns the maximum degree setting.
     #[must_use]
     pub fn max_degree(&self) -> usize {
         self.max_degree
     }
 
+    /// Returns the number of dimensions setting.
     #[must_use]
     pub fn num_dimensions(&self) -> usize {
         self.lyndon_basis.alphabet_size
@@ -81,6 +98,11 @@ impl<T> LogSignatureBuilder<T> {
 }
 
 impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T> {
+    /// Builds an empty log signature with the configured parameters.
+    ///
+    /// The resulting log signature has the proper basis structure but with
+    /// all coefficients set to zero. This is typically used as a starting
+    /// point for accumulating log signature values.
     #[must_use]
     pub fn build<
         U: Clone
@@ -110,6 +132,11 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T
         LogSignature::<T, U> { series, bch_series }
     }
 
+    /// Computes the log signature of a path from multidimensional array data.
+    ///
+    /// The path should be provided as a 2D array where each row represents a point
+    /// and each column represents a coordinate dimension. The log signature is
+    /// computed incrementally over consecutive path segments.
     #[must_use]
     pub fn build_from_path<
         D: Dimension + RemoveAxis,
@@ -148,8 +175,16 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T
     }
 }
 
+/// Represents a computed log signature of a path.
+///
+/// A log signature captures the essential geometric and algebraic features of a path
+/// through its representation as a series in the free Lie algebra. This structure
+/// contains both the computed coefficients and the Baker-Campbell-Hausdorff series
+/// needed for concatenation operations.
 pub struct LogSignature<T, U> {
+    /// The main series containing the log signature coefficients.
     pub series: LieSeries<T, U>,
+    /// The BCH series used for concatenating log signatures.
     pub bch_series: LieSeries<u8, U>,
 }
 
@@ -243,6 +278,11 @@ impl<
         + Neg<Output = U>,
 > LogSignature<T, U>
 {
+    /// Concatenates two log signatures using the Baker-Campbell-Hausdorff formula.
+    ///
+    /// This operation computes the log signature of the path formed by concatenating
+    /// the paths represented by `self` and `rhs`. The result captures the geometry
+    /// of the combined path.
     #[must_use]
     pub fn concatenate(&self, rhs: &Self) -> Self {
         let mut computed_commutations = HashMap::new();
@@ -259,6 +299,10 @@ impl<
         concatenated_log_sig
     }
 
+    /// In-place concatenation of log signatures.
+    ///
+    /// This is the mutable version of `concatenate` that modifies `self` instead
+    /// of creating a new log signature. More memory-efficient for chaining operations.
     pub fn concatenate_assign(&mut self, rhs: &Self) {
         let mut computed_commutations = HashMap::new();
         let original_series = self.series.clone();
@@ -273,6 +317,10 @@ impl<
     }
 }
 
+/// Evaluates a commutator term by recursively applying the commutator operation.
+///
+/// This function interprets commutator expressions from the BCH series and applies
+/// them to concrete Lie series, using memoization to avoid recomputing identical subterms.
 fn evaluate_commutator_term<
     T: Clone + Ord + Generator + Hash,
     U: Clone + Eq + Hash + Default + One + Zero + MulAssign + Neg<Output = U> + AddAssign,

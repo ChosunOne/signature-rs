@@ -9,10 +9,20 @@ use std::ops::{AddAssign, Div, MulAssign, Neg};
 pub use lie_series::LieSeries;
 use num_traits::{FromPrimitive, One, Zero};
 
+/// Trait for types that can generate Lie series.
+///
+/// A Lie series is a formal power series in non-commuting variables that
+/// respects the Lie algebra structure. This trait provides a uniform
+/// interface for generating such series from various sources.
 pub trait LieSeriesGenerator<T, U> {
+    /// Generates a Lie series from this generator.
     fn generate_lie_series(&self) -> LieSeries<T, U>;
 }
 
+/// Computes the binomial coefficient "n choose k" for generic numeric types.
+///
+/// This function efficiently calculates C(n,k) = n!/(k!(n-k)!) using
+/// the multiplicative formula to avoid computing large factorials directly.
 pub(crate) fn binomial<U: One + Zero + FromPrimitive + MulAssign + Div<Output = U>>(
     n: usize,
     k: usize,
@@ -37,6 +47,12 @@ pub(crate) fn binomial<U: One + Zero + FromPrimitive + MulAssign + Div<Output = 
     num / den
 }
 
+/// Generates a sequence of Bernoulli numbers up to the specified maximum index.
+///
+/// Bernoulli numbers B_n are rational numbers that appear in the series expansions
+/// of many important mathematical functions. This implementation uses the recursive
+/// formula based on binomial coefficients and applies the positive sign convention
+/// for B_1 = +1/2.
 #[must_use]
 pub(crate) fn bernoulli_sequence<
     U: Clone

@@ -5,9 +5,15 @@ use lyndon_rs::{generators::Generator, lyndon::LyndonWord};
 use std::{collections::{HashMap, HashSet}, fmt::{Display, Debug}, hash::Hash, ops::{AddAssign, Mul, MulAssign, Neg, Sub}};
 
 
+/// Trait for types that support the commutator operation.
+///
+/// The commutator operation `[A, B]` typically represents the algebraic expression `AB - BA`,
+/// which measures the failure of two elements to commute.
 pub trait Commutator<Rhs = Self> {
+    /// The result type of the commutator operation.
     type Output;
-    /// The commutator operation is represented with `[A, B]` and commonly represents `AB - BA`
+    
+    /// Computes the commutator `[self, other]` = `self * other - other * self`.
     fn commutator(&self, other: Rhs) -> Self::Output;
 }
 impl<T> Commutator<Self> for T 
@@ -36,14 +42,29 @@ macro_rules! comm {
     };
 }
 
+/// Represents an algebraic term involving commutators.
+///
+/// A `CommutatorTerm` can be either:
+/// - An atomic element with a coefficient
+/// - A commutator expression `[left, right]` with a coefficient
+///
+/// This structure allows for the representation of nested commutator expressions
+/// and linear combinations thereof.
 pub enum CommutatorTerm<T, U> {
+    /// An atomic term consisting of a coefficient and an atom.
     Atom{
+        /// The scalar coefficient multiplying the atom.
         coefficient: T,
+        /// The atomic element (generator).
         atom: U,
     },
+    /// A commutator expression `[left, right]` with a coefficient.
     Expression{
+        /// The scalar coefficient multiplying the commutator.
         coefficient: T,
+        /// The left operand of the commutator.
         left: Box<Self>,
+        /// The right operand of the commutator.
         right: Box<Self>,
     },
 }
@@ -362,7 +383,10 @@ impl<T: Clone + One + Zero + Eq + MulAssign + Neg<Output = T>, U: Clone + Ord + 
 }
 
 impl<T, U> CommutatorTerm<T, U> {
-    /// Get the degree of the expression
+    /// Returns the degree of the commutator term.
+    ///
+    /// The degree is defined as the total number of atomic elements in the expression.
+    /// For atoms, this is 1. For expressions, it's the sum of degrees of left and right operands.
     pub fn degree(&self) -> usize {
         match self {
             CommutatorTerm::Atom { .. } => 1,
@@ -372,19 +396,21 @@ impl<T, U> CommutatorTerm<T, U> {
         }
     }
 
+    /// Returns a reference to the coefficient of this term.
     pub fn coefficient(&self) -> &T {
         match self {
             Self::Atom { coefficient, ..} | Self::Expression { coefficient, ..} => coefficient
         }
     }
 
-
+    /// Returns a mutable reference to the coefficient of this term.
     pub fn coefficient_mut(&mut self) -> &mut T {
         match self {
             Self::Atom { coefficient, ..} | Self::Expression { coefficient, ..} => coefficient
         }
     }
 
+    /// Returns the left operand of a commutator expression, or `None` for atoms.
     pub fn left(&self) -> Option<&Self> {
         match self {
             CommutatorTerm::Atom { .. } => None,
@@ -392,6 +418,7 @@ impl<T, U> CommutatorTerm<T, U> {
         }
     }
 
+    /// Returns the right operand of a commutator expression, or `None` for atoms.
     pub fn right(&self) -> Option<&Self> {
         match self {
             CommutatorTerm::Atom { .. } => None,
@@ -399,6 +426,7 @@ impl<T, U> CommutatorTerm<T, U> {
         }
     }
 
+    /// Returns a mutable reference to the left operand, or `None` for atoms.
     pub fn left_mut(&mut self) -> Option<&mut Self> {
         match self {
             CommutatorTerm::Atom { .. } => None,
@@ -406,6 +434,7 @@ impl<T, U> CommutatorTerm<T, U> {
         }
     }
 
+    /// Returns a mutable reference to the right operand, or `None` for atoms.
     pub fn right_mut(&mut self) -> Option<&mut Self> {
         match self {
             CommutatorTerm::Atom { .. } => None,
@@ -415,6 +444,7 @@ impl<T, U> CommutatorTerm<T, U> {
 }
 
 impl<T: Zero, U> CommutatorTerm<T, U> {
+    /// Returns `true` if the coefficient of this term is zero.
     pub fn is_zero(&self) -> bool {
         match self {
             CommutatorTerm::Atom { coefficient, ..} |
@@ -424,7 +454,10 @@ impl<T: Zero, U> CommutatorTerm<T, U> {
 }
 
 impl<T: Clone + One, U: Clone> CommutatorTerm<T, U> {
-    /// Returns the term with the unit coefficient
+    /// Returns a copy of this term with coefficient set to one.
+    ///
+    /// This is useful for extracting the structural part of a term
+    /// without its scalar coefficient.
     #[must_use]
     pub fn unit(&self) -> Self {
         match self {
@@ -443,6 +476,11 @@ impl<T: Clone + One, U: Clone> CommutatorTerm<T, U> {
 }
 
 impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Clone + Ord + Eq> CommutatorTerm<T, U> {
+    /// Sorts the commutator term into canonical Lyndon ordering.
+    ///
+    /// This method recursively applies the anti-commutativity property `[A, B] = -[B, A]`
+    /// to ensure that commutator expressions are in a canonical form where the left
+    /// operand is lexicographically smaller than the right operand.
     pub fn lyndon_sort(&mut self) {
         match self {
             // Do nothing, already sorted
@@ -475,7 +513,11 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
         }
     }
 
-    /// Uses the anti-symmetry property to produce the form `[[A, B], C] = [A, [B, C]] - [B, [A, C]]`
+    /// Applies the Jacobi identity to decompose nested commutators.
+    ///
+    /// For a commutator of the form `[[A, B], C]`, returns the equivalent expression
+    /// `[A, [B, C]] - [B, [A, C]]` as a pair of terms. Returns `None` if the 
+    /// Jacobi identity cannot be applied (e.g., for atoms or already-decomposed expressions).
     pub fn jacobi_identity(&self) -> Option<(Self, Self)> {
         match self {
             CommutatorTerm::Atom{ .. } => None,
@@ -528,6 +570,12 @@ impl<T: Clone + Hash + Eq + One + Zero + MulAssign + Neg<Output = T> + Ord+ AddA
 
         Some(self)
     }
+    /// Decomposes this commutator term into a linear combination of Lyndon basis elements.
+    ///
+    /// Given a set of Lyndon basis elements, this method expresses the current term
+    /// as a sum of basis terms using the Jacobi identity and other commutator relations.
+    /// This is essential for computing in the free Lie algebra where Lyndon words
+    /// form a basis.
     #[must_use]
     pub fn lyndon_basis_decomposition(&self, lyndon_basis_set: &HashSet<Self>) -> Vec<Self> {
         if lyndon_basis_set.contains(&self.unit()) {

@@ -8,17 +8,23 @@ use lyndon_rs::generators::Generator;
 use lyndon_rs::lyndon::LyndonWord;
 use num_traits::{One, Zero};
 
+/// Represents a formal power series in the free Lie algebra.
+///
+/// A `LieSeries` is a linear combination of Lyndon words (represented as commutator terms)
+/// with coefficients from a ring. This structure provides the foundation for computations
+/// involving Baker-Campbell-Hausdorff series and other Lie algebraic operations.
 pub struct LieSeries<T, U> {
-    /// The Lyndon basis for the series
+    /// The Lyndon word basis for the free Lie algebra.
     pub basis: Vec<LyndonWord<T>>,
-    /// The commutator basis for the series
+    /// The commutator representation of the Lyndon basis elements.
     pub commutator_basis: Vec<CommutatorTerm<U, T>>,
-    /// A map for converting arbitrary commutator terms to basis elements
+    /// Maps arbitrary commutator terms to their decomposition in the basis.
     pub commutator_basis_map: HashMap<CommutatorTerm<U, T>, Vec<CommutatorTerm<U, T>>>,
-    /// A map for locating a given term's index in the basis
+    /// Maps basis elements to their index positions for efficient lookup.
     pub commutator_basis_index_map: HashMap<CommutatorTerm<U, T>, usize>,
-    /// The coefficients for each of the terms in the series
+    /// The coefficients corresponding to each basis element.
     pub coefficients: Vec<U>,
+    /// The maximum degree of terms included in this series.
     max_degree: usize,
 }
 

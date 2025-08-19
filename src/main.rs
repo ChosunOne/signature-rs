@@ -23,10 +23,15 @@ use polars::{
 };
 use signature_rs::log_sig::LogSignatureBuilder;
 
+/// Utility for loading path data from various file formats.
 pub struct DataLoader;
 
 impl DataLoader {
-    /// Load a path from file
+    /// Loads path data from a file, supporting multiple formats.
+    ///
+    /// Supports CSV, JSON, JSONL, and Parquet formats. The file format is
+    /// automatically detected from the file's media type. Returns the path
+    /// data as a 2D ndarray where rows are time points and columns are dimensions.
     pub fn load<T: PolarsNumericType>(path: &Path) -> Result<Array2<T::Native>, Box<dyn Error>> {
         let ft = *FileType::try_from_file(path)?
             .media_types()
@@ -59,11 +64,16 @@ impl DataLoader {
     }
 }
 
+/// Supported output file formats for log signature results.
 #[derive(Debug, Copy, Clone)]
 pub enum OutputType {
+    /// Standard JSON format.
     Json,
+    /// JSON Lines format (one JSON object per line).
     JsonLines,
+    /// Comma-separated values format.
     Csv,
+    /// Apache Parquet columnar format.
     Parquet,
 }
 
@@ -92,9 +102,12 @@ impl FromStr for OutputType {
     }
 }
 
+/// Supported numeric precision types for log signature computation.
 #[derive(Debug, Copy, Clone)]
 pub enum DataType {
+    /// 32-bit floating-point precision.
     Float32,
+    /// 64-bit floating-point precision.
     Float64,
 }
 
@@ -119,28 +132,35 @@ impl Display for DataType {
     }
 }
 
+/// Command-line arguments for the log signature computation tool.
 #[derive(Parser, Debug)]
 pub struct Args {
-    /// The number of dimensions of the path
+    /// The number of dimensions of the path data.
+    /// If not specified, will be inferred from the input data.
     #[arg(short = 'd')]
     num_dimensions: Option<usize>,
-    /// The maximum degree of which to calculate the log-signature
+    /// The maximum degree for log signature computation.
+    /// Higher degrees capture more complex geometric features.
     #[arg(short = 'k', default_value_t = 3)]
     max_degree: usize,
-    /// The datatype to use for the log signature coefficients
+    /// The numeric precision to use for log signature coefficients.
     #[arg(short = 't', default_value_t = DataType::Float32)]
     data_type: DataType,
-    /// The file path to the path data
+    /// The file path containing the input path data.
     #[arg(short = 'p')]
     path: PathBuf,
-    /// The output file to write results to
+    /// The output file to write results to. If not specified, prints to stdout.
     #[arg(short = 'o')]
     output: Option<PathBuf>,
-    /// The output file type
+    /// The output file format.
     #[arg(short = 'f', default_value_t = OutputType::Csv)]
     output_type: OutputType,
 }
 
+/// Computes the log signature of a path using the specified parameters.
+///
+/// This function constructs a log signature builder with the given settings
+/// and applies it to the input path data, returning the computed coefficients.
 fn calculate_log_sig<
     T: AddAssign
         + Clone
