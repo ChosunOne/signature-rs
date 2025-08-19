@@ -711,6 +711,7 @@ mod test {
         #[case] path: Array2<f64>,
     ) {
         use ndarray::s;
+        use ordered_float::NotNan;
 
         let builder = LogSignatureBuilder::<u8>::new()
             .with_num_dimensions(num_dimensions)
