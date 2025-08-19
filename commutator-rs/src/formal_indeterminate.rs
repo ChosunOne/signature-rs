@@ -5,9 +5,15 @@ use std::{
 
 use crate::CommutatorTerm;
 
-/// This can represent terms of the form `αe_1⋅⋅⋅e_n`
+/// Represents a formal indeterminate of the form `α·e₁·e₂·...·eₙ`.
+///
+/// A formal indeterminate is a product of symbols with a scalar coefficient.
+/// This is used to represent the expansion of commutator expressions into
+/// their constituent non-commutative monomial terms.
 pub struct FormalIndeterminate<T, U> {
+    /// The scalar coefficient multiplying the product of symbols.
     pub coefficient: U,
+    /// The sequence of symbols in the product.
     pub symbols: Vec<T>,
 }
 

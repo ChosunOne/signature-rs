@@ -3,10 +3,18 @@ use std::{
     hash::Hash,
 };
 
+/// Trait for types that can serve as generators (letters) in a Lyndon word alphabet.
+///
+/// A Generator type must be able to produce an ordered alphabet of the specified size.
+/// This is used to construct Lyndon bases over different types of alphabets.
 pub trait Generator
 where
     Self: Sized,
 {
+    /// Creates an alphabet of the specified size with elements of this generator type.
+    ///
+    /// The returned alphabet should be ordered and contain exactly `size` distinct elements
+    /// suitable for constructing Lyndon words.
     fn alphabet(size: usize) -> Vec<Self>;
 }
 
@@ -173,8 +181,13 @@ impl Generator for char {
     }
 }
 
+/// A generator type using mathematical e-notation with subscripts.
+///
+/// This provides a mathematical notation style for generators, using symbols like e₁, e₂, etc.
+/// Useful for representing generators in a more mathematical context.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ENotation {
+    /// The two-character symbol representation (e.g., ['e', '₁']).
     symbol: [char; 2],
 }
 

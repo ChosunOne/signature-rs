@@ -11,16 +11,26 @@ use thiserror::Error;
 
 use crate::generators::Generator;
 
+/// Sorting method for ordering Lyndon words in a basis.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub enum Sort {
+    /// Standard dictionary ordering based on lexicographic comparison.
     #[default]
     Lexicographical,
+    /// Ordering based on the structure of Lyndon word factorizations.
     Topological,
 }
 
+/// A basis of Lyndon words over an alphabet of type `T`.
+///
+/// A Lyndon basis provides an ordered set of Lyndon words that can be used
+/// as a basis for the free Lie algebra over a given alphabet.
 pub struct LyndonBasis<T> {
+    /// The size of the alphabet used to generate Lyndon words.
     pub alphabet_size: usize,
+    /// The sorting method used to order words in the basis.
     sort: Sort,
+    /// Phantom data to associate the basis with generator type `T`.
     _generator: PhantomData<T>,
 }
 
@@ -62,6 +72,7 @@ impl<T> PartialEq for LyndonBasis<T> {
 impl<T> Eq for LyndonBasis<T> {}
 
 impl<T> LyndonBasis<T> {
+    /// Creates a new Lyndon basis with the specified alphabet size and sorting method.
     #[must_use]
     pub fn new(alphabet_size: usize, sort: Sort) -> Self {
         Self {
@@ -71,6 +82,10 @@ impl<T> LyndonBasis<T> {
         }
     }
 
+    /// Calculates the number of Lyndon words of each degree up to `max_degree`.
+    ///
+    /// Uses the Möbius function to compute the exact count of Lyndon words
+    /// for each length from 1 to `max_degree`.
     #[must_use]
     pub fn number_of_words_per_degree(&self, max_degree: usize) -> Vec<usize> {
         let mu = moebius_mu(max_degree);
@@ -98,6 +113,10 @@ impl<T> LyndonBasis<T> {
 }
 
 impl<T: Generator + Clone + Eq + Hash + Ord> LyndonBasis<T> {
+    /// Generates all Lyndon words up to the specified maximum length.
+    ///
+    /// Returns a vector of Lyndon words ordered according to the basis sorting method.
+    /// The generated basis can be used for computations in free Lie algebras.
     #[must_use]
     pub fn generate_basis(&self, max_length: usize) -> Vec<LyndonWord<T>> {
         let total_words: usize = self.number_of_words_per_degree(max_length).iter().sum();
@@ -188,6 +207,13 @@ impl<T: Generator + Clone + Eq + Hash + Ord> LyndonBasis<T> {
     }
 }
 
+/// Computes the Möbius function values up to `max_degree`.
+///
+/// The Möbius function μ(n) is used in the computation of Lyndon word counts
+/// and has the following properties:
+/// - μ(n) = 1 if n is a square-free positive integer with an even number of prime factors
+/// - μ(n) = -1 if n is a square-free positive integer with an odd number of prime factors  
+/// - μ(n) = 0 if n has a squared prime factor
 #[must_use]
 pub fn moebius_mu(max_degree: usize) -> Vec<i64> {
     let mut mu = vec![0; max_degree];
@@ -202,7 +228,13 @@ pub fn moebius_mu(max_degree: usize) -> Vec<i64> {
     mu
 }
 
+/// A Lyndon word over an alphabet of type `T`.
+///
+/// A Lyndon word is a string that is strictly lexicographically smaller than
+/// all of its nontrivial rotations. Lyndon words form a basis for the free
+/// Lie algebra and are fundamental in combinatorics on words.
 pub struct LyndonWord<T> {
+    /// The sequence of letters that make up the Lyndon word.
     pub letters: Vec<T>,
 }
 
@@ -258,18 +290,23 @@ impl<T: Hash> Hash for LyndonWord<T> {
 }
 
 impl<T> LyndonWord<T> {
+    /// Returns the length of the Lyndon word (number of letters).
     #[must_use]
     pub fn len(&self) -> usize {
         self.letters.len()
     }
 
+    /// Returns `true` if the Lyndon word contains no letters.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.letters.is_empty()
     }
 }
 impl<T: PartialEq> LyndonWord<T> {
-    /// Computes the canonical Goldberg representation of the Lyndon word
+    /// Computes the canonical Goldberg representation of the Lyndon word.
+    ///
+    /// The Goldberg representation expresses a Lyndon word as a partition
+    /// based on runs of identical consecutive letters.
     #[must_use]
     pub fn goldberg(&self) -> Vec<usize> {
         if self.letters.is_empty() {
@@ -332,6 +369,10 @@ impl<T: Ord> LyndonWord<T> {
 }
 
 impl<T: Clone + Generator + Ord> LyndonWord<T> {
+    /// Computes all right factors of this Lyndon word.
+    ///
+    /// Right factors are suffixes of the Lyndon word that are themselves Lyndon words.
+    /// These are used in the construction of free Lie algebra elements.
     #[must_use]
     pub fn right_factors(&self) -> Vec<Self> {
         let alphabet = T::alphabet(1);
@@ -351,6 +392,11 @@ impl<T: Clone + Generator + Ord> LyndonWord<T> {
 }
 
 impl<T: Clone + Ord> LyndonWord<T> {
+    /// Factorizes the Lyndon word into its canonical factorization (v, w).
+    ///
+    /// Every Lyndon word of length > 1 can be uniquely written as a concatenation
+    /// vw where v is a Lyndon word and w is the lexicographically largest Lyndon
+    /// suffix of the original word.
     #[must_use]
     pub fn factorize(&self) -> (LyndonWord<T>, LyndonWord<T>) {
         let n = self.letters.len();
@@ -380,10 +426,13 @@ impl<T: Clone + Ord> Mul for LyndonWord<T> {
     }
 }
 
+/// Errors that can occur when working with Lyndon words.
 #[derive(Error, Debug)]
 pub enum LyndonWordError {
+    /// The provided word does not satisfy the Lyndon word property.
     #[error("Word is not a valid Lyndon word")]
     InvalidWord,
+    /// The word contains letters that are not part of the expected alphabet.
     #[error("Word uses letters not in the alphabet")]
     InvalidLetter,
 }

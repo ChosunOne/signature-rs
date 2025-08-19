@@ -26,27 +26,35 @@ use crate::{
     constants::FACTORIALS,
 };
 
-/// A Lie series of words with alphabet size `N` and generators of type `T`
+/// Generator for Baker-Campbell-Hausdorff (BCH) series using Lyndon words.
+///
+/// This structure efficiently computes BCH series coefficients by organizing
+/// the Lyndon basis and precomputing factorizations. The BCH formula gives
+/// a way to express log(exp(X)exp(Y)) as a series of nested commutators.
 pub struct BchSeriesGenerator<T> {
-    /// The size of the alphabet of the words
+    /// The size of the generator alphabet.
     pub alphabet_size: usize,
-    /// Maximum length of the words
+    /// Maximum degree of terms to include in the series.
     pub max_degree: usize,
-    /// The words of the series
+    /// The Lyndon words forming the basis of the free Lie algebra.
     pub basis: Vec<LyndonWord<T>>,
-    /// The index of the left factor for a given word index `i`
+    /// Index of the left factor for each word in the factorization.
     pub left_factor: Vec<usize>,
-    /// The index of the right factor for a given word index `i`
+    /// Index of the right factor for each word in the factorization.
     pub right_factor: Vec<usize>,
-    /// The length of a given word `i`
+    /// Length (degree) of each word in the basis.
     pub word_lengths: Vec<usize>,
-    /// The starting indices of words with degree `n`
+    /// Starting indices for words of each degree in the basis.
     pub index_of_degree: Vec<usize>,
-    /// The multi-degree index for a given word index `i`
+    /// Multi-degree information for each basis word.
     pub multi_degree: Vec<usize>,
 }
 
 impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T> {
+    /// Creates a new BCH series generator from a Lyndon basis.
+    ///
+    /// This constructor precomputes all necessary factorizations and indices
+    /// for efficient BCH coefficient computation.
     #[must_use]
     pub fn new(basis: LyndonBasis<T>, max_degree: usize) -> Self {
         #[cfg(feature = "progress")]

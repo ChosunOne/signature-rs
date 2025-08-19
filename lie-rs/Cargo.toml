@@ -8,7 +8,6 @@ commutator-rs = {path = "../commutator-rs"}
 lyndon-rs = {path = "../lyndon-rs"}
 num-traits = "^0.2.19"
 rayon = "^1.11.0"
-bitvec = "^1.0.1"
 indicatif = {version = "^0.18.0", optional = true}
 
 [dev-dependencies]
