@@ -1,5 +1,4 @@
 use num_traits::{One, Zero};
-use ordered_float::NotNan;
 
 use lyndon_rs::{generators::Generator, lyndon::LyndonWord};
 use std::{collections::{HashMap, HashSet}, fmt::{Display, Debug}, hash::Hash, ops::{AddAssign, Mul, MulAssign, Neg, Sub}};
@@ -135,18 +134,18 @@ impl<T: Mul<Output = T>, U: Clone> Mul<T> for CommutatorTerm<T, U> {
     }
 }
 
-impl<U: Clone> Mul<CommutatorTerm<NotNan<f32>, U>> for NotNan<f32> {
-    type Output = CommutatorTerm<NotNan<f32>, U>;
+impl<U: Clone> Mul<CommutatorTerm<f32, U>> for f32 {
+    type Output = CommutatorTerm<f32, U>;
 
-    fn mul(self, rhs: CommutatorTerm<NotNan<f32>, U>) -> Self::Output {
+    fn mul(self, rhs: CommutatorTerm<f32, U>) -> Self::Output {
         rhs.mul(self)
     }
 }
 
-impl<U: Clone> Mul<CommutatorTerm<NotNan<f64>, U>> for NotNan<f64> {
-    type Output = CommutatorTerm<NotNan<f64>, U>;
+impl<U: Clone> Mul<CommutatorTerm<f64, U>> for f64 {
+    type Output = CommutatorTerm<f64, U>;
 
-    fn mul(self, rhs: CommutatorTerm<NotNan<f64>, U>) -> Self::Output {
+    fn mul(self, rhs: CommutatorTerm<f64, U>) -> Self::Output {
         rhs.mul(self)
     }
 }
