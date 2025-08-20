@@ -13,7 +13,7 @@ keywords = ["commutator", "lie", "algebra", "combinatorics", "bracket"]
 categories = ["data-structures", "mathematics", "science"]
 
 [dependencies]
-lyndon-rs = {path = "../lyndon-rs"}
+lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
 num-traits = "^0.2.19"
 
 [dev-dependencies]

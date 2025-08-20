@@ -2,6 +2,7 @@
 name = "signature-rs-bin"
 version = "0.1.0"
 edition = "2024"
+description = "CLI Application that computes the log signature from path data"
 rust-version = "1.89.0"
 license = "AGPL-3.0-only"
 repository = "https://github.com/ChosunOne/signature-rs"
@@ -10,17 +11,17 @@ keywords = ["log", "signature", "algebra", "lie", "free"]
 categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [workspace]
-members = ["lyndon-rs", "commutator-rs", "lie-rs", "signature-rs"]
+members = ["lyndon-rs", "commutator-rs", "lie-rs", "signature-rs", "lyndon-py"]
 resolver = "3"
 
 [dependencies]
 ndarray = "^0.16.1"
 ordered-float = "^5.0.0"
 num-traits = "^0.2.19"
-lie-rs = {path = "./lie-rs"}
-lyndon-rs = {path = "./lyndon-rs"}
-commutator-rs = {path = "./commutator-rs"}
-signature-rs = {path = "./signature-rs"}
+lie-rs = {path = "./lie-rs", version = "0.1.0"}
+lyndon-rs = {path = "./lyndon-rs", version = "0.1.0"}
+commutator-rs = {path = "./commutator-rs", version = "0.1.0"}
+signature-rs = {path = "./signature-rs", version = "0.1.0"}
 clap = {version = "^4.5.45", features = ["derive"] }
 polars = { version = "^0.50.0", features = ["ndarray", "lazy", "csv", "parquet", "polars-io", "json"] }
 file_type = "^0.8.9"

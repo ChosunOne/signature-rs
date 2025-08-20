@@ -16,9 +16,9 @@ categories = ["data-structures", "mathematics", "science", "algorithms"]
 ndarray = "^0.16.1"
 num-traits = "^0.2.19"
 ordered-float = "^5.0.0"
-lie-rs = {path = "../lie-rs"}
-lyndon-rs = {path = "../lyndon-rs"}
-commutator-rs = {path = "../commutator-rs"}
+lie-rs = {path = "../lie-rs", version = "0.1.0"}
+lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
+commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
 
 [dev-dependencies]
 rstest = "^0.26.1"

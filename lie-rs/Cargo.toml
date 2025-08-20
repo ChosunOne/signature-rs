@@ -13,8 +13,8 @@ keywords = ["lie", "bch", "algebra", "series", "baker"]
 categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [dependencies]
-commutator-rs = {path = "../commutator-rs"}
-lyndon-rs = {path = "../lyndon-rs"}
+commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
+lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
 num-traits = "^0.2.19"
 rayon = "^1.11.0"
 indicatif = {version = "^0.18.0", optional = true}
