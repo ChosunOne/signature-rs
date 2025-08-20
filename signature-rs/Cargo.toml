@@ -1,11 +1,15 @@
 [package]
 name = "signature-rs"
 version = "0.1.0"
+authors = ["ChosunOne"]
 edition = "2024"
 license = "AGPL-3.0-only"
+description = "High-performance log signature computation for paths and time series data"
+documentation = "https://docs.rs/signature-rs"
+homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
-keywords = ["log", "signature", "algebra", "lie", "free"]
+keywords = ["log", "signature", "lie", "paths", "series"]
 categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [dependencies]

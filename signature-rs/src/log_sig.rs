@@ -101,8 +101,7 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T
     /// Builds an empty log signature with the configured parameters.
     ///
     /// The resulting log signature has the proper basis structure but with
-    /// all coefficients set to zero. This is typically used as a starting
-    /// point for accumulating log signature values.
+    /// all coefficients set to zero.
     #[must_use]
     pub fn build<
         U: Clone

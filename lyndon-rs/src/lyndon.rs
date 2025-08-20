@@ -116,7 +116,6 @@ impl<T: Generator + Clone + Eq + Hash + Ord> LyndonBasis<T> {
     /// Generates all Lyndon words up to the specified maximum length.
     ///
     /// Returns a vector of Lyndon words ordered according to the basis sorting method.
-    /// The generated basis can be used for computations in free Lie algebras.
     #[must_use]
     pub fn generate_basis(&self, max_length: usize) -> Vec<LyndonWord<T>> {
         let total_words: usize = self.number_of_words_per_degree(max_length).iter().sum();
@@ -232,7 +231,7 @@ pub fn moebius_mu(max_degree: usize) -> Vec<i64> {
 ///
 /// A Lyndon word is a string that is strictly lexicographically smaller than
 /// all of its nontrivial rotations. Lyndon words form a basis for the free
-/// Lie algebra and are fundamental in combinatorics on words.
+/// Lie algebra.
 pub struct LyndonWord<T> {
     /// The sequence of letters that make up the Lyndon word.
     pub letters: Vec<T>,
@@ -372,7 +371,6 @@ impl<T: Clone + Generator + Ord> LyndonWord<T> {
     /// Computes all right factors of this Lyndon word.
     ///
     /// Right factors are suffixes of the Lyndon word that are themselves Lyndon words.
-    /// These are used in the construction of free Lie algebra elements.
     #[must_use]
     pub fn right_factors(&self) -> Vec<Self> {
         let alphabet = T::alphabet(1);
@@ -579,7 +577,7 @@ mod test {
             -1, -1, -1, 0, 0, 1, -1, 0, 0, 0, // 50
         ];
         assert_eq!(mu.len(), expected_mu.len());
-        for (i, (term, expected_term)) in mu.iter().zip(expected_mu.iter()).enumerate() {
+        for (term, expected_term) in mu.iter().zip(expected_mu.iter()) {
             assert_eq!(term, expected_term);
         }
     }

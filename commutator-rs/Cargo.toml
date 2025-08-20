@@ -1,11 +1,15 @@
 [package]
 name = "commutator-rs"
 version = "0.1.0"
+authors = ["ChosunOne"]
 edition = "2024"
 license = "AGPL-3.0-only"
+description = "Commutator operations for non-commutative algebras"
+documentation = "https://docs.rs/commutator-rs"
+homepage = "https://github.com/ChosunOne/signature-rs"
 repository = "https://github.com/ChosunOne/signature-rs"
 readme = "README.md"
-keywords = ["commutator", "lie", "algebra", "commute", "abstract"]
+keywords = ["commutator", "lie", "algebra", "combinatorics", "bracket"]
 categories = ["data-structures", "mathematics", "science"]
 
 [dependencies]

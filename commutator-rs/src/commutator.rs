@@ -1,8 +1,12 @@
 use num_traits::{One, Zero};
 
 use lyndon_rs::{generators::Generator, lyndon::LyndonWord};
-use std::{collections::{HashMap, HashSet}, fmt::{Display, Debug}, hash::Hash, ops::{AddAssign, Mul, MulAssign, Neg, Sub}};
-
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::{Debug, Display},
+    hash::Hash,
+    ops::{AddAssign, Mul, MulAssign, Neg, Sub},
+};
 
 /// Trait for types that support the commutator operation.
 ///
@@ -11,12 +15,14 @@ use std::{collections::{HashMap, HashSet}, fmt::{Display, Debug}, hash::Hash, op
 pub trait Commutator<Rhs = Self> {
     /// The result type of the commutator operation.
     type Output;
-    
+
     /// Computes the commutator `[self, other]` = `self * other - other * self`.
     fn commutator(&self, other: Rhs) -> Self::Output;
 }
-impl<T> Commutator<Self> for T 
-where Self: Clone + Mul<Output = T> + Sub<Output = T> {
+impl<T> Commutator<Self> for T
+where
+    Self: Clone + Mul<Output = T> + Sub<Output = T>,
+{
     type Output = T;
 
     fn commutator(&self, other: Self) -> Self::Output {
@@ -24,8 +30,10 @@ where Self: Clone + Mul<Output = T> + Sub<Output = T> {
     }
 }
 
-impl<T> Commutator<&Self> for T 
-where Self: Clone + Mul<Output = T> + Sub<Output = T> {
+impl<T> Commutator<&Self> for T
+where
+    Self: Clone + Mul<Output = T> + Sub<Output = T>,
+{
     type Output = T;
 
     fn commutator(&self, other: &Self) -> Self::Output {
@@ -33,7 +41,45 @@ where Self: Clone + Mul<Output = T> + Sub<Output = T> {
     }
 }
 
-/// Shorthand for applying the commutator operation `[A, B]`.
+/// Shorthand macro for computing commutators `[A, B]`.
+///
+/// This macro provides a convenient syntax for creating commutator expressions.
+/// It expands to `$a.commutator(&$b)`, applying the commutator operation between two terms.
+///
+/// # Examples
+///
+/// Basic usage with CommutatorTerm:
+/// ```rust
+/// use commutator_rs::{CommutatorTerm, Commutator, comm};
+///
+/// let x = CommutatorTerm::Atom { coefficient: 1, atom: 'x' };
+/// let y = CommutatorTerm::Atom { coefficient: 1, atom: 'y' };
+///
+/// // These are equivalent:
+/// let result1 = x.commutator(&y);
+/// let result2 = comm![x, y];
+/// assert_eq!(result1, result2);
+/// ```
+///
+/// Nested commutators:
+/// ```rust
+/// use commutator_rs::{CommutatorTerm, Commutator, comm};
+///
+/// let a = CommutatorTerm::<i32, char>::from('a');
+/// let b = CommutatorTerm::<i32, char>::from('b');
+/// let c = CommutatorTerm::<i32, char>::from('c');
+///
+/// // Compute [[a, b], c]
+/// let nested = comm![comm![a, b], c];
+/// ```
+///
+/// With numeric types:
+/// ```rust
+/// use commutator_rs::{Commutator, comm};
+///
+/// // For numeric types, commutator is AB - BA
+/// assert_eq!(comm![2i32, 3i32], 0); // 2*3 - 3*2 = 0
+/// ```
 #[macro_export]
 macro_rules! comm {
     ($a:expr, $b:expr) => {
@@ -51,14 +97,14 @@ macro_rules! comm {
 /// and linear combinations thereof.
 pub enum CommutatorTerm<T, U> {
     /// An atomic term consisting of a coefficient and an atom.
-    Atom{
+    Atom {
         /// The scalar coefficient multiplying the atom.
         coefficient: T,
         /// The atomic element (generator).
         atom: U,
     },
     /// A commutator expression `[left, right]` with a coefficient.
-    Expression{
+    Expression {
         /// The scalar coefficient multiplying the commutator.
         coefficient: T,
         /// The left operand of the commutator.
@@ -72,7 +118,7 @@ impl<T: One> From<char> for CommutatorTerm<T, char> {
     fn from(value: char) -> Self {
         Self::Atom {
             coefficient: T::one(),
-            atom: value
+            atom: value,
         }
     }
 }
@@ -81,7 +127,7 @@ impl<T: One> From<u8> for CommutatorTerm<T, u8> {
     fn from(value: u8) -> Self {
         Self::Atom {
             coefficient: T::one(),
-            atom: value
+            atom: value,
         }
     }
 }
@@ -89,14 +135,18 @@ impl<T: One> From<u8> for CommutatorTerm<T, u8> {
 impl<T: Display + One + PartialEq, U: Display> Display for CommutatorTerm<T, U> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Atom{ coefficient, atom} => {
+            Self::Atom { coefficient, atom } => {
                 if coefficient.is_one() {
                     write!(f, "{atom}")
                 } else {
                     write!(f, "{coefficient} * {atom}")
                 }
             }
-            Self::Expression { coefficient, left, right} => {
+            Self::Expression {
+                coefficient,
+                left,
+                right,
+            } => {
                 if coefficient.is_one() {
                     write!(f, "[{left}, {right}]")
                 } else {
@@ -110,8 +160,21 @@ impl<T: Display + One + PartialEq, U: Display> Display for CommutatorTerm<T, U> 
 impl<T: Debug, U: Debug> Debug for CommutatorTerm<T, U> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Atom { coefficient, atom } => f.debug_struct("Atom").field("coefficient", coefficient).field("atom", atom).finish(),
-            Self::Expression { coefficient, left, right } => f.debug_struct("Expression").field("coefficient", coefficient).field("left", left).field("right", right).finish(),
+            Self::Atom { coefficient, atom } => f
+                .debug_struct("Atom")
+                .field("coefficient", coefficient)
+                .field("atom", atom)
+                .finish(),
+            Self::Expression {
+                coefficient,
+                left,
+                right,
+            } => f
+                .debug_struct("Expression")
+                .field("coefficient", coefficient)
+                .field("left", left)
+                .field("right", right)
+                .finish(),
         }
     }
 }
@@ -121,15 +184,19 @@ impl<T: Mul<Output = T>, U: Clone> Mul<T> for CommutatorTerm<T, U> {
 
     fn mul(self, rhs: T) -> Self::Output {
         match self {
-            Self::Atom { coefficient, atom } => {
-                Self::Atom {
-                    coefficient: coefficient * rhs,
-                    atom: atom.clone()
-                }
-            } ,
-            Self::Expression { coefficient, left, right } => {
-                Self::Expression { coefficient: coefficient * rhs, left, right }
-            }
+            Self::Atom { coefficient, atom } => Self::Atom {
+                coefficient: coefficient * rhs,
+                atom: atom.clone(),
+            },
+            Self::Expression {
+                coefficient,
+                left,
+                right,
+            } => Self::Expression {
+                coefficient: coefficient * rhs,
+                left,
+                right,
+            },
         }
     }
 }
@@ -205,12 +272,16 @@ impl<T: Hash, U: Hash> Hash for CommutatorTerm<T, U> {
             CommutatorTerm::Atom { coefficient, atom } => {
                 coefficient.hash(state);
                 atom.hash(state);
-            },
-            CommutatorTerm::Expression { coefficient, left, right } => {
+            }
+            CommutatorTerm::Expression {
+                coefficient,
+                left,
+                right,
+            } => {
                 coefficient.hash(state);
                 left.hash(state);
                 right.hash(state);
-            },
+            }
         }
     }
 }
@@ -220,19 +291,19 @@ impl<T: Neg<Output = T>, U> Neg for CommutatorTerm<T, U> {
 
     fn neg(self) -> Self::Output {
         match self {
-            Self::Atom { coefficient, atom} => {
-                Self::Atom {
-                    coefficient: coefficient.neg(),
-                    atom
-                }
+            Self::Atom { coefficient, atom } => Self::Atom {
+                coefficient: coefficient.neg(),
+                atom,
             },
-            Self::Expression { coefficient, left, right} => {
-                Self::Expression {
-                    coefficient: coefficient.neg(),
-                    left,
-                    right
-                }
-            }
+            Self::Expression {
+                coefficient,
+                left,
+                right,
+            } => Self::Expression {
+                coefficient: coefficient.neg(),
+                left,
+                right,
+            },
         }
     }
 }
@@ -240,8 +311,28 @@ impl<T: Neg<Output = T>, U> Neg for CommutatorTerm<T, U> {
 impl<T: Eq, U: Eq> PartialEq for CommutatorTerm<T, U> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Atom { coefficient: l_coefficient, atom: l_atom }, Self::Atom { coefficient: r_coefficient, atom: r_atom }) => l_coefficient == r_coefficient && l_atom == r_atom,
-            (Self::Expression { coefficient: l_coefficient, left: l_left, right: l_right }, Self::Expression { coefficient: r_coefficient, left: r_left, right: r_right }) => l_coefficient == r_coefficient && l_left == r_left && l_right == r_right,
+            (
+                Self::Atom {
+                    coefficient: l_coefficient,
+                    atom: l_atom,
+                },
+                Self::Atom {
+                    coefficient: r_coefficient,
+                    atom: r_atom,
+                },
+            ) => l_coefficient == r_coefficient && l_atom == r_atom,
+            (
+                Self::Expression {
+                    coefficient: l_coefficient,
+                    left: l_left,
+                    right: l_right,
+                },
+                Self::Expression {
+                    coefficient: r_coefficient,
+                    left: r_left,
+                    right: r_right,
+                },
+            ) => l_coefficient == r_coefficient && l_left == r_left && l_right == r_right,
             _ => false,
         }
     }
@@ -251,8 +342,19 @@ impl<T: Eq, U: Eq> Eq for CommutatorTerm<T, U> {}
 impl<T: Clone, U: Clone> Clone for CommutatorTerm<T, U> {
     fn clone(&self) -> Self {
         match self {
-            Self::Atom { coefficient, atom } => Self::Atom { coefficient: coefficient.clone(), atom: atom.clone() },
-            Self::Expression { coefficient, left, right } => Self::Expression { coefficient: coefficient.clone(), left: left.clone(), right: right.clone() },
+            Self::Atom { coefficient, atom } => Self::Atom {
+                coefficient: coefficient.clone(),
+                atom: atom.clone(),
+            },
+            Self::Expression {
+                coefficient,
+                left,
+                right,
+            } => Self::Expression {
+                coefficient: coefficient.clone(),
+                left: left.clone(),
+                right: right.clone(),
+            },
         }
     }
 }
@@ -264,49 +366,117 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
 
     fn commutator(&self, other: &Self) -> Self::Output {
         match (self, other) {
-            (a @ Self::Atom {coefficient: c1, atom: a1}, 
-                b @ Self::Atom {coefficient: c2, atom: a2}) => {
-                let coefficient = if  a == b { T::zero() } else { c1.clone() * c2.clone() };
-                let left = Box::new(Self::Atom { coefficient: T::one(), atom: a1.clone()});
-                let right = Box::new(Self::Atom { coefficient: T::one(), atom: a2.clone()});
-                Self::Expression{
-                    coefficient,
-                    left,
-                    right,
-                }
-            }
-            (Self::Atom {coefficient: c1, atom}, 
-                Self::Expression {coefficient: c2, left: l1, right}) => {
-                let coefficient = c1.clone() * c2.clone();
-                let left = Box::new(Self::Atom { coefficient: T::one(), atom: atom.clone()});
-                let right = Box::new(Self::Expression { coefficient: T::one(), left: l1.clone(), right: right.clone()});
-
-                Self::Expression{
-                    coefficient,
-                    left,
-                    right,
-                }
-            }
-            (Self::Expression {coefficient: c1, left: l1, right: r1}, 
-                Self::Atom{ coefficient: c2, atom }) => {
-                let coefficient = c1.clone() * c2.clone();
-                let left = Box::new(Self::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone() });
-                let right = Box::new(Self::Atom { coefficient: T::one(), atom: atom.clone()});
-                Self::Expression {
-                    coefficient,
-                    left,
-                    right
-                }
-            }
-            (a @ Self::Expression {coefficient: c1, left: l1, right: r1},
-                b @ Self::Expression {coefficient: c2, left: l2, right: r2}) => {
+            (
+                a @ Self::Atom {
+                    coefficient: c1,
+                    atom: a1,
+                },
+                b @ Self::Atom {
+                    coefficient: c2,
+                    atom: a2,
+                },
+            ) => {
                 let coefficient = if a == b {
                     T::zero()
                 } else {
                     c1.clone() * c2.clone()
                 };
-                let left = Box::new(Self::Expression { coefficient: T::one(), left: l1.clone(), right: r1.clone()});
-                let right = Box::new(Self::Expression { coefficient: T::one(), left: l2.clone(), right: r2.clone()});
+                let left = Box::new(Self::Atom {
+                    coefficient: T::one(),
+                    atom: a1.clone(),
+                });
+                let right = Box::new(Self::Atom {
+                    coefficient: T::one(),
+                    atom: a2.clone(),
+                });
+                Self::Expression {
+                    coefficient,
+                    left,
+                    right,
+                }
+            }
+            (
+                Self::Atom {
+                    coefficient: c1,
+                    atom,
+                },
+                Self::Expression {
+                    coefficient: c2,
+                    left: l1,
+                    right,
+                },
+            ) => {
+                let coefficient = c1.clone() * c2.clone();
+                let left = Box::new(Self::Atom {
+                    coefficient: T::one(),
+                    atom: atom.clone(),
+                });
+                let right = Box::new(Self::Expression {
+                    coefficient: T::one(),
+                    left: l1.clone(),
+                    right: right.clone(),
+                });
+
+                Self::Expression {
+                    coefficient,
+                    left,
+                    right,
+                }
+            }
+            (
+                Self::Expression {
+                    coefficient: c1,
+                    left: l1,
+                    right: r1,
+                },
+                Self::Atom {
+                    coefficient: c2,
+                    atom,
+                },
+            ) => {
+                let coefficient = c1.clone() * c2.clone();
+                let left = Box::new(Self::Expression {
+                    coefficient: T::one(),
+                    left: l1.clone(),
+                    right: r1.clone(),
+                });
+                let right = Box::new(Self::Atom {
+                    coefficient: T::one(),
+                    atom: atom.clone(),
+                });
+                Self::Expression {
+                    coefficient,
+                    left,
+                    right,
+                }
+            }
+            (
+                a @ Self::Expression {
+                    coefficient: c1,
+                    left: l1,
+                    right: r1,
+                },
+                b @ Self::Expression {
+                    coefficient: c2,
+                    left: l2,
+                    right: r2,
+                },
+            ) => {
+                let coefficient = if a == b {
+                    T::zero()
+                } else {
+                    c1.clone() * c2.clone()
+                };
+                let left = Box::new(Self::Expression {
+                    coefficient: T::one(),
+                    left: l1.clone(),
+                    right: r1.clone(),
+                });
+                let right = Box::new(Self::Expression {
+                    coefficient: T::one(),
+                    left: l2.clone(),
+                    right: r2.clone(),
+                });
 
                 Self::Expression {
                     coefficient,
@@ -318,9 +488,7 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
     }
 }
 
-impl<T: Eq, U: PartialEq + PartialOrd + Ord> PartialOrd
-    for CommutatorTerm<T, U>
-{
+impl<T: Eq, U: PartialEq + PartialOrd + Ord> PartialOrd for CommutatorTerm<T, U> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -329,52 +497,68 @@ impl<T: Eq, U: PartialEq + PartialOrd + Ord> PartialOrd
 impl<T: Eq, U: Ord> Ord for CommutatorTerm<T, U> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (Self::Atom { atom: a1, ..}, Self::Atom { atom: a2, ..}) => a1.cmp(a2),
-            (Self::Atom { .. }, Self::Expression { left, .. }) => {
-                match self.cmp(left) {
-                    std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
-                    o => o,
-                }
-            }
-            (Self::Expression { left, ..}, Self::Atom { .. }) => {
-                match (**left).cmp(other) {
-                    std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
-                    o => o,
-                }
-            }
-            (Self::Expression {left: l1, right: r1, ..}, 
-                Self::Expression {left: l2, right: r2, ..}) => {
-                match l1.cmp(l2) {
-                    std::cmp::Ordering::Equal => r1.cmp(r2),
-                    o => o,
-                }
-            }
+            (Self::Atom { atom: a1, .. }, Self::Atom { atom: a2, .. }) => a1.cmp(a2),
+            (Self::Atom { .. }, Self::Expression { left, .. }) => match self.cmp(left) {
+                std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
+                o => o,
+            },
+            (Self::Expression { left, .. }, Self::Atom { .. }) => match (**left).cmp(other) {
+                std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
+                o => o,
+            },
+            (
+                Self::Expression {
+                    left: l1,
+                    right: r1,
+                    ..
+                },
+                Self::Expression {
+                    left: l2,
+                    right: r2,
+                    ..
+                },
+            ) => match l1.cmp(l2) {
+                std::cmp::Ordering::Equal => r1.cmp(r2),
+                o => o,
+            },
         }
     }
 }
 
-
-impl<T: Clone + One + Zero + Eq + MulAssign + Neg<Output = T>, U: Clone + Ord + Generator + Eq> From<&LyndonWord<U>>
-    for CommutatorTerm<T, U>
+impl<T: Clone + One + Zero + Eq + MulAssign + Neg<Output = T>, U: Clone + Ord + Generator + Eq>
+    From<&LyndonWord<U>> for CommutatorTerm<T, U>
 {
     fn from(value: &LyndonWord<U>) -> Self {
         if value.len() == 1 {
-            return CommutatorTerm::Atom{coefficient: T::one(), atom: value.letters[0].clone()};
+            return CommutatorTerm::Atom {
+                coefficient: T::one(),
+                atom: value.letters[0].clone(),
+            };
         }
 
         let (left, right) = value.factorize();
         let left = if left.len() == 1 {
-            Box::new(CommutatorTerm::Atom {coefficient: T::one(), atom: left.letters[0].clone()})
+            Box::new(CommutatorTerm::Atom {
+                coefficient: T::one(),
+                atom: left.letters[0].clone(),
+            })
         } else {
             Box::new(Self::from(&left))
         };
         let right = if right.len() == 1 {
-            Box::new(CommutatorTerm::Atom {coefficient: T::one(), atom: right.letters[0].clone()})
+            Box::new(CommutatorTerm::Atom {
+                coefficient: T::one(),
+                atom: right.letters[0].clone(),
+            })
         } else {
             Box::new(Self::from(&right))
         };
 
-        let mut result = Self::Expression { coefficient: T::one(), left, right };
+        let mut result = Self::Expression {
+            coefficient: T::one(),
+            left,
+            right,
+        };
         result.lyndon_sort();
         *result.coefficient_mut() = T::one();
         result
@@ -389,23 +573,21 @@ impl<T, U> CommutatorTerm<T, U> {
     pub fn degree(&self) -> usize {
         match self {
             CommutatorTerm::Atom { .. } => 1,
-            CommutatorTerm::Expression {  left, right , ..} => {
-                left.degree() + right.degree()
-            },
+            CommutatorTerm::Expression { left, right, .. } => left.degree() + right.degree(),
         }
     }
 
     /// Returns a reference to the coefficient of this term.
     pub fn coefficient(&self) -> &T {
         match self {
-            Self::Atom { coefficient, ..} | Self::Expression { coefficient, ..} => coefficient
+            Self::Atom { coefficient, .. } | Self::Expression { coefficient, .. } => coefficient,
         }
     }
 
     /// Returns a mutable reference to the coefficient of this term.
     pub fn coefficient_mut(&mut self) -> &mut T {
         match self {
-            Self::Atom { coefficient, ..} | Self::Expression { coefficient, ..} => coefficient
+            Self::Atom { coefficient, .. } | Self::Expression { coefficient, .. } => coefficient,
         }
     }
 
@@ -446,8 +628,8 @@ impl<T: Zero, U> CommutatorTerm<T, U> {
     /// Returns `true` if the coefficient of this term is zero.
     pub fn is_zero(&self) -> bool {
         match self {
-            CommutatorTerm::Atom { coefficient, ..} |
-            CommutatorTerm::Expression { coefficient, .. } => coefficient.is_zero(),
+            CommutatorTerm::Atom { coefficient, .. }
+            | CommutatorTerm::Expression { coefficient, .. } => coefficient.is_zero(),
         }
     }
 }
@@ -460,21 +642,22 @@ impl<T: Clone + One, U: Clone> CommutatorTerm<T, U> {
     #[must_use]
     pub fn unit(&self) -> Self {
         match self {
-            Self::Atom {  atom, .. } => Self::Atom {
+            Self::Atom { atom, .. } => Self::Atom {
                 coefficient: T::one(),
-                atom: atom.clone()
+                atom: atom.clone(),
             },
-            Self::Expression { left, right, ..} =>
-            Self::Expression {
+            Self::Expression { left, right, .. } => Self::Expression {
                 coefficient: T::one(),
                 left: left.clone(),
-                right: right.clone() }
+                right: right.clone(),
+            },
         }
     }
-
 }
 
-impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Clone + Ord + Eq> CommutatorTerm<T, U> {
+impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Clone + Ord + Eq>
+    CommutatorTerm<T, U>
+{
     /// Sorts the commutator term into canonical Lyndon ordering.
     ///
     /// This method recursively applies the anti-commutativity property `[A, B] = -[B, A]`
@@ -484,7 +667,11 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
         match self {
             // Do nothing, already sorted
             CommutatorTerm::Atom { .. } => {}
-            CommutatorTerm::Expression{coefficient,  left, right} => {
+            CommutatorTerm::Expression {
+                coefficient,
+                left,
+                right,
+            } => {
                 left.lyndon_sort();
                 right.lyndon_sort();
                 match left.cmp(&right) {
@@ -496,13 +683,19 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
                     std::cmp::Ordering::Less => {}
                 }
                 // Propagate up coefficients
-                if let CommutatorTerm::Expression{ coefficient: c2, ..} = &mut **left {
+                if let CommutatorTerm::Expression {
+                    coefficient: c2, ..
+                } = &mut **left
+                {
                     *coefficient *= c2.clone();
                     if *c2 == -T::one() {
                         *c2 = -c2.clone();
                     }
                 }
-                if let CommutatorTerm::Expression{ coefficient: c2, ..} = &mut **right {
+                if let CommutatorTerm::Expression {
+                    coefficient: c2, ..
+                } = &mut **right
+                {
                     *coefficient *= c2.clone();
                     if *c2 == -T::one() {
                         *c2 = -c2.clone();
@@ -515,14 +708,25 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
     /// Applies the Jacobi identity to decompose nested commutators.
     ///
     /// For a commutator of the form `[[A, B], C]`, returns the equivalent expression
-    /// `[A, [B, C]] - [B, [A, C]]` as a pair of terms. Returns `None` if the 
+    /// `[A, [B, C]] - [B, [A, C]]` as a pair of terms. Returns `None` if the
     /// Jacobi identity cannot be applied (e.g., for atoms or already-decomposed expressions).
     pub fn jacobi_identity(&self) -> Option<(Self, Self)> {
         match self {
-            CommutatorTerm::Atom{ .. } => None,
-            CommutatorTerm::Expression { coefficient, left, right} => {
+            CommutatorTerm::Atom { .. } => None,
+            CommutatorTerm::Expression {
+                coefficient,
+                left,
+                right,
+            } => {
                 // Check if expression is already in basis form
-                let CommutatorTerm::Expression{ left: l_left, right: l_right, ..} = &**left else { return None};
+                let CommutatorTerm::Expression {
+                    left: l_left,
+                    right: l_right,
+                    ..
+                } = &**left
+                else {
+                    return None;
+                };
                 let a = l_left.clone();
                 let b = l_right.clone();
                 let c = right.clone();
@@ -533,38 +737,37 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
                 right_term.lyndon_sort();
 
                 Some((left_term, right_term))
-            },
+            }
         }
     }
-
-
 }
 
-impl<T: Clone + Hash + Eq + One + Zero + MulAssign + Neg<Output = T> + Ord+ AddAssign, U: Clone + Hash + Eq + Ord> CommutatorTerm<T, U>
+impl<
+    T: Clone + Hash + Eq + One + Zero + MulAssign + Neg<Output = T> + Ord + AddAssign,
+    U: Clone + Hash + Eq + Ord,
+> CommutatorTerm<T, U>
 {
-    fn find_decomposition_subterm_mut(&mut self, lyndon_basis_set: &HashSet<Self>) -> Option<&mut Self> {
-        if let Self::Atom {..} = self {
+    fn find_decomposition_subterm_mut(
+        &mut self,
+        lyndon_basis_set: &HashSet<Self>,
+    ) -> Option<&mut Self> {
+        if let Self::Atom { .. } = self {
             return None;
         }
         if lyndon_basis_set.contains(&self.unit()) {
             return None;
         }
 
-        let Self::Expression { left, right, ..} = self else {
+        let Self::Expression { left, right, .. } = self else {
             return None;
         };
 
         if let Some(result) = left.find_decomposition_subterm_mut(lyndon_basis_set) {
-            return Some(unsafe {
-                std::ptr::from_mut(result).as_mut().unwrap()
-            })
+            return Some(unsafe { std::ptr::from_mut(result).as_mut().unwrap() });
         }
 
-
         if let Some(result) = right.find_decomposition_subterm_mut(lyndon_basis_set) {
-            return Some(unsafe {
-                std::ptr::from_mut(result).as_mut().unwrap()
-            })
+            return Some(unsafe { std::ptr::from_mut(result).as_mut().unwrap() });
         }
 
         Some(self)
@@ -584,18 +787,19 @@ impl<T: Clone + Hash + Eq + One + Zero + MulAssign + Neg<Output = T> + Ord+ AddA
         let mut lyndon_basis_terms = HashMap::<Self, Self>::new();
         let mut term_queue = vec![self.clone()];
 
-
         while let Some(mut t) = term_queue.pop() {
             t.lyndon_sort();
             if lyndon_basis_set.contains(&t.unit()) {
-                lyndon_basis_terms.entry(t.unit()).and_modify(|x| *x.coefficient_mut() += t.coefficient().clone()).or_insert(t);
+                lyndon_basis_terms
+                    .entry(t.unit())
+                    .and_modify(|x| *x.coefficient_mut() += t.coefficient().clone())
+                    .or_insert(t);
                 continue;
             }
             let mut t1 = t.clone();
             let mut t2 = t.clone();
             let s1 = t1.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
             let s2 = t2.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
-
 
             if s1.is_zero() || s2.is_zero() || s1.left().unwrap() == s1.right().unwrap() {
                 continue;
@@ -608,37 +812,41 @@ impl<T: Clone + Hash + Eq + One + Zero + MulAssign + Neg<Output = T> + Ord+ AddA
                 (a, b)
             };
 
-
             let s_dprime = s1.right().unwrap();
 
             let new_s_1 = Self::Expression {
                 coefficient: s1.coefficient().clone(),
                 left: Box::new(comm![a, s_dprime]),
-                right: Box::new(b.clone())
+                right: Box::new(b.clone()),
             };
 
             let new_s_2 = Self::Expression {
                 coefficient: s2.coefficient().clone(),
                 left: Box::new(a.clone()),
-                right: Box::new(comm![b, s_dprime])
+                right: Box::new(comm![b, s_dprime]),
             };
 
             *s1 = new_s_1;
             *s2 = new_s_2;
 
             if lyndon_basis_set.contains(&t1.unit()) {
-                lyndon_basis_terms.entry(t1.unit()).and_modify(|x| *x.coefficient_mut() += t1.coefficient().clone()).or_insert(t1);
+                lyndon_basis_terms
+                    .entry(t1.unit())
+                    .and_modify(|x| *x.coefficient_mut() += t1.coefficient().clone())
+                    .or_insert(t1);
             } else {
                 term_queue.push(t1);
             }
 
             if lyndon_basis_set.contains(&t2.unit()) {
-                lyndon_basis_terms.entry(t2.unit()).and_modify(|x| *x.coefficient_mut() += t2.coefficient().clone()).or_insert(t2);
+                lyndon_basis_terms
+                    .entry(t2.unit())
+                    .and_modify(|x| *x.coefficient_mut() += t2.coefficient().clone())
+                    .or_insert(t2);
             } else {
                 term_queue.push(t2);
             }
         }
-
 
         let mut lyndon_basis_terms = lyndon_basis_terms.into_values().collect::<Vec<_>>();
 
@@ -647,18 +855,15 @@ impl<T: Clone + Hash + Eq + One + Zero + MulAssign + Neg<Output = T> + Ord+ AddA
     }
 }
 
-
-
-
 #[cfg(test)]
 mod test {
 
     use crate::formal_indeterminate::FormalIndeterminate;
 
     use super::*;
+    use lyndon_rs::lyndon::LyndonWordError;
     use rstest::rstest;
     use std::cmp::{Ordering, PartialOrd};
-    use lyndon_rs::lyndon::LyndonWordError;
 
     #[test]
     fn test_commutators_int() {
@@ -714,7 +919,6 @@ mod test {
         let term = comm![a, b];
         assert_eq!(term, expected_term);
     }
-
 
     #[rstest]
     #[case("AB", "ABB", Ordering::Less)]
@@ -906,12 +1110,19 @@ CommutatorTerm::from('A')
     fn test_commutator_term_jacobi_identity(
         #[case] term: CommutatorTerm<i128, char>,
         #[case] expected_left_term: CommutatorTerm<i128, char>,
-        #[case] expected_right_term: CommutatorTerm<i128, char>) {
+        #[case] expected_right_term: CommutatorTerm<i128, char>,
+    ) {
         let Some((left_term, right_term)) = term.jacobi_identity() else {
             panic!("Failed to create jacobi identity");
         };
-        assert_eq!(left_term, expected_left_term, "{left_term} != {expected_left_term}");
-        assert_eq!(right_term, expected_right_term, "{right_term} != {expected_right_term}");
+        assert_eq!(
+            left_term, expected_left_term,
+            "{left_term} != {expected_left_term}"
+        );
+        assert_eq!(
+            right_term, expected_right_term,
+            "{right_term} != {expected_right_term}"
+        );
     }
 
     #[rstest]
@@ -1036,10 +1247,9 @@ CommutatorTerm::from('A')
         #[case] num_generators: usize,
         #[case] max_degree: usize,
         #[case] term: CommutatorTerm<i128, char>,
-        #[case] mut expected_basis_terms: Vec<CommutatorTerm<i128, char>>
+        #[case] mut expected_basis_terms: Vec<CommutatorTerm<i128, char>>,
     ) {
         use lyndon_rs::lyndon::{LyndonBasis, Sort};
-
 
         expected_basis_terms.sort();
         println!("term: {term}");
@@ -1065,7 +1275,10 @@ CommutatorTerm::from('A')
         dbg!(&basis_terms);
         assert_eq!(basis_terms.len(), expected_basis_terms.len());
         for (basis_term, expected_basis_term) in basis_terms.iter().zip(&expected_basis_terms) {
-            assert_eq!(basis_term, expected_basis_term, "{basis_term} != {expected_basis_term}");
+            assert_eq!(
+                basis_term, expected_basis_term,
+                "{basis_term} != {expected_basis_term}"
+            );
         }
     }
 
@@ -1074,7 +1287,7 @@ CommutatorTerm::from('A')
         CommutatorTerm::from('A'),
         CommutatorTerm::from('B'),
         vec![
-            FormalIndeterminate::<char, i128> { 
+            FormalIndeterminate::<char, i128> {
                 coefficient: 1,
                 symbols: vec!['A', 'B']
             },
