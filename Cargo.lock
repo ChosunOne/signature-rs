@@ -471,6 +471,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "commutator-py"
+version = "0.1.0"
+dependencies = [
+ "commutator-rs",
+ "lyndon-py",
+ "ordered-float",
+ "pyo3",
+]
+
+[[package]]
 name = "commutator-rs"
 version = "0.1.0"
 dependencies = [

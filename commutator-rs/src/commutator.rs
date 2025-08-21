@@ -19,6 +19,7 @@ pub trait Commutator<Rhs = Self> {
     /// Computes the commutator `[self, other]` = `self * other - other * self`.
     fn commutator(&self, other: Rhs) -> Self::Output;
 }
+
 impl<T> Commutator<Self> for T
 where
     Self: Clone + Mul<Output = T> + Sub<Output = T>,
@@ -196,6 +197,28 @@ impl<T: Mul<Output = T>, U: Clone> Mul<T> for CommutatorTerm<T, U> {
                 coefficient: coefficient * rhs,
                 left,
                 right,
+            },
+        }
+    }
+}
+
+impl<T: Mul<Output = T> + Clone, U: Clone> Mul<T> for &CommutatorTerm<T, U> {
+    type Output = CommutatorTerm<T, U>;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        match self {
+            CommutatorTerm::Atom { coefficient, atom } => CommutatorTerm::Atom {
+                coefficient: coefficient.clone() * rhs,
+                atom: atom.clone(),
+            },
+            CommutatorTerm::Expression {
+                coefficient,
+                left,
+                right,
+            } => CommutatorTerm::Expression {
+                coefficient: coefficient.clone() * rhs,
+                left: left.clone(),
+                right: right.clone(),
             },
         }
     }

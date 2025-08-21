@@ -11,7 +11,7 @@ keywords = ["log", "signature", "algebra", "lie", "free"]
 categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [workspace]
-members = ["lyndon-rs", "commutator-rs", "lie-rs", "signature-rs", "lyndon-py"]
+members = ["lyndon-rs", "commutator-rs", "lie-rs", "signature-rs", "lyndon-py", "commutator-py"]
 resolver = "3"
 
 [dependencies]
