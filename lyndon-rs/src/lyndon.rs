@@ -29,7 +29,7 @@ pub struct LyndonBasis<T> {
     /// The size of the alphabet used to generate Lyndon words.
     pub alphabet_size: usize,
     /// The sorting method used to order words in the basis.
-    sort: Sort,
+    pub sort: Sort,
     /// Phantom data to associate the basis with generator type `T`.
     _generator: PhantomData<T>,
 }
@@ -301,6 +301,7 @@ impl<T> LyndonWord<T> {
         self.letters.is_empty()
     }
 }
+
 impl<T: PartialEq> LyndonWord<T> {
     /// Computes the canonical Goldberg representation of the Lyndon word.
     ///
@@ -424,8 +425,16 @@ impl<T: Clone + Ord> Mul for LyndonWord<T> {
     }
 }
 
+impl<T: Clone + Ord> Mul for &LyndonWord<T> {
+    type Output = Result<LyndonWord<T>, LyndonWordError>;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        LyndonWord::<T>::try_from([self.letters.clone(), rhs.letters.clone()].concat())
+    }
+}
+
 /// Errors that can occur when working with Lyndon words.
-#[derive(Error, Debug)]
+#[derive(Copy, Clone, Error, Debug, Eq, PartialEq)]
 pub enum LyndonWordError {
     /// The provided word does not satisfy the Lyndon word property.
     #[error("Word is not a valid Lyndon word")]
