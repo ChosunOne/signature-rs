@@ -475,7 +475,7 @@ name = "commutator-py"
 version = "0.1.0"
 dependencies = [
  "commutator-rs",
- "lyndon-py",
+ "lyndon-rs",
  "ordered-float",
  "pyo3",
 ]

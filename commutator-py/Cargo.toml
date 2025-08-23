@@ -11,5 +11,5 @@ crate-type = ["cdylib"]
 [dependencies]
 ordered-float = "^5.0.0"
 pyo3 = "^0.25.1"
-lyndon-py = {path = "../lyndon-py", version = "0.1.0"}
+lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
 commutator-rs = {path = "../commutator-rs", version = "0.1.0"}

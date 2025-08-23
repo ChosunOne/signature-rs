@@ -2,12 +2,13 @@ use std::{
     collections::HashSet,
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
-    ops::Mul,
+    ops::{Mul, Neg},
 };
 
 use commutator_rs::{Commutator, CommutatorTerm};
+use lyndon_rs::LyndonWord;
 use ordered_float::NotNan;
-use pyo3::{exceptions::PyValueError, prelude::*};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyType};
 
 #[pyclass(name = "CommutatorTerm", eq, ord, str)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -21,9 +22,17 @@ impl Display for CommutatorTermPy {
     }
 }
 
+impl CommutatorTermPy {
+    #[must_use]
+    pub fn inner(&self) -> &CommutatorTerm<NotNan<f32>, u8> {
+        &self.inner
+    }
+}
+
 #[pymethods]
 impl CommutatorTermPy {
     #[new]
+    #[pyo3(signature = (coefficient, atom=None, left=None, right=None))]
     pub fn new(
         coefficient: f32,
         atom: Option<u8>,
@@ -66,26 +75,57 @@ impl CommutatorTermPy {
         unreachable!()
     }
 
+    #[classmethod]
+    pub fn from_lyndon_word(_: Bound<'_, PyType>, lyndon_word: Bound<'_, PyAny>) -> PyResult<Self> {
+        let letters = lyndon_word.getattr("letters")?.extract::<Vec<u8>>()?;
+        let lyndon_word = LyndonWord::try_from(letters)
+            .map_err(|_| PyValueError::new_err("Invalid lyndon word"))?;
+        Ok(Self {
+            inner: CommutatorTerm::from(&lyndon_word),
+        })
+    }
+
+    #[must_use]
     pub fn __mul__(&self, other: f32) -> PyResult<Self> {
         let other_float = other
             .try_into()
             .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
-        return Ok(Self {
-            inner: (&self.inner).mul(other_float),
-        });
+        Ok(Self {
+            inner: self.inner().mul(other_float),
+        })
     }
 
+    #[must_use]
+    pub fn __rmul__(&self, other: f32) -> PyResult<Self> {
+        let other_float = other
+            .try_into()
+            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
+        Ok(Self {
+            inner: self.inner().mul(other_float),
+        })
+    }
+
+    #[must_use]
+    pub fn __neg__(&self) -> Self {
+        Self {
+            inner: self.inner().neg(),
+        }
+    }
+
+    #[must_use]
     pub fn __hash__(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.inner.hash(&mut hasher);
         hasher.finish()
     }
 
+    #[must_use]
     pub fn degree(&self) -> usize {
         self.inner.degree()
     }
 
     #[getter]
+    #[must_use]
     pub fn get_coefficient(&self) -> f32 {
         **self.inner.coefficient()
     }
@@ -97,6 +137,7 @@ impl CommutatorTermPy {
         Ok(())
     }
 
+    #[must_use]
     pub fn commutator(&self, rhs: &Self) -> Self {
         Self {
             inner: self.inner.commutator(&rhs.inner),
@@ -104,6 +145,20 @@ impl CommutatorTermPy {
     }
 
     #[getter]
+    #[must_use]
+    pub fn get_atom(&self) -> Option<u8> {
+        self.inner.atom().copied()
+    }
+
+    #[setter]
+    pub fn set_atom(&mut self, atom: u8) {
+        if let Some(x) = self.inner.atom_mut() {
+            *x = atom;
+        }
+    }
+
+    #[getter]
+    #[must_use]
     pub fn get_left(&self) -> Option<Self> {
         self.inner.left().map(|l| Self { inner: l.clone() })
     }
@@ -123,10 +178,12 @@ impl CommutatorTermPy {
         self.inner.right_mut().replace(&mut term.inner);
     }
 
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         self.inner.is_zero()
     }
 
+    #[must_use]
     pub fn unit(&self) -> Self {
         Self {
             inner: self.inner.unit(),
@@ -137,11 +194,13 @@ impl CommutatorTermPy {
         self.inner.lyndon_sort();
     }
 
+    #[must_use]
     pub fn jacobi_identity(&self) -> Option<(Self, Self)> {
         let (a, b) = self.inner.jacobi_identity()?;
         (Self { inner: a }, Self { inner: b }).into()
     }
 
+    #[must_use]
     pub fn lyndon_basis_decomposition(
         &self,
         lyndon_basis_set: HashSet<CommutatorTermPy>,

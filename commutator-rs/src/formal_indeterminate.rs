@@ -1,5 +1,6 @@
 use std::{
     fmt::{Debug, Display},
+    hash::Hash,
     ops::{Mul, MulAssign, Neg},
 };
 
@@ -56,6 +57,13 @@ impl<T: Clone, U: Clone> Clone for FormalIndeterminate<T, U> {
             coefficient: self.coefficient.clone(),
             symbols: self.symbols.clone(),
         }
+    }
+}
+
+impl<T: Hash, U: Hash> Hash for FormalIndeterminate<T, U> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.coefficient.hash(state);
+        self.symbols.hash(state);
     }
 }
 

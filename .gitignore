@@ -1,4 +1,6 @@
 target/*
+**/__pycache__/*
+*.pyc
 
 # Claude Code workspace instructions
 CLAUDE.md

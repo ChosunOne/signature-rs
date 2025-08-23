@@ -1,19 +1,19 @@
 use std::{fmt::Display, hash::Hash, ops::Mul};
 
 use lyndon_rs::{LyndonBasis, LyndonWord, LyndonWordError, Sort};
-use pyo3::{exceptions::PyValueError, prelude::*, sync::GILOnceCell, types::PyList};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyList};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct PyLyndonWordError(LyndonWordError);
+pub struct LyndonWordPyError(LyndonWordError);
 
-impl From<LyndonWordError> for PyLyndonWordError {
+impl From<LyndonWordError> for LyndonWordPyError {
     fn from(value: LyndonWordError) -> Self {
         Self(value)
     }
 }
 
-impl From<PyLyndonWordError> for PyErr {
-    fn from(value: PyLyndonWordError) -> Self {
+impl From<LyndonWordPyError> for PyErr {
+    fn from(value: LyndonWordPyError) -> Self {
         match value.0 {
             LyndonWordError::InvalidWord => PyValueError::new_err("Invalid lyndon word"),
             LyndonWordError::InvalidLetter => PyValueError::new_err("Invalid letter"),
@@ -47,19 +47,26 @@ impl From<Sort> for PySort {
 }
 
 #[pyclass(name = "LyndonWord", eq, ord, str, frozen, hash)]
-#[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PyLyndonWord {
-    inner: LyndonWord<u8>,
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LyndonWordPy {
+    pub inner: LyndonWord<u8>,
 }
 
-impl Display for PyLyndonWord {
+impl Display for LyndonWordPy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.fmt(f)
     }
 }
 
+impl LyndonWordPy {
+    #[must_use]
+    pub fn inner(&self) -> &LyndonWord<u8> {
+        &self.inner
+    }
+}
+
 #[pymethods]
-impl PyLyndonWord {
+impl LyndonWordPy {
     #[new]
     #[must_use]
     pub fn new(letters: Vec<u8>) -> PyResult<Self> {
@@ -78,24 +85,21 @@ impl PyLyndonWord {
         Ok(Self {
             inner: (&self.inner)
                 .mul(&other.inner)
-                .map_err(PyLyndonWordError::from)?,
+                .map_err(LyndonWordPyError::from)?,
         })
     }
 
     #[getter]
     #[must_use]
     pub fn get_letters(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        static LETTERS: GILOnceCell<Py<PyList>> = GILOnceCell::new();
-        let result = LETTERS
-            .get_or_try_init(py, || {
-                PyList::new(py, &self.inner.letters).map(Bound::unbind)
-            })?
+        let result = PyList::new(py, &self.inner.letters)
+            .map(Bound::unbind)?
             .clone_ref(py);
         PyResult::Ok(result)
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn __len__(&self) -> usize {
         self.inner.len()
     }
 
@@ -168,11 +172,11 @@ impl PyLyndonBasis {
     }
 
     #[must_use]
-    pub fn generate_basis(&self, max_length: usize) -> Vec<PyLyndonWord> {
+    pub fn generate_basis(&self, max_length: usize) -> Vec<LyndonWordPy> {
         self.inner
             .generate_basis(max_length)
             .into_iter()
-            .map(|inner| PyLyndonWord { inner })
+            .map(|inner| LyndonWordPy { inner })
             .collect()
     }
 }
@@ -182,6 +186,6 @@ impl PyLyndonBasis {
 fn lyndon_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySort>()?;
     m.add_class::<PyLyndonBasis>()?;
-    m.add_class::<PyLyndonWord>()?;
+    m.add_class::<LyndonWordPy>()?;
     Ok(())
 }

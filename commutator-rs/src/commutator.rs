@@ -331,6 +331,16 @@ impl<T: Neg<Output = T>, U> Neg for CommutatorTerm<T, U> {
     }
 }
 
+impl<T: Clone + Neg<Output = T>, U: Clone> Neg for &CommutatorTerm<T, U> {
+    type Output = CommutatorTerm<T, U>;
+
+    fn neg(self) -> Self::Output {
+        let mut result = self.clone();
+        *result.coefficient_mut() = self.coefficient().clone().neg();
+        result
+    }
+}
+
 impl<T: Eq, U: Eq> PartialEq for CommutatorTerm<T, U> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -614,35 +624,49 @@ impl<T, U> CommutatorTerm<T, U> {
         }
     }
 
+    pub fn atom(&self) -> Option<&U> {
+        match self {
+            Self::Atom { atom, .. } => Some(atom),
+            Self::Expression { .. } => None,
+        }
+    }
+
+    pub fn atom_mut(&mut self) -> Option<&mut U> {
+        match self {
+            Self::Atom { atom, .. } => Some(atom),
+            Self::Expression { .. } => None,
+        }
+    }
+
     /// Returns the left operand of a commutator expression, or `None` for atoms.
     pub fn left(&self) -> Option<&Self> {
         match self {
-            CommutatorTerm::Atom { .. } => None,
-            CommutatorTerm::Expression { left, .. } => Some(left),
+            Self::Atom { .. } => None,
+            Self::Expression { left, .. } => Some(left),
         }
     }
 
     /// Returns the right operand of a commutator expression, or `None` for atoms.
     pub fn right(&self) -> Option<&Self> {
         match self {
-            CommutatorTerm::Atom { .. } => None,
-            CommutatorTerm::Expression { right, .. } => Some(right),
+            Self::Atom { .. } => None,
+            Self::Expression { right, .. } => Some(right),
         }
     }
 
     /// Returns a mutable reference to the left operand, or `None` for atoms.
     pub fn left_mut(&mut self) -> Option<&mut Self> {
         match self {
-            CommutatorTerm::Atom { .. } => None,
-            CommutatorTerm::Expression { left, .. } => Some(left),
+            Self::Atom { .. } => None,
+            Self::Expression { left, .. } => Some(left),
         }
     }
 
     /// Returns a mutable reference to the right operand, or `None` for atoms.
     pub fn right_mut(&mut self) -> Option<&mut Self> {
         match self {
-            CommutatorTerm::Atom { .. } => None,
-            CommutatorTerm::Expression { right, .. } => Some(right),
+            Self::Atom { .. } => None,
+            Self::Expression { right, .. } => Some(right),
         }
     }
 }
@@ -651,8 +675,9 @@ impl<T: Zero, U> CommutatorTerm<T, U> {
     /// Returns `true` if the coefficient of this term is zero.
     pub fn is_zero(&self) -> bool {
         match self {
-            CommutatorTerm::Atom { coefficient, .. }
-            | CommutatorTerm::Expression { coefficient, .. } => coefficient.is_zero(),
+            Self::Atom { coefficient, .. } | Self::Expression { coefficient, .. } => {
+                coefficient.is_zero()
+            }
         }
     }
 }
@@ -689,8 +714,8 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
     pub fn lyndon_sort(&mut self) {
         match self {
             // Do nothing, already sorted
-            CommutatorTerm::Atom { .. } => {}
-            CommutatorTerm::Expression {
+            Self::Atom { .. } => {}
+            Self::Expression {
                 coefficient,
                 left,
                 right,
@@ -706,7 +731,7 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
                     std::cmp::Ordering::Less => {}
                 }
                 // Propagate up coefficients
-                if let CommutatorTerm::Expression {
+                if let Self::Expression {
                     coefficient: c2, ..
                 } = &mut **left
                 {
@@ -715,7 +740,7 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
                         *c2 = -c2.clone();
                     }
                 }
-                if let CommutatorTerm::Expression {
+                if let Self::Expression {
                     coefficient: c2, ..
                 } = &mut **right
                 {
@@ -735,14 +760,14 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
     /// Jacobi identity cannot be applied (e.g., for atoms or already-decomposed expressions).
     pub fn jacobi_identity(&self) -> Option<(Self, Self)> {
         match self {
-            CommutatorTerm::Atom { .. } => None,
-            CommutatorTerm::Expression {
+            Self::Atom { .. } => None,
+            Self::Expression {
                 coefficient,
                 left,
                 right,
             } => {
                 // Check if expression is already in basis form
-                let CommutatorTerm::Expression {
+                let Self::Expression {
                     left: l_left,
                     right: l_right,
                     ..
@@ -1031,7 +1056,7 @@ mod test {
         ]
     )]
     #[case(
-comm![
+        comm![
             CommutatorTerm::from('A'),
             CommutatorTerm::from('B')
         ],
@@ -1275,7 +1300,6 @@ CommutatorTerm::from('A')
         use lyndon_rs::lyndon::{LyndonBasis, Sort};
 
         expected_basis_terms.sort();
-        println!("term: {term}");
         let basis = LyndonBasis::<char>::new(num_generators, Sort::Lexicographical);
         let basis_set = basis
             .generate_basis(max_degree)
@@ -1283,19 +1307,7 @@ CommutatorTerm::from('A')
             .map(CommutatorTerm::<i128, char>::from)
             .collect::<HashSet<_>>();
 
-        let mut basis_vec = basis_set.iter().collect::<Vec<_>>();
-        basis_vec.sort();
-        println!("Commutator Basis");
-        for (i, term) in basis_vec.into_iter().enumerate() {
-            let basis_str = format!("{term}");
-            if term.degree() == 5 && !basis_str.contains('D') {
-                println!("{i}: {term}");
-            }
-        }
-        println!();
-
         let basis_terms = term.lyndon_basis_decomposition(&basis_set);
-        dbg!(&basis_terms);
         assert_eq!(basis_terms.len(), expected_basis_terms.len());
         for (basis_term, expected_basis_term) in basis_terms.iter().zip(&expected_basis_terms) {
             assert_eq!(
