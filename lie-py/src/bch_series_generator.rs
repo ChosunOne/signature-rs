@@ -1,8 +1,10 @@
 use lie_rs::{BchSeriesGenerator, LieSeriesGenerator};
 use lyndon_rs::{LyndonBasis, Sort};
-use pyo3::{exceptions::PyValueError, prelude::*};
+use pyo3::{exceptions::PyValueError, prelude::*, sync::GILOnceCell, types::PyList};
 
 use crate::lie_series::LieSeriesPy;
+
+static LYNDON_WORD_CLASS: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
 
 #[pyclass(name = "BCHSeriesGenerator")]
 pub struct BchSeriesGeneratorPy {
@@ -36,5 +38,23 @@ impl BchSeriesGeneratorPy {
         LieSeriesPy {
             inner: self.inner.generate_lie_series(),
         }
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn get_basis<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyAny>>> {
+        let lyndon_word_class = LYNDON_WORD_CLASS.get_or_try_init(py, || {
+            let module = py.import("lyndon_py")?;
+            let class = module.getattr("LyndonWord")?;
+            PyResult::Ok(class.unbind())
+        })?;
+        self.inner
+            .basis
+            .iter()
+            .map(|w| PyList::new(py, &w.letters))
+            .collect::<PyResult<Vec<_>>>()?
+            .into_iter()
+            .map(|l| lyndon_word_class.call1(py, (l,)))
+            .collect::<PyResult<Vec<_>>>()
     }
 }

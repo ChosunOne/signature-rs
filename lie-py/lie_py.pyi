@@ -1,4 +1,6 @@
-from lyndon_py import LyndonBasis
+from lyndon_py import LyndonBasis, LyndonWord
 
 class BCHSeriesGenerator:
     def __init__(self, basis: LyndonBasis, max_degree: int) -> None: ...
+    @property
+    def basis(self) -> list[LyndonWord]: ...
