@@ -5,10 +5,12 @@ use std::{
     ops::{Mul, Neg},
 };
 
-use commutator_rs::{Commutator, CommutatorTerm};
+use commutator_rs::{Commutator, CommutatorTerm, FormalIndeterminate};
 use lyndon_rs::LyndonWord;
 use ordered_float::NotNan;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyType};
+
+use crate::formal_indeterminate::FormalIndeterminatePy;
 
 #[pyclass(name = "CommutatorTerm", eq, ord, str)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -210,6 +212,14 @@ impl CommutatorTermPy {
             .lyndon_basis_decomposition(&basis_set)
             .into_iter()
             .map(|x| Self { inner: x })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn formal_indeterminates(&self) -> Vec<FormalIndeterminatePy> {
+        Vec::<FormalIndeterminate<u8, NotNan<f32>>>::from(&self.inner)
+            .into_iter()
+            .map(|x| FormalIndeterminatePy { inner: x })
             .collect()
     }
 }

@@ -1,7 +1,5 @@
-from turtle import right
-
 import pytest
-from commutator_py import CommutatorTerm
+from commutator_py import CommutatorTerm, FormalIndeterminate
 from lyndon_py import LyndonBasis, LyndonWord, Sort
 
 
@@ -316,6 +314,75 @@ class TestCommutatorPyGroup:
             print(x)
         assert len(basis_terms) == len(expected_basis_terms)
         for basis_term, expected_basis_term in zip(basis_terms, expected_basis_terms):
-            # print(basis_term)
-            # print(expected_basis_term)
             assert basis_term == expected_basis_term
+
+    @pytest.mark.parametrize(
+        "a,b,expected_indeterminates",
+        [
+            (
+                CommutatorTerm(1, 0),
+                CommutatorTerm(1, 1),
+                [
+                    FormalIndeterminate(1, [0, 1]),
+                    FormalIndeterminate(-1, [1, 0]),
+                ],
+            ),
+            (
+                CommutatorTerm(
+                    1,
+                    left=CommutatorTerm(1, 0),
+                    right=CommutatorTerm(1, 1),
+                ),
+                CommutatorTerm(
+                    1, left=CommutatorTerm(1, 2), right=CommutatorTerm(1, 3)
+                ),
+                [
+                    FormalIndeterminate(
+                        1,
+                        [0, 1, 2, 3],
+                    ),
+                    FormalIndeterminate(
+                        -1,
+                        [0, 1, 3, 2],
+                    ),
+                    FormalIndeterminate(
+                        -1,
+                        [1, 0, 2, 3],
+                    ),
+                    FormalIndeterminate(
+                        1,
+                        [1, 0, 3, 2],
+                    ),
+                    FormalIndeterminate(
+                        -1,
+                        [2, 3, 0, 1],
+                    ),
+                    FormalIndeterminate(
+                        1,
+                        [2, 3, 1, 0],
+                    ),
+                    FormalIndeterminate(
+                        1,
+                        [3, 2, 0, 1],
+                    ),
+                    FormalIndeterminate(
+                        -1,
+                        [3, 2, 1, 0],
+                    ),
+                ],
+            ),
+        ],
+    )
+    def test_formal_indeterminate_expansion(
+        self,
+        a: CommutatorTerm,
+        b: CommutatorTerm,
+        expected_indeterminates: list[FormalIndeterminate],
+    ):
+        term = a.commutator(b)
+        indeterminates = term.formal_indeterminates()
+        assert len(indeterminates) == len(expected_indeterminates)
+        for indeterminate, expected_indeterminate in zip(
+            indeterminates, expected_indeterminates
+        ):
+            assert indeterminate == expected_indeterminate
