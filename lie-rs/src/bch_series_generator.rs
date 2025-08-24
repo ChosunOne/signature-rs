@@ -534,11 +534,11 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_lie_series_construction() {
+    fn test_construction() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
-        let lie_series = BchSeriesGenerator::<char>::new(basis, 5);
-        assert_eq!(lie_series.max_degree, 5);
-        assert_eq!(lie_series.basis.len(), 14);
+        let bch_series_generator = BchSeriesGenerator::<char>::new(basis, 5);
+        assert_eq!(bch_series_generator.max_degree, 5);
+        assert_eq!(bch_series_generator.basis.len(), 14);
         let expected_left_factor = [
             0, // A
             1, // B
@@ -555,7 +555,7 @@ mod test {
             2, // ABABB
             7, // ABBBB
         ];
-        for (term, expected_term) in lie_series
+        for (term, expected_term) in bch_series_generator
             .left_factor
             .iter()
             .zip(expected_left_factor.iter())
@@ -578,7 +578,7 @@ mod test {
             4, // ABABB
             1, // ABBBB
         ];
-        for (term, expected_term) in lie_series
+        for (term, expected_term) in bch_series_generator
             .right_factor
             .iter()
             .zip(expected_right_factor.iter())
@@ -602,7 +602,7 @@ mod test {
             18, // ABABB
             19, // ABBBB
         ];
-        for (term, expected_term) in lie_series
+        for (term, expected_term) in bch_series_generator
             .multi_degree
             .iter()
             .zip(expected_multi_degree_indices.iter())
@@ -612,11 +612,11 @@ mod test {
     }
 
     #[test]
-    fn test_lie_series_goldberg_series() {
+    fn test_goldberg_series() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
-        let lie_series = BchSeriesGenerator::<char>::new(basis.clone(), 5);
+        let bch_series_generator = BchSeriesGenerator::<char>::new(basis, 5);
         let basis = basis.generate_basis(5);
-        let goldberg_coefficients = lie_series
+        let goldberg_coefficients = bch_series_generator
             .generate_goldberg_coefficient_numerators::<i128>()
             .into_iter()
             .zip(basis.iter())
@@ -651,10 +651,10 @@ mod test {
     }
 
     #[test]
-    fn test_lie_series_bch_series() {
+    fn test_bch_series() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
-        let lie_series = BchSeriesGenerator::<char>::new(basis, 5);
-        let bch_coefficients = lie_series.generate_bch_coefficients::<Ratio<i128>>();
+        let bch_series_generator = BchSeriesGenerator::<char>::new(basis, 5);
+        let bch_coefficients = bch_series_generator.generate_bch_coefficients::<Ratio<i128>>();
         let expected_bch_coefficients = vec![
             Ratio::new(1, 1),
             Ratio::new(1, 1),

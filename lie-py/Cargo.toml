@@ -1,0 +1,16 @@
+[package]
+name = "lie-py"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lie_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+ordered-float = "^5.0.0"
+pyo3 = "^0.25.1"
+lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
+commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
+lie-rs = {path = "../lie-rs", version = "0.1.0"}

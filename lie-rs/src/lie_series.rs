@@ -256,6 +256,14 @@ impl<T: Clone, U: Clone + Mul<Output = U> + MulAssign> Mul<U> for &LieSeries<T, 
     }
 }
 
+impl<T: Clone, U: Clone + Mul<Output = U> + MulAssign> MulAssign<U> for LieSeries<T, U> {
+    fn mul_assign(&mut self, rhs: U) {
+        for c in &mut self.coefficients {
+            *c *= rhs.clone();
+        }
+    }
+}
+
 impl<
     T: Clone + Ord + Generator + Hash + Eq,
     U: Clone + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign + Ord,

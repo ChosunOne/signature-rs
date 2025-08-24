@@ -22,22 +22,32 @@ impl From<LyndonWordPyError> for PyErr {
 }
 
 #[pyclass(name = "Sort", eq)]
+#[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub enum PySort {
-    Lexicographical,
-    Topological,
+pub enum SortPy {
+    Lexicographical = 0,
+    Topological = 1,
 }
 
-impl From<PySort> for Sort {
-    fn from(value: PySort) -> Self {
+#[pymethods]
+impl SortPy {
+    #[getter]
+    #[must_use]
+    pub fn get_value(&self) -> u8 {
+        *self as u8
+    }
+}
+
+impl From<SortPy> for Sort {
+    fn from(value: SortPy) -> Self {
         match value {
-            PySort::Lexicographical => Self::Lexicographical,
-            PySort::Topological => Self::Topological,
+            SortPy::Lexicographical => Self::Lexicographical,
+            SortPy::Topological => Self::Topological,
         }
     }
 }
 
-impl From<Sort> for PySort {
+impl From<Sort> for SortPy {
     fn from(value: Sort) -> Self {
         match value {
             Sort::Lexicographical => Self::Lexicographical,
@@ -130,15 +140,16 @@ impl LyndonWordPy {
 }
 
 #[pyclass(name = "LyndonBasis")]
-pub struct PyLyndonBasis {
+#[derive(Clone, Debug, Copy, Default)]
+pub struct LyndonBasisPy {
     inner: LyndonBasis<u8>,
 }
 
 #[pymethods]
-impl PyLyndonBasis {
+impl LyndonBasisPy {
     #[new]
     #[must_use]
-    pub fn new(alphabet_size: usize, sort: PySort) -> Self {
+    pub fn new(alphabet_size: usize, sort: SortPy) -> Self {
         Self {
             inner: LyndonBasis::new(alphabet_size, sort.into()),
         }
@@ -157,12 +168,12 @@ impl PyLyndonBasis {
 
     #[getter]
     #[must_use]
-    pub fn get_sort(&self) -> PySort {
+    pub fn get_sort(&self) -> SortPy {
         self.inner.sort.into()
     }
 
     #[setter]
-    pub fn set_sort(&mut self, sort: PySort) {
+    pub fn set_sort(&mut self, sort: SortPy) {
         self.inner.sort = sort.into();
     }
 
@@ -184,8 +195,8 @@ impl PyLyndonBasis {
 /// A Python module implemented in Rust.
 #[pymodule]
 fn lyndon_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PySort>()?;
-    m.add_class::<PyLyndonBasis>()?;
+    m.add_class::<SortPy>()?;
+    m.add_class::<LyndonBasisPy>()?;
     m.add_class::<LyndonWordPy>()?;
     Ok(())
 }

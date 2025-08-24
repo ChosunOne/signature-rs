@@ -1379,6 +1379,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lie-py"
+version = "0.1.0"
+dependencies = [
+ "commutator-rs",
+ "lie-rs",
+ "lyndon-rs",
+ "ordered-float",
+ "pyo3",
+]
+
+[[package]]
 name = "lie-rs"
 version = "0.1.0"
 dependencies = [
