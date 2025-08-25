@@ -25,7 +25,7 @@ pub struct LieSeries<T, U> {
     /// The coefficients corresponding to each basis element.
     pub coefficients: Vec<U>,
     /// The maximum degree of terms included in this series.
-    max_degree: usize,
+    pub max_degree: usize,
 }
 
 impl<T: Debug, U: Debug> Debug for LieSeries<T, U> {

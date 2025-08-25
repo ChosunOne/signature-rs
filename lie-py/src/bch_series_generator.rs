@@ -1,12 +1,11 @@
 use lie_rs::{BchSeriesGenerator, LieSeriesGenerator};
 use lyndon_rs::{LyndonBasis, Sort};
-use pyo3::{exceptions::PyValueError, prelude::*, sync::GILOnceCell, types::PyList};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyList};
 
-use crate::lie_series::LieSeriesPy;
-
-static LYNDON_WORD_CLASS: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+use crate::{LYNDON_WORD_CLASS, lie_series::LieSeriesPy};
 
 #[pyclass(name = "BCHSeriesGenerator")]
+#[derive(Clone, Debug)]
 pub struct BchSeriesGeneratorPy {
     pub inner: BchSeriesGenerator<u8>,
 }
@@ -42,7 +41,48 @@ impl BchSeriesGeneratorPy {
 
     #[getter]
     #[must_use]
-    pub fn get_basis<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyAny>>> {
+    pub fn get_alphabet_size(&self) -> usize {
+        self.inner.alphabet_size
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn get_max_degree(&self) -> usize {
+        self.inner.max_degree
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn get_left_factor(&self) -> &[usize] {
+        &self.inner.left_factor
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn get_right_factor(&self) -> &[usize] {
+        &self.inner.right_factor
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn get_word_lengths(&self) -> &[usize] {
+        &self.inner.word_lengths
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn get_index_of_degree(&self) -> &[usize] {
+        &self.inner.index_of_degree
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn multi_degree(&self) -> &[usize] {
+        &self.inner.multi_degree
+    }
+
+    #[getter]
+    pub fn get_basis(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let lyndon_word_class = LYNDON_WORD_CLASS.get_or_try_init(py, || {
             let module = py.import("lyndon_py")?;
             let class = module.getattr("LyndonWord")?;

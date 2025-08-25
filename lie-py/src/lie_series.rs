@@ -1,11 +1,14 @@
 use std::fmt::Display;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 
-use commutator_rs::Commutator;
+use commutator_rs::{Commutator, CommutatorTerm};
 use lie_rs::LieSeries;
 use lyndon_rs::LyndonWord;
 use ordered_float::{FloatIsNan, NotNan};
+use pyo3::types::PyList;
 use pyo3::{exceptions::PyValueError, prelude::*};
+
+use crate::{COMMUTATOR_TERM_CLASS, LYNDON_WORD_CLASS};
 
 #[pyclass(name = "LieSeries", str, sequence)]
 #[derive(Clone, Debug)]
@@ -14,6 +17,7 @@ pub struct LieSeriesPy {
 }
 
 impl LieSeriesPy {
+    #[must_use]
     pub fn inner(&self) -> &LieSeries<u8, NotNan<f32>> {
         &self.inner
     }
@@ -126,10 +130,80 @@ impl LieSeriesPy {
         PyResult::Ok(())
     }
 
+    #[getter]
+    pub fn get_basis(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let lyndon_word_class = LYNDON_WORD_CLASS.get_or_try_init(py, || {
+            let module = py.import("lyndon_py")?;
+            let class = module.getattr("LyndonWord")?;
+            PyResult::Ok(class.unbind())
+        })?;
+        self.inner
+            .basis
+            .iter()
+            .map(|w| PyList::new(py, &w.letters))
+            .collect::<PyResult<Vec<_>>>()?
+            .into_iter()
+            .map(|l| lyndon_word_class.call1(py, (l,)))
+            .collect::<PyResult<Vec<_>>>()
+    }
+
+    #[getter]
+    pub fn get_commutator_basis(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.inner
+            .commutator_basis
+            .iter()
+            .map(|w| build_commutator_py(py, w))
+            .collect::<PyResult<Vec<_>>>()
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn get_coefficients(&self) -> Vec<f32> {
+        self.inner
+            .coefficients
+            .iter()
+            .map(|x| x.into_inner())
+            .collect()
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn max_degree(&self) -> usize {
+        self.inner.max_degree
+    }
+
     #[must_use]
     pub fn commutator(&self, other: &Self) -> Self {
         Self {
             inner: self.inner().commutator(other.inner()),
+        }
+    }
+}
+
+fn build_commutator_py(
+    py: Python<'_>,
+    term: &CommutatorTerm<NotNan<f32>, u8>,
+) -> PyResult<Py<PyAny>> {
+    let commutator_term_class = COMMUTATOR_TERM_CLASS.get_or_try_init(py, || {
+        let module = py.import("commutator_py")?;
+        let class = module.getattr("CommutatorTerm")?;
+        PyResult::Ok(class.unbind())
+    })?;
+    match term {
+        CommutatorTerm::Atom { coefficient, atom } => {
+            commutator_term_class.call1::<(f32, u8)>(py, (coefficient.into_inner(), *atom))
+        }
+        CommutatorTerm::Expression {
+            coefficient,
+            left,
+            right,
+        } => {
+            let left = build_commutator_py(py, left)?;
+            let right = build_commutator_py(py, right)?;
+            commutator_term_class.call1::<(f32, Option<u8>, Py<PyAny>, Py<PyAny>)>(
+                py,
+                (coefficient.into_inner(), None, left, right),
+            )
         }
     }
 }

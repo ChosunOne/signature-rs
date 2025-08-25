@@ -6,6 +6,7 @@ use num_traits::{FromPrimitive, One, Zero};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
+    fmt::{Debug, Display},
     hash::Hash,
     marker::PhantomData,
     ops::{AddAssign, Div, Mul, MulAssign, Neg, SubAssign},
@@ -48,6 +49,37 @@ pub struct BchSeriesGenerator<T> {
     pub index_of_degree: Vec<usize>,
     /// Multi-degree information for each basis word.
     pub multi_degree: Vec<usize>,
+}
+
+impl<T: Debug> Debug for BchSeriesGenerator<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BchSeriesGenerator")
+            .field("alphabet_size", &self.alphabet_size)
+            .field("basis", &self.basis)
+            .field("max_degree", &self.max_degree)
+            .field("basis", &self.basis)
+            .field("left_factor", &self.left_factor)
+            .field("right_factor", &self.right_factor)
+            .field("word_lengths", &self.word_lengths)
+            .field("index_of_degree", &self.index_of_degree)
+            .field("multi_degree", &self.multi_degree)
+            .finish()
+    }
+}
+
+impl<T: Clone> Clone for BchSeriesGenerator<T> {
+    fn clone(&self) -> Self {
+        Self {
+            alphabet_size: self.alphabet_size,
+            max_degree: self.max_degree,
+            basis: self.basis.clone(),
+            left_factor: self.left_factor.clone(),
+            right_factor: self.right_factor.clone(),
+            word_lengths: self.word_lengths.clone(),
+            index_of_degree: self.index_of_degree.clone(),
+            multi_degree: self.multi_degree.clone(),
+        }
+    }
 }
 
 impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T> {
