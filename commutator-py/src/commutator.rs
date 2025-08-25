@@ -36,13 +36,11 @@ impl CommutatorTermPy {
     #[new]
     #[pyo3(signature = (coefficient, atom=None, left=None, right=None))]
     pub fn new(
-        coefficient: f32,
+        coefficient: NotNan<f32>,
         atom: Option<u8>,
         left: Option<Self>,
         right: Option<Self>,
     ) -> PyResult<Self> {
-        let coefficient = NotNan::try_from(coefficient)
-            .map_err(|_| PyValueError::new_err("Recieved NaN float value."))?;
         if atom.is_some() && (left.is_some() || right.is_some()) {
             return Err(PyValueError::new_err(
                 "Either `atom` should be supplied or `left` and `right`",
@@ -78,7 +76,10 @@ impl CommutatorTermPy {
     }
 
     #[classmethod]
-    pub fn from_lyndon_word(_: Bound<'_, PyType>, lyndon_word: Bound<'_, PyAny>) -> PyResult<Self> {
+    pub fn from_lyndon_word(
+        _: Bound<'_, PyType>,
+        lyndon_word: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
         let letters = lyndon_word.getattr("letters")?.extract::<Vec<u8>>()?;
         let lyndon_word = LyndonWord::try_from(letters)
             .map_err(|_| PyValueError::new_err("Invalid lyndon word"))?;
@@ -88,23 +89,17 @@ impl CommutatorTermPy {
     }
 
     #[must_use]
-    pub fn __mul__(&self, other: f32) -> PyResult<Self> {
-        let other_float = other
-            .try_into()
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
-        Ok(Self {
-            inner: self.inner().mul(other_float),
-        })
+    pub fn __mul__(&self, other: NotNan<f32>) -> Self {
+        Self {
+            inner: self.inner().mul(other),
+        }
     }
 
     #[must_use]
-    pub fn __rmul__(&self, other: f32) -> PyResult<Self> {
-        let other_float = other
-            .try_into()
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
-        Ok(Self {
-            inner: self.inner().mul(other_float),
-        })
+    pub fn __rmul__(&self, other: NotNan<f32>) -> Self {
+        Self {
+            inner: self.inner().mul(other),
+        }
     }
 
     #[must_use]
@@ -133,10 +128,8 @@ impl CommutatorTermPy {
     }
 
     #[setter]
-    pub fn set_coefficient(&mut self, coefficient: f32) -> PyResult<()> {
-        *self.inner.coefficient_mut() = NotNan::<f32>::try_from(coefficient)
-            .map_err(|_| PyValueError::new_err("Recieved NaN float value"))?;
-        Ok(())
+    pub fn set_coefficient(&mut self, coefficient: NotNan<f32>) {
+        *self.inner.coefficient_mut() = coefficient;
     }
 
     #[must_use]

@@ -25,15 +25,14 @@ impl FormalIndeterminatePy {
 #[pymethods]
 impl FormalIndeterminatePy {
     #[new]
-    pub fn new(coefficient: f32, symbols: Vec<u8>) -> PyResult<Self> {
-        let coefficient = NotNan::try_from(coefficient)
-            .map_err(|_| PyValueError::new_err("Received NaN float value"))?;
-        Ok(Self {
+    #[must_use]
+    pub fn new(coefficient: NotNan<f32>, symbols: Vec<u8>) -> Self {
+        Self {
             inner: FormalIndeterminate {
                 coefficient,
                 symbols,
             },
-        })
+        }
     }
 
     #[classmethod]
@@ -53,10 +52,7 @@ impl FormalIndeterminatePy {
 
     pub fn __mul__<'py>(&self, other: &Bound<'py, PyAny>) -> PyResult<Self> {
         if other.is_instance_of::<PyFloat>() {
-            let coefficient = other
-                .extract::<f32>()?
-                .try_into()
-                .map_err(|_| PyValueError::new_err("Received NaN float value"))?;
+            let coefficient = other.extract::<NotNan<f32>>()?;
             return Ok(Self {
                 inner: FormalIndeterminate {
                     coefficient,
@@ -76,12 +72,9 @@ impl FormalIndeterminatePy {
         ))
     }
 
-    pub fn __rmul__<'py>(&self, other: &Bound<'py, PyAny>) -> PyResult<Self> {
+    pub fn __rmul__(&self, other: &Bound<'_, PyAny>) -> PyResult<Self> {
         if other.is_instance_of::<PyFloat>() {
-            let coefficient = other
-                .extract::<f32>()?
-                .try_into()
-                .map_err(|_| PyValueError::new_err("Received NaN float value"))?;
+            let coefficient = other.extract::<NotNan<f32>>()?;
             return Ok(Self {
                 inner: FormalIndeterminate {
                     coefficient,
@@ -115,11 +108,8 @@ impl FormalIndeterminatePy {
     }
 
     #[setter]
-    pub fn set_coefficient(&mut self, coefficient: f32) -> PyResult<()> {
-        let coefficient = NotNan::try_from(coefficient)
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
+    pub fn set_coefficient(&mut self, coefficient: NotNan<f32>) {
         self.inner.coefficient = coefficient;
-        Ok(())
     }
 
     #[getter]

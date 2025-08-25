@@ -1606,6 +1606,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "numpy"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29f1dee9aa8d3f6f8e8b9af3803006101bb3653866ef056d530d53ae68587191"
+dependencies = [
+ "libc",
+ "ndarray",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "pyo3",
+ "pyo3-build-config",
+ "rustc-hash",
+]
+
+[[package]]
 name = "object"
 version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2375,6 +2391,7 @@ dependencies = [
  "libc",
  "memoffset",
  "once_cell",
+ "ordered-float",
  "portable-atomic",
  "pyo3-build-config",
  "pyo3-ffi",
@@ -3020,6 +3037,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "signature-py"
+version = "0.1.0"
+dependencies = [
+ "commutator-rs",
+ "lie-rs",
+ "lyndon-rs",
+ "ndarray",
+ "numpy",
+ "ordered-float",
+ "pyo3",
+ "signature-rs",
 ]
 
 [[package]]

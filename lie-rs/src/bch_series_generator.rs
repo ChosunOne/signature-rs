@@ -6,7 +6,7 @@ use num_traits::{FromPrimitive, One, Zero};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
-    fmt::{Debug, Display},
+    fmt::Debug,
     hash::Hash,
     marker::PhantomData,
     ops::{AddAssign, Div, Mul, MulAssign, Neg, SubAssign},

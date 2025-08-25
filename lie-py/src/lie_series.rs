@@ -4,7 +4,7 @@ use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 use commutator_rs::{Commutator, CommutatorTerm};
 use lie_rs::LieSeries;
 use lyndon_rs::LyndonWord;
-use ordered_float::{FloatIsNan, NotNan};
+use ordered_float::NotNan;
 use pyo3::types::PyList;
 use pyo3::{exceptions::PyValueError, prelude::*};
 
@@ -32,12 +32,7 @@ impl Display for LieSeriesPy {
 #[pymethods]
 impl LieSeriesPy {
     #[new]
-    pub fn new(basis: Vec<Bound<'_, PyAny>>, coefficients: Vec<f32>) -> PyResult<Self> {
-        let coefficients = coefficients
-            .into_iter()
-            .map(NotNan::try_from)
-            .collect::<Result<Vec<_>, FloatIsNan>>()
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
+    pub fn new(basis: Vec<Bound<'_, PyAny>>, coefficients: Vec<NotNan<f32>>) -> PyResult<Self> {
         let basis_words = basis
             .into_iter()
             .map(|w| w.getattr("letters"))
@@ -60,15 +55,12 @@ impl LieSeriesPy {
     }
 
     #[must_use]
-    pub fn __getitem__(&self, idx: usize) -> f32 {
-        self.inner[idx].into()
+    pub fn __getitem__(&self, idx: usize) -> NotNan<f32> {
+        self.inner[idx]
     }
 
-    pub fn __setitem__(&mut self, idx: usize, coefficient: f32) -> PyResult<()> {
-        let coefficient = NotNan::try_from(coefficient)
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
+    pub fn __setitem__(&mut self, idx: usize, coefficient: NotNan<f32>) {
         self.inner[idx] = coefficient;
-        PyResult::Ok(())
     }
 
     #[must_use]
@@ -107,27 +99,22 @@ impl LieSeriesPy {
         self.inner.sub_assign(other.inner());
     }
 
-    pub fn __mul__(&self, other: f32) -> PyResult<Self> {
-        let other = NotNan::try_from(other)
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
-        PyResult::Ok(Self {
+    #[must_use]
+    pub fn __mul__(&self, other: NotNan<f32>) -> Self {
+        Self {
             inner: self.inner().mul(other),
-        })
+        }
     }
 
-    pub fn __rmul__(&self, other: f32) -> PyResult<Self> {
-        let other = NotNan::try_from(other)
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
-        PyResult::Ok(Self {
+    #[must_use]
+    pub fn __rmul__(&self, other: NotNan<f32>) -> Self {
+        Self {
             inner: self.inner().mul(other),
-        })
+        }
     }
 
-    pub fn __imul__(&mut self, other: f32) -> PyResult<()> {
-        let other = NotNan::try_from(other)
-            .map_err(|_| PyValueError::new_err("Received NaN float value."))?;
+    pub fn __imul__(&mut self, other: NotNan<f32>) {
         self.inner.mul_assign(other);
-        PyResult::Ok(())
     }
 
     #[getter]
@@ -158,12 +145,8 @@ impl LieSeriesPy {
 
     #[getter]
     #[must_use]
-    pub fn get_coefficients(&self) -> Vec<f32> {
-        self.inner
-            .coefficients
-            .iter()
-            .map(|x| x.into_inner())
-            .collect()
+    pub fn get_coefficients(&self) -> Vec<NotNan<f32>> {
+        self.inner.coefficients.clone()
     }
 
     #[getter]

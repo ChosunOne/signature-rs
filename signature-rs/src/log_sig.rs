@@ -24,9 +24,9 @@ use std::{
 /// allows configuring the parameters and constructing log signatures from various inputs.
 pub struct LogSignatureBuilder<T> {
     /// The maximum degree of terms to include in the log signature computation.
-    max_degree: usize,
+    pub max_degree: usize,
     /// The Lyndon basis configuration for the underlying algebra.
-    lyndon_basis: LyndonBasis<T>,
+    pub lyndon_basis: LyndonBasis<T>,
 }
 
 impl<T: Debug> Debug for LogSignatureBuilder<T> {
