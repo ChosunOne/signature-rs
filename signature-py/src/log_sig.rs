@@ -105,6 +105,17 @@ impl LogSignaturePy {
     }
 
     #[getter]
+    #[must_use]
+    pub fn get_coefficients(&self) -> Vec<NotNan<f32>> {
+        self.inner.series.coefficients.clone()
+    }
+
+    #[setter]
+    pub fn set_coefficients(&mut self, coefficients: Vec<NotNan<f32>>) {
+        self.inner.series.coefficients = coefficients;
+    }
+
+    #[getter]
     pub fn get_bch_series(&self, py: Python) -> PyResult<Py<PyAny>> {
         let lie_series_class = LIE_SERIES_CLASS.get_or_try_init(py, || {
             let module = py.import("lie_py")?;
