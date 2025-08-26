@@ -339,3 +339,36 @@ class TestLogSignatureGroup:
         assert len(coefficients) == len(expected_coefficients)
         for c, e_c in zip(coefficients, expected_coefficients):
             assert (c - e_c).__abs__() < 0.001, f"{c} != {e_c}"
+
+    def test_concatenate(self):
+        builder = LogSignatureBuilder(5, 5)
+        log_sig_1 = builder.build_from_path(
+            array([[1.0, 2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0, 10.0]]).__array__()
+        )
+        log_sig_2 = builder.build_from_path(
+            array(
+                [
+                    [6.0, 7.0, 8.0, 9.0, 10.0],
+                    [11.0, 12.0, 13.0, 14.0, 15.0],
+                    [16.0, 17.0, 18.0, 19.0, 20.0],
+                ]
+            ).__array__()
+        )
+        log_sig = builder.build_from_path(
+            array(
+                [
+                    [1.0, 2.0, 3.0, 4.0, 5.0],
+                    [6.0, 7.0, 8.0, 9.0, 10.0],
+                    [11.0, 12.0, 13.0, 14.0, 15.0],
+                    [16.0, 17.0, 18.0, 19.0, 20.0],
+                ]
+            ).__array__()
+        )
+
+        concatenated_log_sig = log_sig_1.concatenate(log_sig_2)
+        concat_coefficients = concatenated_log_sig.series.coefficients
+        path_coefficients = log_sig.series.coefficients
+
+        assert len(concat_coefficients) == len(path_coefficients)
+        for cc, pc in zip(concat_coefficients, path_coefficients):
+            assert (cc - pc).__abs__() < 0.001, f"{cc} != {pc}"
