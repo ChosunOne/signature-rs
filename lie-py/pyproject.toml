@@ -4,18 +4,61 @@ build-backend = "maturin"
 
 [project]
 name = "lie-py"
+version = "0.1.0"
+authors = [
+    {name = "signature-rs contributors"},
+]
+description = "High-performance Lie series and Baker-Campbell-Hausdorff computations"
+readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Operating System :: OS Independent",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dynamic = ["version"]
+keywords = [
+    "lie-series",
+    "baker-campbell-hausdorff",
+    "bch",
+    "lie-algebra",
+    "goldberg-coefficients",
+    "rough-paths",
+    "quantum-mechanics",
+    "control-theory",
+]
+license = {text = "AGPL-3.0-only"}
+homepage = "https://github.com/ChosunOne/signature-rs"
+repository = "https://github.com/ChosunOne/signature-rs"
+documentation = "https://github.com/ChosunOne/signature-rs/tree/main/lie-py"
 dependencies = [
-    "lyndon-py",
-    "commutator-py",
+    "lyndon-py>=0.1.0",
+    "commutator-py>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
     "maturin>=1.9.3",
     "pytest>=8.3.5",
+    "pytest-cov",
+    "black",
+    "isort",
+]
+test = [
+    "pytest>=8.3.5",
+    "pytest-cov",
 ]
 [tool.maturin]
 features = ["pyo3/extension-module"]
@@ -25,3 +68,9 @@ cache-keys = [{file = "pyproject.toml"}, {file = "rust/Cargo.toml"}, {file="**/*
 [tool.uv.sources]
 lyndon-py = { path = "../lyndon-py", editable = true }
 commutator-py = { path = "../commutator-py", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-cov>=5.0.0",
+]
