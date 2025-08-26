@@ -373,3 +373,10 @@ class TestLogSignatureGroup:
         assert len(concat_coefficients) == len(path_coefficients)
         for cc, pc in zip(concat_coefficients, path_coefficients):
             assert (cc - pc).__abs__() < 0.001, f"{cc} != {pc}"
+
+    def test_multiple_log_sigs(self):
+        path = array([[1.0, 2.0], [3.0, 4.0]]).__array__()
+
+        for degree in [1, 2, 3, 4]:
+            builder = LogSignatureBuilder(degree, 2)
+            _ = builder.build_from_path(path)

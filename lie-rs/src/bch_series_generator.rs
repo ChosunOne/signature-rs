@@ -276,6 +276,13 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
     >(
         &self,
     ) -> Vec<U> {
+        if self.max_degree == 0 {
+            return vec![];
+        }
+        if self.max_degree == 1 {
+            return vec![U::one(); self.alphabet_size];
+        }
+
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
             "[{elapsed_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
@@ -709,6 +716,20 @@ mod test {
             .zip(expected_bch_coefficients.iter())
         {
             assert_eq!(term, expected_term);
+        }
+    }
+
+    #[test]
+    fn test_bch_series_degree_1() {
+        let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
+        let bch_series_generator = BchSeriesGenerator::<char>::new(basis, 1);
+        let bch_coefficients = bch_series_generator.generate_bch_coefficients::<Ratio<i128>>();
+        let expected_bch_coefficients = vec![Ratio::new(1, 1), Ratio::new(1, 1)];
+        for (term, expected_term) in bch_coefficients
+            .iter()
+            .zip(expected_bch_coefficients.iter())
+        {
+            assert_eq!(term, expected_term, "{term} != {expected_term}");
         }
     }
 }
