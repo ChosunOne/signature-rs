@@ -17,6 +17,7 @@ dependencies = [
     "lie-py",
     "maturin>=1.9.3",
     "pytest>=8.3.5",
+    "numpy>=1.24.4",
 ]
 [tool.maturin]
 features = ["pyo3/extension-module"]
@@ -27,3 +28,8 @@ cache-keys = [{file = "pyproject.toml"}, {file = "rust/Cargo.toml"}, {file="**/*
 lyndon-py = { path = "../lyndon-py", editable = true }
 commutator-py = { path = "../commutator-py", editable = true }
 lie-py = { path = "../lie-py", editable = true }
+
+[dependency-groups]
+dev = [
+    "jax>=0.4.13",
+]

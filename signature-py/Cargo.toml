@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 numpy = "^0.25.0"
 ndarray = "^0.16.1"
 ordered-float = "^5.0.0"
-pyo3 = "^0.25.1"
+pyo3 = {version = "^0.25.1", features = ["ordered-float"] }
 lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
 commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
 lie-rs = {path = "../lie-rs", version = "0.1.0"}
