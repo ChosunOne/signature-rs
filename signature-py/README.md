@@ -29,7 +29,7 @@ builder = LogSignatureBuilder(max_degree=3, num_dimensions=2)
 log_signature = builder.build_from_path(path)
 
 # Access signature coefficients
-coefficients = log_signature.series.coefficients
+coefficients = log_signature.coefficients
 print(f"Log signature coefficients: {coefficients}")
 
 # Get individual coefficient values
@@ -55,11 +55,11 @@ sig2 = builder.build_from_path(path2)
 
 # Concatenate using Baker-Campbell-Hausdorff formula
 concatenated_sig = sig1.concatenate(sig2)
-print(f"Concatenated signature: {concatenated_sig.series.coefficients}")
+print(f"Concatenated signature: {concatenated_sig.coefficients}")
 
 # In-place concatenation
 sig1.concatenate_assign(sig2)
-print(f"In-place result: {sig1.series.coefficients}")
+print(f"In-place result: {sig1.coefficients}")
 ```
 
 ### Working with High-Dimensional Data
@@ -77,8 +77,8 @@ path_data = np.cumsum(np.random.randn(n_points, n_dims), axis=0).astype(np.float
 builder = LogSignatureBuilder(max_degree=3, num_dimensions=5)
 signature = builder.build_from_path(path_data)
 
-print(f"Signature dimension: {len(signature.series.coefficients)}")
-print(f"First 10 coefficients: {signature.series.coefficients[:10]}")
+print(f"Signature dimension: {len(signature.coefficients)}")
+print(f"First 10 coefficients: {signature.coefficients[:10]}")
 ```
 
 ### Empty Signature Construction
@@ -90,8 +90,8 @@ from signature_py import LogSignatureBuilder
 builder = LogSignatureBuilder(max_degree=4, num_dimensions=3)
 empty_sig = builder.build()
 
-print(f"Empty signature length: {len(empty_sig.series.coefficients)}")
-print(f"All zeros: {all(c == 0.0 for c in empty_sig.series.coefficients)}")
+print(f"Empty signature length: {len(empty_sig.coefficients)}")
+print(f"All zeros: {all(c == 0.0 for c in empty_sig.coefficients)}")
 ```
 
 ## API Reference
@@ -100,6 +100,7 @@ print(f"All zeros: {all(c == 0.0 for c in empty_sig.series.coefficients)}")
 
 #### Properties
 
+- `coefficients: list[float]`: The underlying Lie series coefficients
 - `series: LieSeries`: The underlying Lie series representation
 - `bch_series: LieSeries`: BCH series used for concatenation operations
 
