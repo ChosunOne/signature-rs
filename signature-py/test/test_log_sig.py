@@ -1,4 +1,5 @@
 import pytest
+from jax import Array, jit
 from jax.numpy import array
 from numpy import float32
 from numpy.typing import NDArray

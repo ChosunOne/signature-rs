@@ -62,7 +62,7 @@ impl LogSignatureBuilderPy {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "LogSignature")]
 #[derive(Debug, Clone)]
 pub struct LogSignaturePy {
     pub inner: LogSignature<u8, NotNan<f32>>,
