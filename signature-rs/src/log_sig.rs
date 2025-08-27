@@ -1,4 +1,4 @@
-use commutator_rs::{Commutator, CommutatorTerm, comm};
+use commutator_rs::CommutatorTerm;
 use lie_rs::LieSeriesGenerator;
 use lie_rs::{LieSeries, bch_series_generator::BchSeriesGenerator};
 use lyndon_rs::lyndon::LyndonWord;
@@ -97,7 +97,7 @@ impl<T> LogSignatureBuilder<T> {
     }
 }
 
-impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T> {
+impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T> {
     /// Builds an empty log signature with the configured parameters.
     ///
     /// The resulting log signature has the proper basis structure but with
@@ -159,15 +159,12 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureBuilder<T
         path: &ArrayView<U, D>,
     ) -> LogSignature<T, U> {
         let mut log_sig = self.build();
-        let mut log_sig_segment = log_sig.clone();
 
         for window in path.axis_windows(Axis(0), 2) {
             let start = window.index_axis(Axis(0), 0);
             let end = window.index_axis(Axis(0), 1);
             let displacement = (&end - &start).iter().cloned().collect::<Vec<_>>();
-            log_sig_segment.series.coefficients[..self.lyndon_basis.alphabet_size]
-                .clone_from_slice(&displacement[..self.lyndon_basis.alphabet_size]);
-            log_sig.concatenate_assign(&log_sig_segment);
+            log_sig.concatenate_assign_coefficients(&displacement);
         }
 
         log_sig
@@ -284,16 +281,9 @@ impl<
     /// of the combined path.
     #[must_use]
     pub fn concatenate(&self, rhs: &Self) -> Self {
-        let mut computed_commutations = HashMap::new();
         let mut concatenated_log_sig = self.clone();
 
-        for (i, term) in self.bch_series.commutator_basis.iter().enumerate().skip(1) {
-            concatenated_log_sig.series += evaluate_commutator_term(
-                term,
-                &[&self.series, &rhs.series],
-                &mut computed_commutations,
-            ) * self.bch_series[i].clone();
-        }
+        concatenated_log_sig.concatenate_assign(rhs);
 
         concatenated_log_sig
     }
@@ -303,15 +293,32 @@ impl<
     /// This is the mutable version of `concatenate` that modifies `self` instead
     /// of creating a new log signature. More memory-efficient for chaining operations.
     pub fn concatenate_assign(&mut self, rhs: &Self) {
-        let mut computed_commutations = HashMap::new();
-        let original_series = self.series.clone();
+        self.concatenate_assign_coefficients(&rhs.series.coefficients);
+    }
 
-        for (i, term) in self.bch_series.commutator_basis.iter().enumerate().skip(1) {
-            self.series += evaluate_commutator_term(
+    pub(crate) fn concatenate_assign_coefficients(&mut self, rhs_coefficients: &[U]) {
+        let mut computed_commutations = HashMap::new();
+        let original_coefficients = self.series.coefficients.clone();
+
+        for (i, term) in self
+            .bch_series
+            .commutator_basis
+            .iter()
+            .filter(|x| !x.is_zero())
+            .enumerate()
+            .skip(1)
+        {
+            let ct = evaluate_commutator_term(
                 term,
-                &[&original_series, &rhs.series],
+                &self.series,
+                &original_coefficients,
+                rhs_coefficients,
                 &mut computed_commutations,
-            ) * self.bch_series[i].clone();
+            );
+            for (self_coeff, comm_coeff) in &mut self.series.coefficients.iter_mut().zip(ct.iter())
+            {
+                *self_coeff += comm_coeff.clone() * self.bch_series[i].clone();
+            }
         }
     }
 }
@@ -321,24 +328,54 @@ impl<
 /// This function interprets commutator expressions from the BCH series and applies
 /// them to concrete Lie series, using memoization to avoid recomputing identical subterms.
 fn evaluate_commutator_term<
+    'a,
+    'b: 'a,
     T: Clone + Ord + Generator + Hash,
     U: Clone + Eq + Hash + Default + One + Zero + MulAssign + Neg<Output = U> + AddAssign,
 >(
-    term: &CommutatorTerm<U, u8>,
-    series: &[&LieSeries<T, U>],
-    computed_commutations: &mut HashMap<CommutatorTerm<U, u8>, LieSeries<T, U>>,
-) -> LieSeries<T, U> {
+    term: &'b CommutatorTerm<U, u8>,
+    series: &LieSeries<T, U>,
+    a_coefficients: &[U],
+    b_coefficients: &[U],
+    computed_commutations: &'a mut HashMap<&'b CommutatorTerm<U, u8>, Vec<U>>,
+) -> &'a [U] {
     match term {
-        &CommutatorTerm::Atom { atom: a, .. } => series[a as usize].clone(),
+        t @ &CommutatorTerm::Atom { atom: a, .. } => {
+            if a == 0 {
+                computed_commutations.insert(t, a_coefficients.to_vec());
+                &computed_commutations[t]
+            } else {
+                computed_commutations.insert(t, b_coefficients.to_vec());
+                &computed_commutations[t]
+            }
+        }
         t @ CommutatorTerm::Expression { left, right, .. } => {
             if computed_commutations.contains_key(t) {
-                return computed_commutations[t].clone();
+                return &computed_commutations[t];
             }
-            let a = evaluate_commutator_term(left, series, computed_commutations);
-            let b = evaluate_commutator_term(right, series, computed_commutations);
-            let result = comm![a, b];
-            computed_commutations.insert(t.clone(), result.clone());
-            result
+            // SAFETY: Commutator terms form trees
+            unsafe {
+                let map_ptr =
+                    computed_commutations as *mut HashMap<&'b CommutatorTerm<U, u8>, Vec<U>>;
+                let a = evaluate_commutator_term(
+                    left,
+                    series,
+                    a_coefficients,
+                    b_coefficients,
+                    &mut *map_ptr,
+                );
+                let b = evaluate_commutator_term(
+                    right,
+                    series,
+                    a_coefficients,
+                    b_coefficients,
+                    &mut *map_ptr,
+                );
+                let mut coefficients = vec![U::default(); a_coefficients.len()];
+                LieSeries::commutator_coefficients(series, a, b, &mut coefficients);
+                computed_commutations.insert(t, coefficients);
+                &computed_commutations[t]
+            }
         }
     }
 }
@@ -719,12 +756,12 @@ mod test {
 
         dbg!(&path.slice(s![0..2, ..]));
 
-        let log_sig_1 = builder.build_from_path(&path.slice(s![0..=1, ..]));
+        let mut concatenated_log_sig = builder.build_from_path(&path.slice(s![0..=1, ..]));
         let log_sig_2 = builder.build_from_path(&path.slice(s![1.., ..]));
 
-        let log_sig = builder.build_from_path(&path.slice(s![.., ..]));
+        concatenated_log_sig.concatenate_assign(&log_sig_2);
 
-        let concatenated_log_sig = log_sig_1.concatenate(&log_sig_2);
+        let log_sig = builder.build_from_path(&path.slice(s![.., ..]));
 
         for (concat_c, full_path_c) in concatenated_log_sig
             .series

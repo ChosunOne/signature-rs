@@ -4,7 +4,7 @@ use lyndon_rs::{generators::Generator, lyndon::LyndonWord};
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
-    hash::Hash,
+    hash::{DefaultHasher, Hash, Hasher},
     ops::{AddAssign, Mul, MulAssign, Neg, Sub},
 };
 
@@ -112,6 +112,8 @@ pub enum CommutatorTerm<T, U> {
         left: Box<Self>,
         /// The right operand of the commutator.
         right: Box<Self>,
+        /// The degree of the commutator
+        degree: usize,
     },
 }
 
@@ -147,6 +149,7 @@ impl<T: Display + One + PartialEq, U: Display> Display for CommutatorTerm<T, U> 
                 coefficient,
                 left,
                 right,
+                ..
             } => {
                 if coefficient.is_one() {
                     write!(f, "[{left}, {right}]")
@@ -170,11 +173,13 @@ impl<T: Debug, U: Debug> Debug for CommutatorTerm<T, U> {
                 coefficient,
                 left,
                 right,
+                degree,
             } => f
                 .debug_struct("Expression")
                 .field("coefficient", coefficient)
                 .field("left", left)
                 .field("right", right)
+                .field("degree", degree)
                 .finish(),
         }
     }
@@ -193,10 +198,12 @@ impl<T: Mul<Output = T>, U: Clone> Mul<T> for CommutatorTerm<T, U> {
                 coefficient,
                 left,
                 right,
+                degree,
             } => Self::Expression {
                 coefficient: coefficient * rhs,
                 left,
                 right,
+                degree,
             },
         }
     }
@@ -215,10 +222,12 @@ impl<T: Mul<Output = T> + Clone, U: Clone> Mul<T> for &CommutatorTerm<T, U> {
                 coefficient,
                 left,
                 right,
+                degree,
             } => CommutatorTerm::Expression {
                 coefficient: coefficient.clone() * rhs,
                 left: left.clone(),
                 right: right.clone(),
+                degree: *degree,
             },
         }
     }
@@ -300,6 +309,7 @@ impl<T: Hash, U: Hash> Hash for CommutatorTerm<T, U> {
                 coefficient,
                 left,
                 right,
+                ..
             } => {
                 coefficient.hash(state);
                 left.hash(state);
@@ -322,10 +332,12 @@ impl<T: Neg<Output = T>, U> Neg for CommutatorTerm<T, U> {
                 coefficient,
                 left,
                 right,
+                degree,
             } => Self::Expression {
                 coefficient: coefficient.neg(),
                 left,
                 right,
+                degree,
             },
         }
     }
@@ -359,11 +371,13 @@ impl<T: Eq, U: Eq> PartialEq for CommutatorTerm<T, U> {
                     coefficient: l_coefficient,
                     left: l_left,
                     right: l_right,
+                    ..
                 },
                 Self::Expression {
                     coefficient: r_coefficient,
                     left: r_left,
                     right: r_right,
+                    ..
                 },
             ) => l_coefficient == r_coefficient && l_left == r_left && l_right == r_right,
             _ => false,
@@ -383,10 +397,12 @@ impl<T: Clone, U: Clone> Clone for CommutatorTerm<T, U> {
                 coefficient,
                 left,
                 right,
+                degree,
             } => Self::Expression {
                 coefficient: coefficient.clone(),
                 left: left.clone(),
                 right: right.clone(),
+                degree: *degree,
             },
         }
     }
@@ -397,6 +413,7 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
 {
     type Output = Self;
 
+    #[allow(clippy::too_many_lines)]
     fn commutator(&self, other: &Self) -> Self::Output {
         match (self, other) {
             (
@@ -426,6 +443,7 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient,
                     left,
                     right,
+                    degree: 2,
                 }
             }
             (
@@ -437,6 +455,7 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient: c2,
                     left: l1,
                     right,
+                    degree,
                 },
             ) => {
                 let coefficient = c1.clone() * c2.clone();
@@ -448,12 +467,14 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient: T::one(),
                     left: l1.clone(),
                     right: right.clone(),
+                    degree: *degree,
                 });
 
                 Self::Expression {
                     coefficient,
                     left,
                     right,
+                    degree: *degree + 1,
                 }
             }
             (
@@ -461,6 +482,7 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient: c1,
                     left: l1,
                     right: r1,
+                    degree,
                 },
                 Self::Atom {
                     coefficient: c2,
@@ -472,6 +494,7 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient: T::one(),
                     left: l1.clone(),
                     right: r1.clone(),
+                    degree: *degree,
                 });
                 let right = Box::new(Self::Atom {
                     coefficient: T::one(),
@@ -481,6 +504,7 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient,
                     left,
                     right,
+                    degree: degree + 1,
                 }
             }
             (
@@ -488,11 +512,13 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient: c1,
                     left: l1,
                     right: r1,
+                    degree: degree1,
                 },
                 b @ Self::Expression {
                     coefficient: c2,
                     left: l2,
                     right: r2,
+                    degree: degree2,
                 },
             ) => {
                 let coefficient = if a == b {
@@ -504,17 +530,20 @@ impl<T: Clone + One + Zero + Eq + Mul<Output = T>, U: Clone + Eq> Commutator<&Se
                     coefficient: T::one(),
                     left: l1.clone(),
                     right: r1.clone(),
+                    degree: *degree1,
                 });
                 let right = Box::new(Self::Expression {
                     coefficient: T::one(),
                     left: l2.clone(),
                     right: r2.clone(),
+                    degree: *degree2,
                 });
 
                 Self::Expression {
                     coefficient,
                     left,
                     right,
+                    degree: *degree1 + *degree2,
                 }
             }
         }
@@ -591,6 +620,7 @@ impl<T: Clone + One + Zero + Eq + MulAssign + Neg<Output = T>, U: Clone + Ord + 
             coefficient: T::one(),
             left,
             right,
+            degree: value.len(),
         };
         result.lyndon_sort();
         *result.coefficient_mut() = T::one();
@@ -606,7 +636,7 @@ impl<T, U> CommutatorTerm<T, U> {
     pub fn degree(&self) -> usize {
         match self {
             CommutatorTerm::Atom { .. } => 1,
-            CommutatorTerm::Expression { left, right, .. } => left.degree() + right.degree(),
+            CommutatorTerm::Expression { degree, .. } => *degree,
         }
     }
 
@@ -698,8 +728,29 @@ impl<T: Clone + One, U: Clone> CommutatorTerm<T, U> {
                 coefficient: T::one(),
                 left: left.clone(),
                 right: right.clone(),
+                degree: left.degree() + right.degree(),
             },
         }
+    }
+}
+
+impl<T: Clone + One + Hash, U: Clone + Hash> CommutatorTerm<T, U> {
+    /// Returns the hash of the unit struct without cloning
+    pub fn unit_hash(&self) -> u64 {
+        let mut state = DefaultHasher::default();
+        core::mem::discriminant(self).hash(&mut state);
+        match self {
+            CommutatorTerm::Atom { atom, .. } => {
+                T::one().hash(&mut state);
+                atom.hash(&mut state);
+            }
+            CommutatorTerm::Expression { left, right, .. } => {
+                T::one().hash(&mut state);
+                left.unit_hash().hash(&mut state);
+                right.unit_hash().hash(&mut state);
+            }
+        }
+        state.finish()
     }
 }
 
@@ -719,6 +770,7 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
                 coefficient,
                 left,
                 right,
+                ..
             } => {
                 left.lyndon_sort();
                 right.lyndon_sort();
@@ -765,6 +817,7 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
                 coefficient,
                 left,
                 right,
+                ..
             } => {
                 // Check if expression is already in basis form
                 let Self::Expression {
@@ -797,12 +850,12 @@ impl<
 {
     fn find_decomposition_subterm_mut(
         &mut self,
-        lyndon_basis_set: &HashSet<Self>,
+        lyndon_basis_set: &HashSet<u64>,
     ) -> Option<&mut Self> {
         if let Self::Atom { .. } = self {
             return None;
         }
-        if lyndon_basis_set.contains(&self.unit()) {
+        if lyndon_basis_set.contains(&self.unit_hash()) {
             return None;
         }
 
@@ -824,11 +877,9 @@ impl<
     ///
     /// Given a set of Lyndon basis elements, this method expresses the current term
     /// as a sum of basis terms using the Jacobi identity and other commutator relations.
-    /// This is essential for computing in the free Lie algebra where Lyndon words
-    /// form a basis.
     #[must_use]
-    pub fn lyndon_basis_decomposition(&self, lyndon_basis_set: &HashSet<Self>) -> Vec<Self> {
-        if lyndon_basis_set.contains(&self.unit()) {
+    pub fn lyndon_basis_decomposition(&self, lyndon_basis_set: &HashSet<u64>) -> Vec<Self> {
+        if lyndon_basis_set.contains(&self.unit_hash()) {
             return vec![self.clone()];
         }
 
@@ -837,7 +888,7 @@ impl<
 
         while let Some(mut t) = term_queue.pop() {
             t.lyndon_sort();
-            if lyndon_basis_set.contains(&t.unit()) {
+            if lyndon_basis_set.contains(&t.unit_hash()) {
                 lyndon_basis_terms
                     .entry(t.unit())
                     .and_modify(|x| *x.coefficient_mut() += t.coefficient().clone())
@@ -866,18 +917,20 @@ impl<
                 coefficient: s1.coefficient().clone(),
                 left: Box::new(comm![a, s_dprime]),
                 right: Box::new(b.clone()),
+                degree: self.degree(),
             };
 
             let new_s_2 = Self::Expression {
                 coefficient: s2.coefficient().clone(),
                 left: Box::new(a.clone()),
                 right: Box::new(comm![b, s_dprime]),
+                degree: self.degree(),
             };
 
             *s1 = new_s_1;
             *s2 = new_s_2;
 
-            if lyndon_basis_set.contains(&t1.unit()) {
+            if lyndon_basis_set.contains(&t1.unit_hash()) {
                 lyndon_basis_terms
                     .entry(t1.unit())
                     .and_modify(|x| *x.coefficient_mut() += t1.coefficient().clone())
@@ -886,7 +939,7 @@ impl<
                 term_queue.push(t1);
             }
 
-            if lyndon_basis_set.contains(&t2.unit()) {
+            if lyndon_basis_set.contains(&t2.unit_hash()) {
                 lyndon_basis_terms
                     .entry(t2.unit())
                     .and_modify(|x| *x.coefficient_mut() += t2.coefficient().clone())
@@ -926,6 +979,7 @@ mod test {
         coefficient: 1,
         left: Box::new(CommutatorTerm::from('A')),
         right: Box::new(CommutatorTerm::from('B')),
+        degree: 2,
     })]
     #[case(
         CommutatorTerm::from('B'),
@@ -934,30 +988,37 @@ mod test {
             coefficient: 1,
             left: Box::new(CommutatorTerm::from('B')),
             right: Box::new(CommutatorTerm::from('A')),
+            degree: 2,
         })]
     #[case(
         CommutatorTerm::Expression {
             coefficient: 2,
             left: Box::new(CommutatorTerm::from('A')),
-            right: Box::new(CommutatorTerm::from('B'))
+            right: Box::new(CommutatorTerm::from('B')),
+            degree: 2,
         },
         CommutatorTerm::Expression {
             coefficient: 3,
             left: Box::new(CommutatorTerm::from('B')),
-            right: Box::new(CommutatorTerm::from('A'))
+            right: Box::new(CommutatorTerm::from('A')),
+            degree: 2,
         },
         CommutatorTerm::Expression {
             coefficient: 6,
             left: Box::new(CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(CommutatorTerm::from('A')),
-                right: Box::new(CommutatorTerm::from('B'))
+                right: Box::new(CommutatorTerm::from('B')),
+                degree: 2,
             }),
             right: Box::new(CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(CommutatorTerm::from('B')),
-                right: Box::new(CommutatorTerm::from('A'))
+                right: Box::new(CommutatorTerm::from('A')),
+                degree: 2,
+
             }),
+            degree: 4,
     })]
     fn test_commutator_terms(
         #[case] a: CommutatorTerm<i128, char>,
@@ -1001,7 +1062,8 @@ mod test {
         CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(CommutatorTerm::from('A')),
-                right: Box::new(CommutatorTerm::from('B'))
+                right: Box::new(CommutatorTerm::from('B')),
+                degree: 2,
             },
         Ordering::Less)]
     #[case(
@@ -1009,14 +1071,16 @@ mod test {
         CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(CommutatorTerm::from('A')),
-                right: Box::new(CommutatorTerm::from('B'))
+                right: Box::new(CommutatorTerm::from('B')),
+                degree: 2,
             },
         Ordering::Greater)]
     #[case(
         CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(CommutatorTerm::from('A')),
-                right: Box::new(CommutatorTerm::from('B'))
+                right: Box::new(CommutatorTerm::from('B')),
+                degree: 2,
             },
         CommutatorTerm::from('A'),
         Ordering::Greater)]
@@ -1024,7 +1088,8 @@ mod test {
         CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(CommutatorTerm::from('A')),
-                right: Box::new(CommutatorTerm::from('B'))
+                right: Box::new(CommutatorTerm::from('B')),
+                degree: 2,
             },
         CommutatorTerm::from('B'),
         Ordering::Less)]
@@ -1032,7 +1097,8 @@ mod test {
         CommutatorTerm::Expression {
                 coefficient: 1,
                 left: Box::new(CommutatorTerm::from('A')),
-                right: Box::new(CommutatorTerm::from('B'))
+                right: Box::new(CommutatorTerm::from('B')),
+                degree: 2,
             },
         CommutatorTerm::from('A'),
         Ordering::Greater)]
@@ -1305,6 +1371,7 @@ CommutatorTerm::from('A')
             .generate_basis(max_degree)
             .iter()
             .map(CommutatorTerm::<i128, char>::from)
+            .map(|x| x.unit_hash())
             .collect::<HashSet<_>>();
 
         let basis_terms = term.lyndon_basis_decomposition(&basis_set);

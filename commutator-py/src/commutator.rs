@@ -66,6 +66,7 @@ impl CommutatorTermPy {
             return Ok(Self {
                 inner: CommutatorTerm::Expression {
                     coefficient,
+                    degree: l.inner.degree() + r.inner.degree(),
                     left: Box::new(l.inner),
                     right: Box::new(r.inner),
                 },
@@ -200,7 +201,10 @@ impl CommutatorTermPy {
         &self,
         lyndon_basis_set: HashSet<CommutatorTermPy>,
     ) -> Vec<Self> {
-        let basis_set = lyndon_basis_set.into_iter().map(|x| x.inner).collect();
+        let basis_set = lyndon_basis_set
+            .into_iter()
+            .map(|x| x.inner.unit_hash())
+            .collect();
         self.inner
             .lyndon_basis_decomposition(&basis_set)
             .into_iter()

@@ -180,6 +180,7 @@ fn build_commutator_py(
             coefficient,
             left,
             right,
+            ..
         } => {
             let left = build_commutator_py(py, left)?;
             let right = build_commutator_py(py, right)?;

@@ -19,9 +19,11 @@ pub struct LieSeries<T, U> {
     /// The commutator representation of the Lyndon basis elements.
     pub commutator_basis: Vec<CommutatorTerm<U, T>>,
     /// Maps arbitrary commutator terms to their decomposition in the basis.
-    pub commutator_basis_map: HashMap<CommutatorTerm<U, T>, Vec<CommutatorTerm<U, T>>>,
+    pub commutator_basis_map: Vec<Vec<usize>>,
+    /// Maps arbitrary commutator terms to their decomposition coefficients in the basis.
+    pub commutator_basis_map_coefficients: Vec<Vec<U>>,
     /// Maps basis elements to their index positions for efficient lookup.
-    pub commutator_basis_index_map: HashMap<CommutatorTerm<U, T>, usize>,
+    pub commutator_basis_index_map: HashMap<u64, usize>,
     /// The coefficients corresponding to each basis element.
     pub coefficients: Vec<U>,
     /// The maximum degree of terms included in this series.
@@ -34,6 +36,10 @@ impl<T: Debug, U: Debug> Debug for LieSeries<T, U> {
             .field("basis", &self.basis)
             .field("commutator_basis", &self.commutator_basis)
             .field("commutator_basis_map", &self.commutator_basis_map)
+            .field(
+                "commutator_basis_map_coefficients",
+                &self.commutator_basis_map_coefficients,
+            )
             .field(
                 "commutator_basis_index_map",
                 &self.commutator_basis_index_map,
@@ -68,6 +74,7 @@ impl<T: Clone, U: Clone> Clone for LieSeries<T, U> {
             basis: self.basis.clone(),
             commutator_basis: self.commutator_basis.clone(),
             commutator_basis_map: self.commutator_basis_map.clone(),
+            commutator_basis_map_coefficients: self.commutator_basis_map_coefficients.clone(),
             commutator_basis_index_map: self.commutator_basis_index_map.clone(),
             coefficients: self.coefficients.clone(),
             max_degree: self.max_degree,
@@ -92,7 +99,7 @@ impl<
 
     fn index(&self, index: LyndonWord<T>) -> &Self::Output {
         let term = CommutatorTerm::<U, T>::from(&index);
-        let i = self.commutator_basis_index_map[&term];
+        let i = self.commutator_basis_index_map[&term.unit_hash()];
         &self.coefficients[i]
     }
 }
@@ -106,7 +113,7 @@ impl<
 
     fn index(&self, index: &LyndonWord<T>) -> &Self::Output {
         let term = CommutatorTerm::<U, T>::from(index);
-        let i = self.commutator_basis_index_map[&term];
+        let i = self.commutator_basis_index_map[&term.unit_hash()];
         &self.coefficients[i]
     }
 }
@@ -124,7 +131,7 @@ impl<
 {
     fn index_mut(&mut self, index: LyndonWord<T>) -> &mut Self::Output {
         let term = CommutatorTerm::<U, T>::from(&index);
-        let i = self.commutator_basis_index_map[&term];
+        let i = self.commutator_basis_index_map[&term.unit_hash()];
         &mut self.coefficients[i]
     }
 }
@@ -136,7 +143,7 @@ impl<
 {
     fn index_mut(&mut self, index: &LyndonWord<T>) -> &mut Self::Output {
         let term = CommutatorTerm::<U, T>::from(index);
-        let i = self.commutator_basis_index_map[&term];
+        let i = self.commutator_basis_index_map[&term.unit_hash()];
         &mut self.coefficients[i]
     }
 }
@@ -145,18 +152,11 @@ impl<T: Clone, U: Clone + Add<Output = U>> Add for &LieSeries<T, U> {
     type Output = LieSeries<T, U>;
 
     fn add(self, rhs: Self) -> Self::Output {
-        let mut coefficients = self.coefficients.clone();
+        let mut result = self.clone();
         for i in 0..self.coefficients.len() {
-            coefficients[i] = self.coefficients[i].clone() + rhs.coefficients[i].clone();
+            result.coefficients[i] = self.coefficients[i].clone() + rhs.coefficients[i].clone();
         }
-        LieSeries::<T, U> {
-            basis: self.basis.clone(),
-            commutator_basis: self.commutator_basis.clone(),
-            commutator_basis_map: self.commutator_basis_map.clone(),
-            commutator_basis_index_map: self.commutator_basis_index_map.clone(),
-            coefficients,
-            max_degree: self.max_degree,
-        }
+        result
     }
 }
 
@@ -191,18 +191,11 @@ impl<T: Clone, U: Clone + Sub<Output = U>> Sub for &LieSeries<T, U> {
     type Output = LieSeries<T, U>;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        let mut coefficients = self.coefficients.clone();
+        let mut result = self.clone();
         for i in 0..self.coefficients.len() {
-            coefficients[i] = self.coefficients[i].clone() - rhs.coefficients[i].clone();
+            result.coefficients[i] = self.coefficients[i].clone() - rhs.coefficients[i].clone();
         }
-        LieSeries::<T, U> {
-            basis: self.basis.clone(),
-            commutator_basis: self.commutator_basis.clone(),
-            commutator_basis_map: self.commutator_basis_map.clone(),
-            commutator_basis_index_map: self.commutator_basis_index_map.clone(),
-            coefficients,
-            max_degree: self.max_degree,
-        }
+        result
     }
 }
 
@@ -280,26 +273,37 @@ impl<
         for word in &basis {
             commutator_basis.push(CommutatorTerm::from(word));
         }
-        let commutator_basis_set = commutator_basis.iter().cloned().collect::<HashSet<_>>();
-        let mut commutator_basis_map = HashMap::new();
+        let commutator_basis_set = commutator_basis
+            .iter()
+            .map(commutator_rs::CommutatorTerm::unit_hash)
+            .collect::<HashSet<_>>();
 
         let mut commutator_basis_index_map = HashMap::new();
         for (i, a) in commutator_basis.iter().enumerate() {
-            commutator_basis_index_map.insert(a.clone(), i);
+            commutator_basis_index_map.insert(a.unit_hash(), i);
         }
 
-        for a in &commutator_basis {
-            for b in &commutator_basis {
+        let mut commutator_basis_map = vec![vec![]; basis.len() * basis.len()];
+        let mut commutator_basis_map_coefficients = vec![vec![]; basis.len() * basis.len()];
+        for (i, a) in commutator_basis.iter().enumerate() {
+            for (j, b) in commutator_basis.iter().enumerate() {
                 if a == b || max_degree < a.degree() + b.degree() {
                     continue;
                 }
-                let term = comm![a, b];
-                let mut lyndon_term = term.clone();
-                lyndon_term.lyndon_sort();
+                let mut term = comm![a, b];
+                term.lyndon_sort();
 
-                let basis_terms = lyndon_term.lyndon_basis_decomposition(&commutator_basis_set);
-
-                commutator_basis_map.insert(term, basis_terms);
+                let basis_terms = term.lyndon_basis_decomposition(&commutator_basis_set);
+                let basis_term_coefficients = basis_terms
+                    .iter()
+                    .map(|x| x.coefficient().clone())
+                    .collect::<Vec<_>>();
+                let basis_term_indices = basis_terms
+                    .into_iter()
+                    .map(|x| commutator_basis_index_map[&x.unit_hash()])
+                    .collect::<Vec<_>>();
+                commutator_basis_map_coefficients[i * basis.len() + j] = basis_term_coefficients;
+                commutator_basis_map[i * basis.len() + j] = basis_term_indices;
             }
         }
 
@@ -307,9 +311,66 @@ impl<
             basis,
             commutator_basis,
             commutator_basis_map,
+            commutator_basis_map_coefficients,
             commutator_basis_index_map,
             coefficients,
             max_degree,
+        }
+    }
+}
+
+impl<
+    T: Clone + Ord + Generator + Hash + Eq,
+    U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign,
+> LieSeries<T, U>
+{
+    pub fn commutator_coefficients(
+        a_series: &LieSeries<T, U>,
+        a_coefficients: &[U],
+        b_coefficients: &[U],
+        result_coefficients: &mut [U],
+    ) {
+        let nonzero_coefficients = a_coefficients
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_zero())
+            .map(|x| x.0)
+            .collect::<Vec<_>>();
+        let other_nonzero_coefficients = b_coefficients
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_zero())
+            .map(|x| x.0);
+
+        for i in nonzero_coefficients {
+            let a: &CommutatorTerm<U, T> = &a_series.commutator_basis[i];
+            for j in other_nonzero_coefficients.clone() {
+                let b = &a_series.commutator_basis[j];
+                if i == j || a.degree() + b.degree() > a_series.max_degree {
+                    continue;
+                }
+
+                let basis_indices: &[usize] =
+                    &a_series.commutator_basis_map[i * a_series.basis.len() + j];
+                let basis_coefficients: &[U] =
+                    &a_series.commutator_basis_map_coefficients[i * a_series.basis.len() + j];
+                for (&basis_index, basis_coefficient) in basis_indices
+                    .iter()
+                    .zip(basis_coefficients)
+                    .filter(|(_, b_c)| !b_c.is_zero())
+                {
+                    let CommutatorTerm::Expression { coefficient, .. } =
+                        &a_series.commutator_basis[basis_index]
+                    else {
+                        panic!("Failed to create commutator expression from term");
+                    };
+
+                    result_coefficients[basis_index] += basis_coefficient.clone()
+                        * a_coefficients[i].clone()
+                        * b_coefficients[j].clone()
+                        * coefficient.clone();
+                }
+            }
         }
     }
 }
@@ -323,66 +384,17 @@ impl<
 
     /// Calculates the lie bracket `[A, B]` for a lie series for terms within the commutator basis.
     fn commutator(&self, other: &Self) -> Self::Output {
+        let mut result = self.clone();
         let mut coefficients = vec![U::default(); self.coefficients.len()];
-
-        let self_nonzero_coefficients = self
-            .coefficients
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.is_zero())
-            .map(|x| x.0);
-        let other_nonzero_coefficients = other
-            .coefficients
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.is_zero())
-            .map(|x| x.0);
-
-        for i in self_nonzero_coefficients {
-            let a = &self.commutator_basis[i];
-            for j in other_nonzero_coefficients.clone() {
-                let b = &other.commutator_basis[j];
-                if i == j || a.degree() + b.degree() > self.max_degree {
-                    continue;
-                }
-                let comm_term = comm![a, b];
-
-                let Some(basis_terms) = self.commutator_basis_map.get(&comm_term) else {
-                    continue;
-                };
-
-                for basis_term in basis_terms {
-                    let basis_term_key = match basis_term {
-                        CommutatorTerm::Atom { atom, .. } => CommutatorTerm::Atom {
-                            coefficient: U::one(),
-                            atom: atom.clone(),
-                        },
-                        CommutatorTerm::Expression { left, right, .. } => {
-                            CommutatorTerm::Expression {
-                                coefficient: U::one(),
-                                left: left.clone(),
-                                right: right.clone(),
-                            }
-                        }
-                    };
-                    let basis_index = self.commutator_basis_index_map[&basis_term_key];
-                    let CommutatorTerm::Expression { coefficient, .. } = basis_term else {
-                        panic!("Failed to create commutator expression from term");
-                    };
-
-                    coefficients[basis_index] +=
-                        self[i].clone() * other[j].clone() * coefficient.clone();
-                }
-            }
-        }
-        Self {
-            basis: self.basis.clone(),
-            commutator_basis: self.commutator_basis.clone(),
-            commutator_basis_map: self.commutator_basis_map.clone(),
-            commutator_basis_index_map: self.commutator_basis_index_map.clone(),
-            coefficients,
-            max_degree: self.max_degree,
-        }
+        LieSeries::<T, U>::commutator_coefficients(
+            self,
+            // other,
+            &self.coefficients,
+            &other.coefficients,
+            &mut coefficients,
+        );
+        result.coefficients = coefficients;
+        result
     }
 }
 

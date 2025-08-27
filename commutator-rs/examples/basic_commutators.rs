@@ -50,9 +50,9 @@ fn demonstrate_commutator_terms() {
     };
 
     println!("Created atoms:");
-    println!("  x = {:?}", x);
-    println!("  y = {:?}", y);
-    println!("  z = {:?}", z);
+    println!("  x = {x:?}");
+    println!("  y = {y:?}");
+    println!("  z = {z:?}");
     println!();
 
     // Compute basic commutators
@@ -61,9 +61,9 @@ fn demonstrate_commutator_terms() {
     let yz_comm = y.commutator(&z);
 
     println!("Basic commutators:");
-    println!("  [x, y] = {:?}", xy_comm);
-    println!("  [x, z] = {:?}", xz_comm);
-    println!("  [y, z] = {:?}", yz_comm);
+    println!("  [x, y] = {xy_comm:?}");
+    println!("  [x, z] = {xz_comm:?}");
+    println!("  [y, z] = {yz_comm:?}");
     println!();
 
     // Show commutator structure
@@ -71,12 +71,14 @@ fn demonstrate_commutator_terms() {
         coefficient,
         left,
         right,
+        degree,
     } = &xy_comm
     {
         println!("Structure of [x, y]:");
-        println!("  Coefficient: {}", coefficient);
-        println!("  Left: {:?}", left);
-        println!("  Right: {:?}", right);
+        println!("  Coefficient: {coefficient}");
+        println!("  Left: {left:?}");
+        println!("  Right: {right:?}");
+        println!("  Degree: {degree:?}");
     }
 }
 
@@ -89,15 +91,13 @@ fn demonstrate_numeric_commutators() {
     let a = 3;
     let b = 5;
     let comm_result = a.commutator(&b);
-    println!("  [3, 5] = 3×5 - 5×3 = {} (numbers commute)", comm_result);
+    println!("  [3, 5] = 3×5 - 5×3 = {comm_result} (numbers commute)");
 
     // Demonstrate concept with a custom matrix-like structure
     demonstrate_matrix_commutators();
 }
 
 fn demonstrate_matrix_commutators() {
-    println!("\nMatrix-like commutators:");
-
     // Simple 2x2 matrix representation
     #[derive(Clone, Debug, PartialEq)]
     struct Matrix2x2 {
@@ -107,6 +107,7 @@ fn demonstrate_matrix_commutators() {
         d: f64,
     }
 
+    println!("\nMatrix-like commutators:");
     impl Matrix2x2 {
         fn new(a: f64, b: f64, c: f64, d: f64) -> Self {
             Self { a, b, c, d }
@@ -269,6 +270,7 @@ fn print_commutator_structure(term: &CommutatorTerm<i32, char>, indent: usize) {
             coefficient,
             left,
             right,
+            ..
         } => {
             println!("{}Expression (coeff: {}):", spaces, coefficient);
             println!("{}  Left:", spaces);
