@@ -339,24 +339,30 @@ impl<
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.is_zero())
+            .filter(|(i, _)| a_series.commutator_basis[*i].degree() != a_series.max_degree)
             .map(|x| x.0)
             .collect::<Vec<_>>();
         let other_nonzero_coefficients = b_coefficients
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.is_zero())
+            .filter(|(i, _)| a_series.commutator_basis[*i].degree() != a_series.max_degree)
             .map(|x| x.0);
 
         for i in nonzero_coefficients {
             let a: &CommutatorTerm<U, T> = &a_series.commutator_basis[i];
             for j in other_nonzero_coefficients.clone() {
                 let b = &a_series.commutator_basis[j];
-                if i == j || a.degree() + b.degree() > a_series.max_degree {
+                if i == j {
                     continue;
                 }
 
-                // For some non lyndon term T = [T_i, T_j]
-                // Get the indices of the lyndon basis terms T -> [c_1 * A, c_2 * B, c_3 * C, ...]
+                if a.degree() + b.degree() > a_series.max_degree {
+                    break;
+                }
+
+                // For some non lyndon term T_{ij} = [T_i, T_j]
+                // Get the indices of the lyndon basis terms T_{ij} -> [c_1 * A, c_2 * B, c_3 * C, ...]
                 // [i_A, i_B, i_C, ..., i_n]
                 let basis_indices: &[usize] =
                     &a_series.commutator_basis_map[i * a_series.basis.len() + j];
@@ -376,6 +382,17 @@ impl<
                 }
             }
         }
+    }
+
+    pub fn commutator_assign(&mut self, other: &Self) {
+        let mut coefficients = vec![U::default(); self.coefficients.len()];
+        LieSeries::commutator_coefficients(
+            self,
+            &self.coefficients,
+            &other.coefficients,
+            &mut coefficients,
+        );
+        self.coefficients = coefficients;
     }
 }
 

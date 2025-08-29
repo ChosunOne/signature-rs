@@ -1,0 +1,21 @@
+[package]
+name = "lyndon-cl"
+version = "0.1.0"
+authors = ["ChosunOne"]
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Lyndon words and Lyndon basis for free Lie algebras"
+documentation = "https://docs.rs/lyndon-cl"
+homepage = "https://github.com/ChosunOne/signature-rs"
+repository = "https://github.com/ChosunOne/signature-rs"
+readme = "README.md"
+keywords = ["lyndon", "lie", "combinatorics", "free", "algebra"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
+
+[dependencies]
+cubecl = {version = "0.6.0", features = ["wgpu"]}
+serde = {version = "^1.0.219", features = ["derive"]}
+
+[dev-dependencies]
+rstest = "^0.26.1"
+

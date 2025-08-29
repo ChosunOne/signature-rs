@@ -1,0 +1,24 @@
+[package]
+name = "lie-cl"
+version = "0.1.0"
+authors = ["ChosunOne"]
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Lie series and Baker-Campbell-Hausdorff formula computations on the GPU"
+documentation = "https://docs.rs/lie-cl"
+homepage = "https://github.com/ChosunOne/signature-rs"
+repository = "https://github.com/ChosunOne/signature-rs"
+readme = "README.md"
+keywords = ["lie", "bch", "algebra", "series", "baker"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
+
+[dependencies]
+commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
+cubecl = {version = "^0.6.0", features=["wgpu", "cuda"]}
+lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
+lie-rs = {path = "../lie-rs", version = "0.1.0"}
+serde = {version = "^1.0.219"}
+
+[dev-dependencies]
+rstest = "^0.26.1"
+ordered-float = "^5.0.0"
