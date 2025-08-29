@@ -293,11 +293,16 @@ impl<
                 let mut term = comm![a, b];
                 term.lyndon_sort();
 
+                // For some non-basis term T, and its decomposition to basis terms A, B, and C, ...
+                // T -> [c_1 * A, c_2 * B, c_3 * C, ...]
                 let basis_terms = term.lyndon_basis_decomposition(&commutator_basis_set);
+                // Get the coefficients [c_1, c_2, c_3, ...]
                 let basis_term_coefficients = basis_terms
                     .iter()
                     .map(|x| x.coefficient().clone())
                     .collect::<Vec<_>>();
+                // Get the indices i of A, B, C, ...
+                // [i_A, i_B, i_C, ...]
                 let basis_term_indices = basis_terms
                     .into_iter()
                     .map(|x| commutator_basis_index_map[&x.unit_hash()])
@@ -350,25 +355,24 @@ impl<
                     continue;
                 }
 
+                // For some non lyndon term T = [T_i, T_j]
+                // Get the indices of the lyndon basis terms T -> [c_1 * A, c_2 * B, c_3 * C, ...]
+                // [i_A, i_B, i_C, ..., i_n]
                 let basis_indices: &[usize] =
                     &a_series.commutator_basis_map[i * a_series.basis.len() + j];
+                // Get the coefficients of the basis terms
+                // [c_1, c_2, c_3, ..., c_n]
                 let basis_coefficients: &[U] =
                     &a_series.commutator_basis_map_coefficients[i * a_series.basis.len() + j];
+                // Perform L_new[i_n] += c_n * L_a[i] * L_b[j]
                 for (&basis_index, basis_coefficient) in basis_indices
                     .iter()
                     .zip(basis_coefficients)
                     .filter(|(_, b_c)| !b_c.is_zero())
                 {
-                    let CommutatorTerm::Expression { coefficient, .. } =
-                        &a_series.commutator_basis[basis_index]
-                    else {
-                        panic!("Failed to create commutator expression from term");
-                    };
-
                     result_coefficients[basis_index] += basis_coefficient.clone()
                         * a_coefficients[i].clone()
-                        * b_coefficients[j].clone()
-                        * coefficient.clone();
+                        * b_coefficients[j].clone();
                 }
             }
         }
