@@ -248,8 +248,6 @@ pub fn lie_series_commutation_3d<F: Float>(
     input_b: &LieSeriesCL<F>,
     output: &mut LieSeriesCL<Atomic<F>>,
 ) {
-    let max_degree = input_a.degrees[input_a.degrees.len() - 1];
-
     let i = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
     let j = CUBE_POS_Y * CUBE_DIM_Y + UNIT_POS_Y;
     let k = CUBE_POS_Z * CUBE_DIM_Z + UNIT_POS_Z;
@@ -261,23 +259,31 @@ pub fn lie_series_commutation_3d<F: Float>(
         terminate!();
     }
 
-    let coeff = if i == j || input_a.degrees[i] + input_b.degrees[j] > max_degree {
-        F::new(0.0)
-    } else {
-        input_a.coefficients[i] * input_b.coefficients[j]
-    };
+    let max_degree = input_a.degrees[input_a.degrees.len() - 1];
+    if i == j || input_a.degrees[i] + input_b.degrees[j] > max_degree {
+        terminate!();
+    }
 
     let basis_index =
         input_a.basis_map[i * input_a.basis_map.stride(0) + j * input_a.basis_map.stride(1) + k];
+    if basis_index == -1 {
+        terminate!();
+    }
+
+    let coeff = input_a.coefficients[i] * input_b.coefficients[j];
+    if coeff == F::from_int(0) {
+        terminate!();
+    }
     let basis_coefficient = input_a.basis_coefficients
         [i * input_a.basis_map.stride(0) + j * input_a.basis_map.stride(1) + k];
-
-    if basis_index > -1 {
-        Atomic::add(
-            &output.coefficients[basis_index as u32],
-            basis_coefficient * coeff,
-        );
+    if basis_coefficient == F::from_int(0) {
+        terminate!();
     }
+
+    Atomic::add(
+        &output.coefficients[basis_index as u32],
+        basis_coefficient * coeff,
+    );
 }
 
 #[cfg(test)]
