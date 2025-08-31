@@ -734,7 +734,26 @@ impl<T: Clone + One, U: Clone> CommutatorTerm<T, U> {
     }
 }
 
-impl<T: Clone + One + Hash, U: Clone + Hash> CommutatorTerm<T, U> {
+impl<T, U: Hash> CommutatorTerm<T, U> {
+    /// Returns the hash of only the atoms in the struct
+    pub fn atom_hash(&self) -> u64 {
+        let mut state = DefaultHasher::default();
+        core::mem::discriminant(self).hash(&mut state);
+        match self {
+            Self::Atom { atom, .. } => {
+                atom.hash(&mut state);
+            }
+            Self::Expression { left, right, .. } => {
+                left.atom_hash().hash(&mut state);
+                right.atom_hash().hash(&mut state);
+            }
+        }
+
+        state.finish()
+    }
+}
+
+impl<T: Clone + One + Hash, U: Hash> CommutatorTerm<T, U> {
     /// Returns the hash of the unit struct without cloning
     pub fn unit_hash(&self) -> u64 {
         let mut state = DefaultHasher::default();

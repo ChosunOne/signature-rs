@@ -160,7 +160,7 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
     }
 
     #[must_use]
-    pub fn kernel_arg<F: CubePrimitive>(&self) -> LieSeriesCLLaunch<F, R> {
+    pub fn kernel_arg<F: CubePrimitive>(&self) -> LieSeriesCLLaunch<'_, F, R> {
         let basis_coefficients = unsafe {
             TensorArg::from_raw_parts::<F>(
                 &self.basis_coefficients_data,

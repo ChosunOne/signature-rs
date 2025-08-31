@@ -3977,6 +3977,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "signature-cl"
+version = "0.1.0"
+dependencies = [
+ "commutator-rs",
+ "cubecl",
+ "lie-cl",
+ "lie-rs",
+ "lyndon-rs",
+ "ordered-float 5.0.0",
+ "rstest",
+ "serde",
+ "signature-rs",
+]
+
+[[package]]
 name = "signature-py"
 version = "0.1.0"
 dependencies = [
