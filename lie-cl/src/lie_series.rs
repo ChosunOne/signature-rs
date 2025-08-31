@@ -217,37 +217,6 @@ pub fn lie_series_commutation<F: Float>(
     input_b: &LieSeriesCL<F>,
     output: &mut LieSeriesCL<Atomic<F>>,
 ) {
-    let max_degree = input_a.degrees[input_a.degrees.len() - 1];
-    for i in 0..input_a.basis_map.shape(0) {
-        for j in 0..input_a.basis_map.shape(1) {
-            let coeff = if i == j || input_a.degrees[i] + input_b.degrees[j] > max_degree {
-                F::new(0.0)
-            } else {
-                input_a.coefficients[i] * input_b.coefficients[j]
-            };
-
-            for k in 0..input_a.basis_map.shape(2) {
-                let basis_index = input_a.basis_map
-                    [i * input_a.basis_map.stride(0) + j * input_a.basis_map.stride(1) + k];
-                let basis_coefficient = input_a.basis_coefficients
-                    [i * input_a.basis_map.stride(0) + j * input_a.basis_map.stride(1) + k];
-                if basis_index > -1 {
-                    Atomic::add(
-                        &output.coefficients[basis_index as u32],
-                        basis_coefficient * coeff,
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[cube(launch_unchecked)]
-pub fn lie_series_commutation_3d<F: Float>(
-    input_a: &LieSeriesCL<F>,
-    input_b: &LieSeriesCL<F>,
-    output: &mut LieSeriesCL<Atomic<F>>,
-) {
     let i = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
     let j = CUBE_POS_Y * CUBE_DIM_Y + UNIT_POS_Y;
     let k = CUBE_POS_Z * CUBE_DIM_Z + UNIT_POS_Z;
@@ -301,75 +270,6 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-
-    pub struct SerialCommutationBench<R: Runtime> {
-        pub num_generators: usize,
-        pub basis_depth: usize,
-        pub a_coefficients: Vec<f32>,
-        pub b_coefficients: Vec<f32>,
-        pub lie_series: LieSeries<u8, NotNan<f32>>,
-        client: ComputeClient<R::Server, R::Channel>,
-    }
-
-    impl<R: Runtime> Benchmark for SerialCommutationBench<R> {
-        type Input = (LieSeriesCLData<R, f32>, LieSeriesCLData<R, f32>);
-        type Output = LieSeriesCLData<R, f32>;
-
-        fn prepare(&self) -> Self::Input {
-            let basis = LyndonBasis::<u8>::new(self.num_generators, Sort::Lexicographical)
-                .generate_basis(self.basis_depth);
-
-            let a = LieSeries::new(
-                basis.clone(),
-                self.a_coefficients
-                    .iter()
-                    .copied()
-                    .map(|x| NotNan::try_from(x).unwrap())
-                    .collect::<Vec<_>>(),
-            );
-            let b = LieSeries::new(
-                basis.clone(),
-                self.b_coefficients
-                    .iter()
-                    .copied()
-                    .map(|x| NotNan::try_from(x).unwrap())
-                    .collect::<Vec<_>>(),
-            );
-            let input_a = LieSeriesCLData::<R, f32>::new(&self.client, &a);
-            let input_b = LieSeriesCLData::<R, f32>::new(&self.client, &b);
-            (input_a, input_b)
-        }
-
-        fn name(&self) -> String {
-            format!(
-                "{}-commutation-{:?}-{:?}",
-                R::name(&self.client),
-                self.num_generators,
-                self.basis_depth
-            )
-            .to_lowercase()
-        }
-
-        fn sync(&self) {
-            future::block_on(self.client.sync());
-        }
-
-        fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
-            let output = LieSeriesCLData::<R, f32>::empty(&self.client, &self.lie_series);
-
-            unsafe {
-                lie_series_commutation::launch_unchecked(
-                    &self.client,
-                    CubeCount::Static(1, 1, 1),
-                    CubeDim::new(1, 1, 1),
-                    input.0.kernel_arg::<f32>(),
-                    input.1.kernel_arg(),
-                    output.kernel_arg(),
-                );
-            }
-            Ok(output)
-        }
-    }
 
     pub struct ParallelCommutationBench<R: Runtime> {
         pub num_generators: usize,
@@ -441,7 +341,7 @@ mod test {
             let cube_dim = CubeDim::new(cube_x, cube_y, cube_z);
 
             unsafe {
-                lie_series_commutation_3d::launch_unchecked(
+                lie_series_commutation::launch_unchecked(
                     &self.client,
                     cube_count,
                     cube_dim,
@@ -504,103 +404,7 @@ mod test {
             0., 0., 0., 0., 0., 0., 0., 0.,
             0., 0., 0., 0., 0., 0., 0., 0.,
         ])]
-    fn test_lie_series_commutation_on_gpu(
-        #[case] num_generators: usize,
-        #[case] basis_depth: usize,
-        #[case] a_coefficients: Vec<f32>,
-        #[case] b_coefficients: Vec<f32>,
-        #[case] expected_coefficients: Vec<f32>,
-    ) {
-        let client = WgpuRuntime::client(&WgpuDevice::default());
-        let basis = LyndonBasis::<u8>::new(num_generators, Sort::Lexicographical)
-            .generate_basis(basis_depth);
-        let a_coefficients = a_coefficients
-            .into_iter()
-            .map(|x| NotNan::try_from(x).unwrap())
-            .collect::<Vec<_>>();
-        let b_coefficients = b_coefficients
-            .into_iter()
-            .map(|x| NotNan::try_from(x).unwrap())
-            .collect::<Vec<_>>();
-        let a = LieSeries::new(basis.clone(), a_coefficients);
-        let b = LieSeries::new(basis, b_coefficients);
-        let input_a = LieSeriesCLData::<WgpuRuntime, f32>::new(&client, &a);
-        let input_b = LieSeriesCLData::<WgpuRuntime, f32>::new(&client, &b);
-        let output = LieSeriesCLData::<WgpuRuntime, f32>::empty(&client, &a);
-
-        unsafe {
-            lie_series_commutation::launch_unchecked(
-                &client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new(1, 1, 1),
-                input_a.kernel_arg::<f32>(),
-                input_b.kernel_arg(),
-                output.kernel_arg(),
-            );
-        }
-
-        let coefficients = output.read_coefficients(&client);
-        assert_eq!(coefficients.len(), expected_coefficients.len());
-        dbg!(&coefficients);
-        for (c, e_c) in coefficients
-            .into_iter()
-            .zip(expected_coefficients.into_iter())
-        {
-            assert!((c - e_c).abs() < 0.001, "{c} != {e_c}");
-        }
-    }
-
-    #[rstest]
-    #[case(2, 2, vec![1., 2., 3.], vec![4., 5., 6.], vec![0., 0., -3.])]
-    #[case(2, 2, vec![3., 2., 1.], vec![1., 2., 3.], vec![0., 0., 4.])]
-    #[case(2, 3, vec![1., 2., 3., 4., 5.], vec![6., 7., 8., 9., 10.], vec![0., 0., -5., -10., 5.])]
-    #[case(3, 3,
-        vec![1., 2., 3., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.],
-        vec![5., 3., 1., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.],
-        vec![0., 0., 0., -7., -14., -7., 0., 0., 0., 0., 0., 0., 0., 0.])]
-    #[case(3, 3,
-        vec![1., 2., 3., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.],
-        vec![0., 0., 0., -7., -14., -7., 0., 0., 0., 0., 0., 0., 0., 0.],
-        vec![0., 0., 0., 0., 0., 0., -7., -14., 14., 14., 49., 42., -14., 21.])]
-    #[case(3, 4,
-        vec![
-            1., 2., 3., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-        ],
-        vec![
-            5., 3., 1., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-        ],
-        vec![
-            0., 0., 0., -7., -14., -7., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-        ],
-    )]
-    #[case(3, 4, vec![
-            1., 2., 3., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-        ],
-        vec![
-            0., 0., 0., -7., -14., -7., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-        ],
-        vec![
-            0., 0., 0., 0., 0., 0., -7., -14.,
-            14., 14., 49., 42., -14., 21., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-            0., 0., 0., 0., 0., 0., 0., 0.,
-        ])]
-    fn test_lie_series_commutation_3d(
+    fn test_lie_series_commutation(
         #[case] num_generators: usize,
         #[case] basis_depth: usize,
         #[case] a_coefficients: Vec<f32>,
@@ -642,7 +446,7 @@ mod test {
         let cube_dim = CubeDim::new(cube_x, cube_y, cube_z);
 
         unsafe {
-            lie_series_commutation_3d::launch_unchecked(
+            lie_series_commutation::launch_unchecked(
                 &client,
                 cube_count,
                 cube_dim,
@@ -661,39 +465,6 @@ mod test {
         {
             assert!((c - e_c).abs() < 0.001, "{c} != {e_c}");
         }
-    }
-
-    #[rstest]
-    #[case(3, 5)]
-    #[case(4, 5)]
-    #[case(5, 5)]
-    #[case(6, 4)]
-    #[case(7, 4)]
-    #[case(8, 4)]
-    fn test_serial_gpu_benchmark(#[case] num_generators: usize, #[case] basis_depth: usize) {
-        let basis = LyndonBasis::<u8>::new(num_generators, Sort::Lexicographical)
-            .generate_basis(basis_depth);
-        let a_coefficients = (0..basis.len())
-            .map(|x| NotNan::<f32>::try_from(x as f32).unwrap())
-            .collect::<Vec<_>>();
-        let b_coefficients = (0..basis.len()).rev().map(|x| x as f32).collect::<Vec<_>>();
-        let client = WgpuRuntime::client(&WgpuDevice::default());
-        let lie_series = LieSeries::new(basis, a_coefficients.clone());
-        let a_coefficients = a_coefficients.into_iter().map(|x| x.into_inner()).collect();
-        let bench = SerialCommutationBench::<WgpuRuntime> {
-            num_generators,
-            basis_depth,
-            a_coefficients,
-            b_coefficients,
-            lie_series,
-            client,
-        };
-
-        println!("{}", bench.name());
-        println!(
-            "{}",
-            bench.run(cubecl::benchmark::TimingMethod::System).unwrap()
-        );
     }
 
     #[rstest]
