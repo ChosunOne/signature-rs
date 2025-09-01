@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use cubecl::{prelude::*, server::Handle, std::tensor::compact_strides};
 use lie_rs::LieSeries;
 
-pub struct LieSeriesCLData<R: Runtime, T: Numeric + CubeElement> {
-    basis_map_shape: Vec<usize>,
+pub struct LieSeriesCLData<R, T> {
+    pub basis_map_shape: Vec<usize>,
     basis_coefficients_data: Handle,
     basis_map_data: Handle,
     basis_strides: Vec<usize>,
@@ -212,7 +212,7 @@ pub struct LieSeriesCL<T: CubePrimitive> {
 }
 
 #[cube(launch_unchecked)]
-pub fn lie_series_scalar_multiplication<F: Float>(
+pub fn lie_series_scalar_multiplication<F: Numeric>(
     input_a: &LieSeriesCL<Line<F>>,
     scalar: F,
     output: &mut LieSeriesCL<Line<F>>,
@@ -225,7 +225,7 @@ pub fn lie_series_scalar_multiplication<F: Float>(
 }
 
 #[cube(launch_unchecked)]
-pub fn lie_series_addition<F: Float>(
+pub fn lie_series_addition<F: Numeric>(
     input_a: &LieSeriesCL<Line<F>>,
     input_b: &LieSeriesCL<Line<F>>,
     output: &mut LieSeriesCL<Line<F>>,
@@ -237,7 +237,7 @@ pub fn lie_series_addition<F: Float>(
 }
 
 #[cube(launch_unchecked)]
-pub fn lie_series_commutation<F: Float>(
+pub fn lie_series_commutation<F: Numeric>(
     input_a: &LieSeriesCL<F>,
     input_b: &LieSeriesCL<F>,
     output: &mut LieSeriesCL<Atomic<F>>,
@@ -391,7 +391,6 @@ mod test {
         let client = CudaRuntime::client(&CudaDevice::default());
         let lie_series_data = LieSeriesCLData::<CudaRuntime, f32>::new(&client, &lie_series);
         let line_size = 4;
-        let output = LieSeriesCLData::<CudaRuntime, f32>::empty(&client, &lie_series);
 
         unsafe {
             lie_series_scalar_multiplication::launch_unchecked(
@@ -400,11 +399,11 @@ mod test {
                 CubeDim::new(a_coefficients.len() as u32, 1, 1),
                 lie_series_data.kernel_arg::<Line<f32>>(line_size),
                 ScalarArg::new(2.0f32),
-                output.kernel_arg(line_size),
+                lie_series_data.kernel_arg(line_size),
             );
         }
 
-        let coefficients = output.read_coefficients(&client);
+        let coefficients = lie_series_data.read_coefficients(&client);
         assert_eq!(coefficients.len(), a_coefficients.len());
 
         for (c, o_c) in coefficients.into_iter().zip(
@@ -584,7 +583,10 @@ mod test {
         let b_coefficients = (0..basis.len()).rev().map(|x| x as f32).collect::<Vec<_>>();
         let client = CudaRuntime::client(&CudaDevice::default());
         let lie_series = LieSeries::new(basis, a_coefficients.clone());
-        let a_coefficients = a_coefficients.into_iter().map(|x| x.into_inner()).collect();
+        let a_coefficients = a_coefficients
+            .into_iter()
+            .map(ordered_float::NotNan::into_inner)
+            .collect();
         let bench = ParallelCommutationBench::<CudaRuntime> {
             num_generators,
             basis_depth,
