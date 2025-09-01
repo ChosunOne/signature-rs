@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use cubecl::{prelude::*, server::Handle, std::tensor::compact_strides};
-use lie_cl::lie_series::{LieSeriesCL, LieSeriesCLData};
+use cubecl::{prelude::*, server::Handle};
+use lie_cl::lie_series::LieSeriesCLData;
 use signature_rs::{CommutatorTerm, LogSignature};
 
 pub struct LogSignatureCLData<R: Runtime, T: Numeric + CubeElement> {
@@ -13,9 +13,7 @@ pub struct LogSignatureCLData<R: Runtime, T: Numeric + CubeElement> {
     bch_coefficients_len: usize,
     /// The dependencies for each term in the series, e.g.
     /// A = [0, -1], B = [1, -1], [A, B] = [0, 1], [A, [A, B]] = [0, 2], ...
-    bch_commutator_basis_data: Handle,
-    bch_commutator_basis_shape: Vec<usize>,
-    bch_commutator_basis_stride: Vec<usize>,
+    bch_commutator_basis: Vec<[i32; 2]>,
 }
 
 impl<R: Runtime, T: Numeric + CubeElement> Clone for LogSignatureCLData<R, T> {
@@ -24,9 +22,7 @@ impl<R: Runtime, T: Numeric + CubeElement> Clone for LogSignatureCLData<R, T> {
             lie_series_data: self.lie_series_data.clone(),
             bch_coefficients_data: self.bch_coefficients_data.clone(),
             bch_coefficients_len: self.bch_coefficients_len,
-            bch_commutator_basis_data: self.bch_commutator_basis_data.clone(),
-            bch_commutator_basis_shape: self.bch_commutator_basis_shape.clone(),
-            bch_commutator_basis_stride: self.bch_commutator_basis_stride.clone(),
+            bch_commutator_basis: self.bch_commutator_basis.clone(),
         }
     }
 }
@@ -42,8 +38,6 @@ impl<R: Runtime, T: Numeric + CubeElement> LogSignatureCLData<R, T> {
 
         let mut bch_commutator_basis =
             Vec::with_capacity(log_signature.bch_series.commutator_basis.len());
-        let bch_commutator_basis_shape = vec![log_signature.bch_series.commutator_basis.len(), 2];
-        let bch_commutator_basis_stride = compact_strides(&bch_commutator_basis_shape);
 
         let mut commutation_index_map = HashMap::new();
 
@@ -62,20 +56,11 @@ impl<R: Runtime, T: Numeric + CubeElement> LogSignatureCLData<R, T> {
             }
         }
 
-        let bch_commutator_basis_flat = bch_commutator_basis
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let bch_commutator_basis_data = client.create(i32::as_bytes(&bch_commutator_basis_flat));
-
         Self {
             lie_series_data,
             bch_coefficients_data,
             bch_coefficients_len: log_signature.bch_series.coefficients.len(),
-            bch_commutator_basis_data,
-            bch_commutator_basis_shape,
-            bch_commutator_basis_stride,
+            bch_commutator_basis,
         }
     }
 
@@ -89,9 +74,6 @@ impl<R: Runtime, T: Numeric + CubeElement> LogSignatureCLData<R, T> {
         let mut bch_commutator_basis =
             Vec::with_capacity(log_signature.bch_series.commutator_basis.len());
 
-        let bch_commutator_basis_shape = vec![log_signature.bch_series.commutator_basis.len(), 2];
-        let bch_commutator_basis_stride = compact_strides(&bch_commutator_basis_shape);
-
         let mut commutation_index_map = HashMap::new();
 
         for (i, commutator_term) in log_signature.bch_series.commutator_basis.iter().enumerate() {
@@ -109,38 +91,16 @@ impl<R: Runtime, T: Numeric + CubeElement> LogSignatureCLData<R, T> {
             }
         }
 
-        let bch_commutator_basis_flat = bch_commutator_basis
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let bch_commutator_basis_data = client.create(i32::as_bytes(&bch_commutator_basis_flat));
-
         Self {
             lie_series_data,
             bch_coefficients_data,
             bch_coefficients_len: log_signature.bch_series.coefficients.len(),
-            bch_commutator_basis_data,
-            bch_commutator_basis_shape,
-            bch_commutator_basis_stride,
+            bch_commutator_basis,
         }
     }
 
-    #[must_use]
-    pub fn kernel_arg<F: CubePrimitive>(&self) -> LogSignatureCLLaunch<'_, F, R> {
-        let lie_series = self.lie_series_data.kernel_arg();
-        let bch_coefficients = unsafe {
-            ArrayArg::from_raw_parts::<T>(&self.bch_coefficients_data, self.bch_coefficients_len, 1)
-        };
-        let bch_commutator_basis = unsafe {
-            TensorArg::from_raw_parts::<u32>(
-                &self.bch_commutator_basis_data,
-                &self.bch_commutator_basis_stride,
-                &self.bch_commutator_basis_shape,
-                1,
-            )
-        };
-        LogSignatureCLLaunch::new(lie_series, bch_coefficients, bch_commutator_basis)
+    pub fn concat(&self, other: &Self) {
+        todo!()
     }
 
     pub fn read_coefficients(self, client: &ComputeClient<R::Server, R::Channel>) -> Vec<T> {
@@ -148,9 +108,48 @@ impl<R: Runtime, T: Numeric + CubeElement> LogSignatureCLData<R, T> {
     }
 }
 
-#[derive(CubeType, CubeLaunch)]
-pub struct LogSignatureCL<T: CubePrimitive> {
-    pub lie_series: LieSeriesCL<T>,
-    pub bch_coefficients: Array<T>,
-    pub bch_commutator_basis: Tensor<u32>,
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use lie_rs::{BchSeriesGenerator, LieSeries, LieSeriesGenerator};
+    use lyndon_rs::{LyndonBasis, Sort};
+    use ordered_float::NotNan;
+    use signature_rs::CommutatorTerm;
+
+    #[test]
+    fn test_bch_series_plan() {
+        let basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
+        let bch_series: LieSeries<u8, NotNan<f32>> =
+            BchSeriesGenerator::new(basis, 5).generate_lie_series();
+
+        let mut commutation_index_map = HashMap::new();
+        let mut bch_commutator_basis = Vec::with_capacity(bch_series.commutator_basis.len());
+
+        for (i, commutator_term) in bch_series.commutator_basis.iter().enumerate() {
+            match commutator_term {
+                t @ CommutatorTerm::Atom { atom, .. } => {
+                    bch_commutator_basis.push([i32::from(*atom), -1]);
+                    commutation_index_map.insert(t.atom_hash(), i);
+                }
+                t @ CommutatorTerm::Expression { left, right, .. } => {
+                    let left_index = commutation_index_map[&left.atom_hash()] as i32;
+                    let right_index = commutation_index_map[&right.atom_hash()] as i32;
+                    bch_commutator_basis.push([left_index, right_index]);
+                    commutation_index_map.insert(t.atom_hash(), i);
+                }
+            }
+        }
+
+        println!("Index \t Commutator \t Degree");
+        for (i, plan) in bch_commutator_basis.iter().enumerate() {
+            println!(
+                "[{i}]:\t [{}, {}] \t{}",
+                plan[0],
+                plan[1],
+                &bch_series.commutator_basis[i].degree()
+            );
+        }
+        todo!()
+    }
 }

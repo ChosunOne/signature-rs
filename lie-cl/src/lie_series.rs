@@ -8,7 +8,7 @@ pub struct LieSeriesCLData<R: Runtime, T: Numeric + CubeElement> {
     basis_coefficients_data: Handle,
     basis_map_data: Handle,
     basis_strides: Vec<usize>,
-    coefficients_data: Handle,
+    pub coefficients_data: Handle,
     degrees_data: Handle,
     _t: PhantomData<T>,
     _r: PhantomData<R>,
@@ -160,13 +160,13 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
     }
 
     #[must_use]
-    pub fn kernel_arg<F: CubePrimitive>(&self) -> LieSeriesCLLaunch<'_, F, R> {
+    pub fn kernel_arg<F: CubePrimitive>(&self, line_size: u8) -> LieSeriesCLLaunch<'_, F, R> {
         let basis_coefficients = unsafe {
             TensorArg::from_raw_parts::<F>(
                 &self.basis_coefficients_data,
                 &self.basis_strides,
                 &self.basis_map_shape,
-                1,
+                line_size,
             )
         };
 
@@ -175,7 +175,7 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
                 &self.basis_map_data,
                 &self.basis_strides,
                 &self.basis_map_shape,
-                1,
+                line_size,
             )
         };
 
@@ -209,6 +209,31 @@ pub struct LieSeriesCL<T: CubePrimitive> {
     pub coefficients: Array<T>,
     /// The degrees for each term in the Lie Series
     pub degrees: Array<u32>,
+}
+
+#[cube(launch_unchecked)]
+pub fn lie_series_scalar_multiplication<F: Float>(
+    input_a: &LieSeriesCL<Line<F>>,
+    scalar: F,
+    output: &mut LieSeriesCL<Line<F>>,
+) {
+    let i = ABSOLUTE_POS;
+    if i < input_a.coefficients.len() {
+        let scalar = Line::new(scalar);
+        output.coefficients[i] = input_a.coefficients[i] * scalar;
+    }
+}
+
+#[cube(launch_unchecked)]
+pub fn lie_series_addition<F: Float>(
+    input_a: &LieSeriesCL<Line<F>>,
+    input_b: &LieSeriesCL<Line<F>>,
+    output: &mut LieSeriesCL<Line<F>>,
+) {
+    let i = ABSOLUTE_POS;
+    if i < input_a.coefficients.len() {
+        output.coefficients[i] = input_a.coefficients[i] + input_b.coefficients[i];
+    }
 }
 
 #[cube(launch_unchecked)]
@@ -345,12 +370,86 @@ mod test {
                     &self.client,
                     cube_count,
                     cube_dim,
-                    input.0.kernel_arg::<f32>(),
-                    input.1.kernel_arg(),
-                    output.kernel_arg(),
+                    input.0.kernel_arg::<f32>(1),
+                    input.1.kernel_arg(1),
+                    output.kernel_arg(1),
                 );
             }
             Ok(output)
+        }
+    }
+
+    #[rstest]
+    fn test_scalar_multiplication() {
+        use cubecl::cuda::CudaDevice;
+
+        let basis = LyndonBasis::<u8>::new(3, Sort::Lexicographical).generate_basis(6);
+        let a_coefficients = (0..basis.len())
+            .map(|x| NotNan::<f32>::try_from(x as f32).unwrap())
+            .collect::<Vec<_>>();
+        let lie_series = LieSeries::new(basis, a_coefficients.clone());
+        let client = CudaRuntime::client(&CudaDevice::default());
+        let lie_series_data = LieSeriesCLData::<CudaRuntime, f32>::new(&client, &lie_series);
+        let line_size = 4;
+        let output = LieSeriesCLData::<CudaRuntime, f32>::empty(&client, &lie_series);
+
+        unsafe {
+            lie_series_scalar_multiplication::launch_unchecked(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new(a_coefficients.len() as u32, 1, 1),
+                lie_series_data.kernel_arg::<Line<f32>>(line_size),
+                ScalarArg::new(2.0f32),
+                output.kernel_arg(line_size),
+            );
+        }
+
+        let coefficients = output.read_coefficients(&client);
+        assert_eq!(coefficients.len(), a_coefficients.len());
+
+        for (c, o_c) in coefficients.into_iter().zip(
+            a_coefficients
+                .into_iter()
+                .map(ordered_float::NotNan::into_inner),
+        ) {
+            assert!((c - 2. * o_c).abs() < 0.001, "{c} != 2.0 * {o_c}");
+        }
+    }
+
+    #[rstest]
+    fn test_addition() {
+        use cubecl::cuda::CudaDevice;
+
+        let basis = LyndonBasis::<u8>::new(3, Sort::Lexicographical).generate_basis(6);
+        let a_coefficients = (0..basis.len())
+            .map(|x| NotNan::<f32>::try_from(x as f32).unwrap())
+            .collect::<Vec<_>>();
+        let lie_series = LieSeries::new(basis, a_coefficients.clone());
+        let client = CudaRuntime::client(&CudaDevice::default());
+        let lie_series_data = LieSeriesCLData::<CudaRuntime, f32>::new(&client, &lie_series);
+        let line_size = 4;
+        let output = LieSeriesCLData::<CudaRuntime, f32>::empty(&client, &lie_series);
+
+        unsafe {
+            lie_series_addition::launch_unchecked(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new(a_coefficients.len() as u32, 1, 1),
+                lie_series_data.kernel_arg::<Line<f32>>(line_size),
+                lie_series_data.kernel_arg::<Line<f32>>(line_size),
+                output.kernel_arg(line_size),
+            );
+        }
+
+        let coefficients = output.read_coefficients(&client);
+        assert_eq!(coefficients.len(), a_coefficients.len());
+
+        for (c, o_c) in coefficients.into_iter().zip(
+            a_coefficients
+                .into_iter()
+                .map(ordered_float::NotNan::into_inner),
+        ) {
+            assert!((c - 2. * o_c).abs() < 0.001, "{c} != 2.0 * {o_c}");
         }
     }
 
@@ -450,9 +549,9 @@ mod test {
                 &client,
                 cube_count,
                 cube_dim,
-                input_a.kernel_arg::<f32>(),
-                input_b.kernel_arg(),
-                output.kernel_arg(),
+                input_a.kernel_arg::<f32>(1),
+                input_b.kernel_arg(1),
+                output.kernel_arg(1),
             );
         }
 
