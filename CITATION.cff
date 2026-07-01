@@ -1,9 +1,11 @@
-cff-version: 1.1.0
-message: "If you use this software, please cite it as below."
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title:ChosunOne/signature-rs: 0.1.1
 authors:
 - family-names: "Evans"
   given-names: "Josiah Geoffrey"
-orcid: "https://orcid.org/0009-0007-1782-7556"
-title:ChosunOne/signature-rs: 0.1.1
-version: 0.1.1
-date-released: 2026-07-01
+doi: "10.5281/zenodo.21106739"
+license: "AGPL-3.0"
+repository-code: "https://github.com/ChosunOne/signature-rs"
+url: "https://github.com/ChosunOne/signature-rs"
+version: "0.1.1"
