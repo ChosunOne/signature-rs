@@ -26,7 +26,7 @@ impl<R: Runtime> LogSignatureCLBuilder<R> {
 
     pub fn build_from_tensor_path<'a>(
         &'a self,
-        path: &TensorHandle<R, f32>,
+        path: &TensorHandle<R>,
     ) -> LogSignatureCLData<'a, R, f32, NotNan<f32>> {
         todo!()
     }

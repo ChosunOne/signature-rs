@@ -34,10 +34,7 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
     LogSignatureCLData<'a, R, T, U>
 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn new(
-        client: &ComputeClient<R::Server, R::Channel>,
-        log_signature: &'a LogSignature<u8, U>,
-    ) -> Self {
+    pub fn new(client: &ComputeClient<R>, log_signature: &'a LogSignature<u8, U>) -> Self {
         let lie_series_data = LieSeriesCLData::<R, T>::new(client, &log_signature.series);
 
         let mut bch_commutator_basis =
@@ -68,10 +65,7 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn empty(
-        client: &ComputeClient<R::Server, R::Channel>,
-        log_signature: &'a LogSignature<u8, U>,
-    ) -> Self {
+    pub fn empty(client: &ComputeClient<R>, log_signature: &'a LogSignature<u8, U>) -> Self {
         let lie_series_data = LieSeriesCLData::<R, T>::empty(client, &log_signature.series);
         let mut bch_commutator_basis =
             Vec::with_capacity(log_signature.bch_series.commutator_basis.len());
@@ -108,7 +102,7 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
         clippy::cast_sign_loss,
         clippy::similar_names
     )]
-    pub fn concat(&self, client: &ComputeClient<R::Server, R::Channel>, other: &Self) -> Self {
+    pub fn concat(&self, client: &ComputeClient<R>, other: &Self) -> Self {
         let basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
         let terms_per_degree =
             basis.number_of_words_per_degree(self.log_signature.bch_series.max_degree);
@@ -135,7 +129,7 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
         let cubes_z = dim_k.div_ceil(cube_z);
 
         let cube_count = CubeCount::Static(cubes_x, cubes_y, cubes_z);
-        let cube_dim = CubeDim::new(cube_x, cube_y, cube_z);
+        let cube_dim = CubeDim::new_3d(cube_x, cube_y, cube_z);
 
         let mut cumsum = 0;
         for num_terms in terms_per_degree {
@@ -156,15 +150,15 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
                         client,
                         cube_count.clone(),
                         cube_dim,
-                        left_term.kernel_arg(1),
-                        right_term.kernel_arg(1),
-                        output_term.kernel_arg(1),
+                        left_term.kernel_arg(),
+                        right_term.kernel_arg(),
+                        output_term.kernel_arg(),
                     );
                 }
             }
             cumsum += num_terms;
             // Ensure the previous level's calculations are complete.
-            block_on(client.sync());
+            let _ = block_on(client.sync());
         }
 
         let num_blocks = self
@@ -175,7 +169,7 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
             .div_ceil(MAX_THREADS as usize) as u32;
 
         let cube_count = CubeCount::Static(num_blocks, 1, 1);
-        let cube_dim = CubeDim::new(MAX_THREADS, 1, 1);
+        let cube_dim = CubeDim::new_3d(MAX_THREADS, 1, 1);
 
         for (coefficient, term) in self
             .log_signature
@@ -189,13 +183,14 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
                     client,
                     cube_count.clone(),
                     cube_dim,
-                    term.kernel_arg(LINE_SIZE),
-                    ScalarArg::new(<T as std::convert::From<U>>::from(*coefficient)),
-                    term.kernel_arg(LINE_SIZE),
+                    LINE_SIZE as usize,
+                    term.kernel_arg(),
+                    <T as std::convert::From<U>>::from(*coefficient),
+                    term.kernel_arg(),
                 );
             }
         }
-        block_on(client.sync());
+        let _ = block_on(client.sync());
 
         let reduction = &commutation_terms[0];
 
@@ -214,12 +209,13 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
                     client,
                     cube_count.clone(),
                     cube_dim,
-                    reduction.kernel_arg(LINE_SIZE),
-                    commutation_terms[i].kernel_arg(LINE_SIZE),
-                    reduction.kernel_arg(LINE_SIZE),
+                    LINE_SIZE as usize,
+                    reduction.kernel_arg(),
+                    commutation_terms[i].kernel_arg(),
+                    reduction.kernel_arg(),
                 );
             }
-            block_on(client.sync());
+            let _ = block_on(client.sync());
         }
 
         Self {
@@ -229,7 +225,7 @@ impl<'a, R: Runtime, T: Copy + Numeric + CubeElement + From<U>, U: Copy>
         }
     }
 
-    pub fn read_coefficients(self, client: &ComputeClient<R::Server, R::Channel>) -> Vec<T> {
+    pub fn read_coefficients(self, client: &ComputeClient<R>) -> Vec<T> {
         self.lie_series_data.read_coefficients(client)
     }
 }

@@ -1,14 +1,17 @@
 use std::marker::PhantomData;
 
-use cubecl::{prelude::*, server::Handle, std::tensor::compact_strides};
+use cubecl::{prelude::*, server::Handle, std::tensor::compact_strides, zspace::Strides};
 use lie_rs::LieSeries;
+
+const VECTORIZATION: usize = 4;
 
 pub struct LieSeriesCLData<R, T> {
     pub basis_map_shape: Vec<usize>,
     basis_coefficients_data: Handle,
     basis_map_data: Handle,
-    basis_strides: Vec<usize>,
+    basis_strides: Strides,
     pub coefficients_data: Handle,
+    coefficients_len: usize,
     degrees_data: Handle,
     _t: PhantomData<T>,
     _r: PhantomData<R>,
@@ -22,6 +25,7 @@ impl<R: Runtime, T: Numeric + CubeElement> Clone for LieSeriesCLData<R, T> {
             basis_map_data: self.basis_map_data.clone(),
             basis_strides: self.basis_strides.clone(),
             coefficients_data: self.coefficients_data.clone(),
+            coefficients_len: self.coefficients_len,
             degrees_data: self.degrees_data.clone(),
             _t: PhantomData,
             _r: PhantomData,
@@ -30,10 +34,7 @@ impl<R: Runtime, T: Numeric + CubeElement> Clone for LieSeriesCLData<R, T> {
 }
 
 impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
-    pub fn new(
-        client: &ComputeClient<R::Server, R::Channel>,
-        lie_series: &LieSeries<u8, impl Into<T> + Copy>,
-    ) -> Self {
+    pub fn new(client: &ComputeClient<R>, lie_series: &LieSeries<u8, impl Into<T> + Copy>) -> Self {
         let max_basis_terms = lie_series
             .commutator_basis_map
             .iter()
@@ -64,25 +65,31 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
             }
         }
 
-        let basis_map_data = client.create(i32::as_bytes(&basis_map_padded));
+        let basis_map_data = client.create_from_slice(i32::as_bytes(&basis_map_padded));
 
-        let basis_coefficients_data = client.create(T::as_bytes(&basis_coefficients_padded));
+        let basis_coefficients_data =
+            client.create_from_slice(T::as_bytes(&basis_coefficients_padded));
 
-        let coefficients_data = client.create(T::as_bytes(
-            &lie_series
-                .coefficients
-                .iter()
-                .copied()
-                .map(std::convert::Into::into)
-                .collect::<Vec<_>>(),
-        ));
+        let coefficients = lie_series
+            .coefficients
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect::<Vec<T>>();
+
+        let coefficients_len = coefficients.len().div_ceil(VECTORIZATION) * VECTORIZATION;
+
+        let mut coefficients = coefficients;
+        coefficients.resize(coefficients_len, T::from_int(0));
+        let coefficients_data = client.create_from_slice(T::as_bytes(&coefficients));
+
         let degree_vec = lie_series
             .commutator_basis
             .iter()
             .map(|x| x.degree() as u32)
             .collect::<Vec<_>>();
 
-        let degrees_data = client.create(u32::as_bytes(&degree_vec));
+        let degrees_data = client.create_from_slice(u32::as_bytes(&degree_vec));
         let basis_strides = compact_strides(&basis_map_shape);
 
         Self {
@@ -91,6 +98,7 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
             basis_strides,
             basis_coefficients_data,
             coefficients_data,
+            coefficients_len,
             degrees_data,
             _t: PhantomData,
             _r: PhantomData,
@@ -99,7 +107,7 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
 
     #[must_use]
     pub fn empty(
-        client: &ComputeClient<R::Server, R::Channel>,
+        client: &ComputeClient<R>,
         lie_series: &LieSeries<u8, impl Into<T> + Copy>,
     ) -> Self {
         let max_basis_terms = lie_series
@@ -130,21 +138,24 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
                 }
             }
         }
-        let basis_map_data = client.create(i32::as_bytes(&basis_map_padded));
+        let basis_map_data = client.create_from_slice(i32::as_bytes(&basis_map_padded));
 
-        let basis_coefficients_data = client.create(T::as_bytes(&basis_coefficients_padded));
+        let basis_coefficients_data =
+            client.create_from_slice(T::as_bytes(&basis_coefficients_padded));
 
-        let coefficients_data = client.create(T::as_bytes(&vec![
-            T::from_int(0);
-            lie_series.coefficients.len()
-        ]));
+        let coefficients_len =
+            lie_series.coefficients.len().div_ceil(VECTORIZATION) * VECTORIZATION;
+
+        let coefficients_data =
+            client.create_from_slice(T::as_bytes(&vec![T::from_int(0); coefficients_len]));
+
         let degree_vec = lie_series
             .commutator_basis
             .iter()
             .map(|x| x.degree() as u32)
             .collect::<Vec<_>>();
 
-        let degrees_data = client.create(u32::as_bytes(&degree_vec));
+        let degrees_data = client.create_from_slice(u32::as_bytes(&degree_vec));
         let basis_strides = compact_strides(&basis_map_shape);
 
         Self {
@@ -153,6 +164,7 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
             basis_strides,
             basis_coefficients_data,
             coefficients_data,
+            coefficients_len,
             degrees_data,
             _t: PhantomData,
             _r: PhantomData,
@@ -160,38 +172,36 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
     }
 
     #[must_use]
-    pub fn kernel_arg<F: CubePrimitive>(&self, line_size: u8) -> LieSeriesCLLaunch<'_, F, R> {
+    pub fn kernel_arg<E: CubePrimitive>(&self) -> LieSeriesCLLaunch<E, R> {
         let basis_coefficients = unsafe {
-            TensorArg::from_raw_parts::<F>(
-                &self.basis_coefficients_data,
-                &self.basis_strides,
-                &self.basis_map_shape,
-                line_size,
+            TensorArg::from_raw_parts(
+                self.basis_coefficients_data.clone(),
+                self.basis_strides.clone(),
+                self.basis_map_shape.clone().into(),
             )
         };
 
         let basis_map = unsafe {
-            TensorArg::from_raw_parts::<i32>(
-                &self.basis_map_data,
-                &self.basis_strides,
-                &self.basis_map_shape,
-                line_size,
+            TensorArg::from_raw_parts(
+                self.basis_map_data.clone(),
+                self.basis_strides.clone(),
+                self.basis_map_shape.clone().into(),
             )
         };
 
         let coefficients = unsafe {
-            ArrayArg::from_raw_parts::<T>(&self.coefficients_data, self.basis_map_shape[0], 1)
+            ArrayArg::from_raw_parts(self.coefficients_data.clone(), self.coefficients_len)
         };
 
-        let degrees = unsafe {
-            ArrayArg::from_raw_parts::<u32>(&self.degrees_data, self.basis_map_shape[0], 1)
-        };
+        let degrees =
+            unsafe { ArrayArg::from_raw_parts(self.degrees_data.clone(), self.basis_map_shape[0]) };
         LieSeriesCLLaunch::new(basis_coefficients, basis_map, coefficients, degrees)
     }
 
-    pub fn read_coefficients(self, client: &ComputeClient<R::Server, R::Channel>) -> Vec<T> {
-        let bytes = client.read_one(self.coefficients_data.binding());
-        T::from_bytes(&bytes).to_vec()
+    pub fn read_coefficients(self, client: &ComputeClient<R>) -> Vec<T> {
+        let n = self.basis_map_shape[0];
+        let bytes = client.read_one(self.coefficients_data).unwrap();
+        T::from_bytes(&bytes).iter().take(n).copied().collect()
     }
 }
 
@@ -212,23 +222,23 @@ pub struct LieSeriesCL<T: CubePrimitive> {
 }
 
 #[cube(launch_unchecked)]
-pub fn lie_series_scalar_multiplication<F: Numeric>(
-    input_a: &LieSeriesCL<Line<F>>,
+pub fn lie_series_scalar_multiplication<F: Numeric + CubeElement, N: Size>(
+    input_a: &LieSeriesCL<Vector<F, N>>,
     scalar: F,
-    output: &mut LieSeriesCL<Line<F>>,
+    output: &mut LieSeriesCL<Vector<F, N>>,
 ) {
     let i = ABSOLUTE_POS;
     if i < input_a.coefficients.len() {
-        let scalar = Line::new(scalar);
+        let scalar = Vector::new(scalar);
         output.coefficients[i] = input_a.coefficients[i] * scalar;
     }
 }
 
 #[cube(launch_unchecked)]
-pub fn lie_series_addition<F: Numeric>(
-    input_a: &LieSeriesCL<Line<F>>,
-    input_b: &LieSeriesCL<Line<F>>,
-    output: &mut LieSeriesCL<Line<F>>,
+pub fn lie_series_addition<F: Numeric, N: Size>(
+    input_a: &LieSeriesCL<Vector<F, N>>,
+    input_b: &LieSeriesCL<Vector<F, N>>,
+    output: &mut LieSeriesCL<Vector<F, N>>,
 ) {
     let i = ABSOLUTE_POS;
     if i < input_a.coefficients.len() {
@@ -242,9 +252,9 @@ pub fn lie_series_commutation<F: Numeric>(
     input_b: &LieSeriesCL<F>,
     output: &mut LieSeriesCL<Atomic<F>>,
 ) {
-    let i = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
-    let j = CUBE_POS_Y * CUBE_DIM_Y + UNIT_POS_Y;
-    let k = CUBE_POS_Z * CUBE_DIM_Z + UNIT_POS_Z;
+    let i = (CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X) as usize;
+    let j = (CUBE_POS_Y * CUBE_DIM_Y + UNIT_POS_Y) as usize;
+    let k = (CUBE_POS_Z * CUBE_DIM_Z + UNIT_POS_Z) as usize;
 
     if i >= input_a.basis_map.shape(0)
         || j >= input_a.basis_map.shape(1)
@@ -274,10 +284,7 @@ pub fn lie_series_commutation<F: Numeric>(
         terminate!();
     }
 
-    Atomic::add(
-        &output.coefficients[basis_index as u32],
-        basis_coefficient * coeff,
-    );
+    output.coefficients[basis_index as usize].fetch_add(basis_coefficient * coeff);
 }
 
 #[cfg(test)]
@@ -285,7 +292,7 @@ mod test {
     use std::cmp::min;
 
     use cubecl::{
-        benchmark::Benchmark,
+        benchmark::{Benchmark, TimingMethod},
         cuda::CudaRuntime,
         future,
         wgpu::{WgpuDevice, WgpuRuntime},
@@ -302,7 +309,7 @@ mod test {
         pub a_coefficients: Vec<f32>,
         pub b_coefficients: Vec<f32>,
         pub lie_series: LieSeries<u8, NotNan<f32>>,
-        client: ComputeClient<R::Server, R::Channel>,
+        client: ComputeClient<R>,
     }
 
     impl<R: Runtime> Benchmark for ParallelCommutationBench<R> {
@@ -345,7 +352,7 @@ mod test {
         }
 
         fn sync(&self) {
-            future::block_on(self.client.sync());
+            let _ = future::block_on(self.client.sync());
         }
 
         fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
@@ -363,16 +370,16 @@ mod test {
             let cubes_z = dim_k.div_ceil(cube_z);
 
             let cube_count = CubeCount::Static(cubes_x, cubes_y, cubes_z);
-            let cube_dim = CubeDim::new(cube_x, cube_y, cube_z);
+            let cube_dim = CubeDim::new_3d(cube_x, cube_y, cube_z);
 
             unsafe {
-                lie_series_commutation::launch_unchecked(
+                lie_series_commutation::launch_unchecked::<f32, R>(
                     &self.client,
                     cube_count,
                     cube_dim,
-                    input.0.kernel_arg::<f32>(1),
-                    input.1.kernel_arg(1),
-                    output.kernel_arg(1),
+                    input.0.kernel_arg(),
+                    input.1.kernel_arg(),
+                    output.kernel_arg(),
                 );
             }
             Ok(output)
@@ -393,13 +400,14 @@ mod test {
         let line_size = 4;
 
         unsafe {
-            lie_series_scalar_multiplication::launch_unchecked(
+            lie_series_scalar_multiplication::launch_unchecked::<f32, CudaRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
-                CubeDim::new(a_coefficients.len() as u32, 1, 1),
-                lie_series_data.kernel_arg::<Line<f32>>(line_size),
-                ScalarArg::new(2.0f32),
-                lie_series_data.kernel_arg(line_size),
+                CubeDim::new_3d(a_coefficients.len() as u32, 1, 1),
+                line_size as usize,
+                lie_series_data.kernel_arg(),
+                2.0f32,
+                lie_series_data.kernel_arg(),
             );
         }
 
@@ -430,13 +438,14 @@ mod test {
         let output = LieSeriesCLData::<CudaRuntime, f32>::empty(&client, &lie_series);
 
         unsafe {
-            lie_series_addition::launch_unchecked(
+            lie_series_addition::launch_unchecked::<f32, CudaRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
-                CubeDim::new(a_coefficients.len() as u32, 1, 1),
-                lie_series_data.kernel_arg::<Line<f32>>(line_size),
-                lie_series_data.kernel_arg::<Line<f32>>(line_size),
-                output.kernel_arg(line_size),
+                CubeDim::new_3d(a_coefficients.len() as u32, 1, 1),
+                line_size as usize,
+                lie_series_data.kernel_arg(),
+                lie_series_data.kernel_arg(),
+                output.kernel_arg(),
             );
         }
 
@@ -541,16 +550,16 @@ mod test {
         let cubes_z = dim_k.div_ceil(cube_z);
 
         let cube_count = CubeCount::Static(cubes_x, cubes_y, cubes_z);
-        let cube_dim = CubeDim::new(cube_x, cube_y, cube_z);
+        let cube_dim = CubeDim::new_3d(cube_x, cube_y, cube_z);
 
         unsafe {
-            lie_series_commutation::launch_unchecked(
+            lie_series_commutation::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 cube_count,
                 cube_dim,
-                input_a.kernel_arg::<f32>(1),
-                input_b.kernel_arg(1),
-                output.kernel_arg(1),
+                input_a.kernel_arg(),
+                input_b.kernel_arg(),
+                output.kernel_arg(),
             );
         }
 
@@ -597,9 +606,6 @@ mod test {
         };
 
         println!("{}", bench.name());
-        println!(
-            "{}",
-            bench.run(cubecl::benchmark::TimingMethod::System).unwrap()
-        );
+        println!("{}", bench.run(TimingMethod::System).unwrap());
     }
 }

@@ -9,10 +9,11 @@ mod test {
         server::Handle,
         std::tensor::compact_strides,
         wgpu::{WgpuDevice, WgpuRuntime},
+        zspace::Strides,
     };
     pub struct CpuTensor {
         pub data: Vec<f32>,
-        pub strides: Vec<usize>,
+        pub strides: Strides,
         pub shape: Vec<usize>,
     }
 
@@ -58,7 +59,7 @@ mod test {
     pub struct GpuTensor<R: Runtime, F: Float + CubeElement> {
         data: Handle,
         shape: Vec<usize>,
-        strides: Vec<usize>,
+        strides: Strides,
         _r: PhantomData<R>,
         _f: PhantomData<F>,
     }
@@ -77,12 +78,12 @@ mod test {
 
     impl<R: Runtime, F: Float + CubeElement> GpuTensor<R, F> {
         /// Create a `GpuTensor` with a shape filled by number in order
-        pub fn arange(shape: Vec<usize>, client: &ComputeClient<R::Server, R::Channel>) -> Self {
+        pub fn arange(shape: Vec<usize>, client: &ComputeClient<R>) -> Self {
             let size = shape.iter().product();
             let data: Vec<F> = (0..size).map(|i| F::from_int(i as i64)).collect();
-            let data = client.create(F::as_bytes(&data));
+            let data = client.create_from_slice(F::as_bytes(&data));
 
-            let strides = cubecl::std::tensor::compact_strides(&shape);
+            let strides = compact_strides(&shape);
             Self {
                 data,
                 shape,
@@ -93,7 +94,7 @@ mod test {
         }
 
         /// Create an empty GpuTensor with a shape
-        pub fn empty(shape: Vec<usize>, client: &ComputeClient<R::Server, R::Channel>) -> Self {
+        pub fn empty(shape: Vec<usize>, client: &ComputeClient<R>) -> Self {
             let size = shape.iter().product::<usize>() * core::mem::size_of::<F>();
             let data = client.empty(size);
 
@@ -108,22 +109,26 @@ mod test {
         }
 
         /// Create a TensorArg to pass to a kernel
-        pub fn into_tensor_arg(&self, line_size: u8) -> TensorArg<'_, R> {
+        pub fn into_tensor_arg(&self) -> TensorArg<R> {
             unsafe {
-                TensorArg::from_raw_parts::<F>(&self.data, &self.strides, &self.shape, line_size)
+                TensorArg::from_raw_parts(
+                    self.data.clone(),
+                    self.strides.clone(),
+                    self.shape.clone().into(),
+                )
             }
         }
 
         /// Return the data from the client
-        pub fn read(self, client: &ComputeClient<R::Server, R::Channel>) -> Vec<F> {
-            let bytes = client.read_one(self.data.binding());
+        pub fn read(self, client: &ComputeClient<R>) -> Vec<F> {
+            let bytes = client.read_one(self.data).unwrap();
             F::from_bytes(&bytes).to_vec()
         }
     }
 
     pub struct ReductionBench<R: Runtime, F: Float + CubeElement> {
         input_shape: Vec<usize>,
-        client: ComputeClient<R::Server, R::Channel>,
+        client: ComputeClient<R>,
         _f: PhantomData<F>,
     }
 
@@ -142,7 +147,7 @@ mod test {
         }
 
         fn sync(&self) {
-            future::block_on(self.client.sync());
+            let _ = future::block_on(self.client.sync());
         }
 
         fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
@@ -153,9 +158,10 @@ mod test {
                 reduce_matrix_gpu::launch_unchecked::<F, R>(
                     &self.client,
                     CubeCount::Static(self.input_shape[0] as u32, 1, 1),
-                    CubeDim::new(self.input_shape[1] as u32, 1, 1),
-                    input.into_tensor_arg(LINE_SIZE as u8),
-                    output.into_tensor_arg(LINE_SIZE as u8),
+                    CubeDim::new_3d(self.input_shape[1] as u32, 1, 1),
+                    LINE_SIZE as usize,
+                    input.into_tensor_arg(),
+                    output.into_tensor_arg(),
                 );
             }
 
@@ -164,12 +170,18 @@ mod test {
     }
 
     #[cube(launch_unchecked)]
-    pub fn reduce_matrix_gpu<F: Float>(input: &Tensor<Line<F>>, output: &mut Tensor<Line<F>>) {
-        let mut acc = Line::new(F::new(0.0f32));
-        for i in 0..input.shape(2) / LINE_SIZE {
-            acc = acc + input[CUBE_POS_X * input.stride(0) + UNIT_POS_X * input.stride(1) + i];
+    pub fn reduce_matrix_gpu<F: Float, N: Size>(
+        input: &Tensor<Vector<F, N>>,
+        output: &mut Tensor<Vector<F, N>>,
+    ) {
+        let mut acc = Vector::new(F::new(0.0f32));
+        for i in 0..input.shape(2) / LINE_SIZE as usize {
+            acc = acc
+                + input[CUBE_POS_X as usize * input.stride(0)
+                    + UNIT_POS_X as usize * input.stride(1)
+                    + i];
         }
-        output[CUBE_POS_X * output.stride(0) + UNIT_POS_X] = acc;
+        output[CUBE_POS_X as usize * output.stride(0) + UNIT_POS_X as usize] = acc;
     }
 
     #[test]
@@ -194,9 +206,10 @@ mod test {
             reduce_matrix_gpu::launch_unchecked::<f32, WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
-                CubeDim::new(1, 1, 1),
-                input.into_tensor_arg(1),
-                output.into_tensor_arg(1),
+                CubeDim::new_3d(1, 1, 1),
+                LINE_SIZE as usize,
+                input.into_tensor_arg(),
+                output.into_tensor_arg(),
             );
         };
 
