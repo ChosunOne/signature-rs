@@ -1,4 +1,4 @@
-[![DOI](https://zenodo.org/badge/1036825296.svg)](https://doi.org/10.5281/zenodo.21106686)
+<a href="https://doi.org/10.5281/zenodo.21106686"><img src="https://zenodo.org/badge/1036825296.svg" alt="DOI"></a>
 
 # signature-rs-bin
 
