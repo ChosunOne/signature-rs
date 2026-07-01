@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1036825296.svg)](https://doi.org/10.5281/zenodo.21106686)
+
 # signature-rs-bin
 
 A command-line tool for computing log signatures from path data in various formats.
