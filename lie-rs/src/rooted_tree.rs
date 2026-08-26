@@ -238,6 +238,10 @@ impl<T> GraphPartitionTable<T> {
 
 impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
     #[must_use]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(initial_trees = t_n.len()))
+    )]
     pub fn new(mut t_n: Vec<RootedTree<T>>) -> Self {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
@@ -265,6 +269,8 @@ impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
         while i < t_n.len() {
             let tree = &t_n[i];
             let Some((v, w)) = tree.factorize() else {
+                #[cfg(feature = "tracing")]
+                tracing::trace!(i, "leaf tree, no edge partitions");
                 i += 1;
                 #[cfg(feature = "progress")]
                 pb.inc(1);
@@ -273,6 +279,8 @@ impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
             };
             let v_idx = tree_t_n_map[&v];
             let w_idx = tree_t_n_map[&w];
+            #[cfg(feature = "tracing")]
+            tracing::trace!(i, v = v_idx, w = w_idx, "factorized tree for partition table");
             s[i].partitions.push((v_idx, w_idx));
 
             for p in 0..v.degree() - 1 {
@@ -290,6 +298,11 @@ impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
                     degree.push(v_root_w.degree());
                     tree_t_n_map.insert(v_root_w.clone(), t_n.len() - 1);
                     s.push(EdgePartitions::default());
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!(
+                        total_trees = t_n.len(),
+                        "added auxiliary tree (from v-partition)"
+                    );
                 }
                 s[i].partitions
                     .push((tree_t_n_map[&v_root_w], tree_t_n_map[&v_comp]));
@@ -310,6 +323,11 @@ impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
                     degree.push(v_w_root.degree());
                     tree_t_n_map.insert(v_w_root.clone(), t_n.len() - 1);
                     s.push(EdgePartitions::default());
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!(
+                        total_trees = t_n.len(),
+                        "added auxiliary tree (from w-partition)"
+                    );
                 }
                 s[i].partitions
                     .push((tree_t_n_map[&v_w_root], tree_t_n_map[&w_comp]));
@@ -322,6 +340,15 @@ impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
         #[cfg(feature = "progress")]
         pb.finish();
 
+        #[cfg(feature = "tracing")]
+        {
+            tracing::debug!(total_trees = t_n.len(), "populated edge partitions");
+            tracing::debug!(
+                total_trees = t_n.len(),
+                "finished building graph partition table"
+            );
+        }
+
         Self { t_n, degree, s }
     }
 }
@@ -332,6 +359,7 @@ mod test {
 
     use lyndon_rs::lyndon::{LyndonBasis, Sort};
     use rstest::rstest;
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -490,6 +518,7 @@ mod test {
         assert!(tree_set.contains(&grafted_tree_2));
     }
 
+    #[traced_test]
     #[test]
     fn test_graph_partition_table() {
         let basis = LyndonBasis::<char>::new(2, Sort::Topological);
@@ -527,5 +556,11 @@ mod test {
         for (s_ui, expected_s_ui) in graph_partition_table.s.iter().zip(expected_s.iter()) {
             assert_eq!(&s_ui.partitions, expected_s_ui);
         }
+
+        #[cfg(feature = "tracing")]
+        assert!(
+            logs_contain("finished building graph partition table"),
+            "expected tracing event from GraphPartitionTable::new"
+        );
     }
 }

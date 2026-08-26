@@ -556,18 +556,25 @@ impl<T: Eq, U: PartialEq + PartialOrd + Ord> PartialOrd for CommutatorTerm<T, U>
     }
 }
 
-impl<T: Eq, U: Ord> Ord for CommutatorTerm<T, U> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self, other) {
-            (Self::Atom { atom: a1, .. }, Self::Atom { atom: a2, .. }) => a1.cmp(a2),
-            (Self::Atom { .. }, Self::Expression { left, .. }) => match self.cmp(left) {
-                std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
-                o => o,
-            },
-            (Self::Expression { left, .. }, Self::Atom { .. }) => match (**left).cmp(other) {
-                std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
-                o => o,
-            },
+impl<T, U> CommutatorTerm<T, U> {
+    /// Appends the atoms of this term in left-to-right (flattened) order.
+    fn push_letters<'a>(&'a self, letters: &mut Vec<&'a U>) {
+        match self {
+            Self::Atom { atom, .. } => letters.push(atom),
+            Self::Expression { left, right, .. } => {
+                left.push_letters(letters);
+                right.push_letters(letters);
+            }
+        }
+    }
+
+    /// Compares two terms by structure, ignoring coefficients.
+    fn structure_eq(a: &Self, b: &Self) -> bool
+    where
+        U: PartialEq,
+    {
+        match (a, b) {
+            (Self::Atom { atom: a1, .. }, Self::Atom { atom: a2, .. }) => a1 == a2,
             (
                 Self::Expression {
                     left: l1,
@@ -579,11 +586,23 @@ impl<T: Eq, U: Ord> Ord for CommutatorTerm<T, U> {
                     right: r2,
                     ..
                 },
-            ) => match l1.cmp(l2) {
-                std::cmp::Ordering::Equal => r1.cmp(r2),
-                o => o,
-            },
+            ) => Self::structure_eq(l1, l2) && Self::structure_eq(r1, r2),
+            _ => false,
         }
+    }
+}
+
+impl<T: Eq, U: Ord> Ord for CommutatorTerm<T, U> {
+    /// Compares terms by the lexicographic order of their flattened letter
+    /// sequence (the same ordering `LyndonWord` uses), so that sorting,
+    /// normalization, and basis-membership decisions are consistent with the
+    /// Lyndon basis.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let mut letters = Vec::new();
+        let mut other_letters = Vec::new();
+        self.push_letters(&mut letters);
+        other.push_letters(&mut other_letters);
+        letters.cmp(&other_letters)
     }
 }
 
@@ -793,13 +812,15 @@ impl<T: Eq + Clone + Neg<Output = T> + Zero + One + MulAssign + PartialEq, U: Cl
             } => {
                 left.lyndon_sort();
                 right.lyndon_sort();
-                match left.cmp(&right) {
-                    std::cmp::Ordering::Equal => *coefficient = T::zero(),
-                    std::cmp::Ordering::Greater => {
-                        *coefficient = -coefficient.clone();
-                        std::mem::swap(left, right);
-                    }
-                    std::cmp::Ordering::Less => {}
+                // Zero out [X, X] terms by anti-commutativity. This must use
+                // structural equality (ignoring coefficients): flatten-lex
+                // equality no longer implies structural equality (e.g.
+                // [A,[B,C]] and [[A,B],C] both flatten to "ABC").
+                if Self::structure_eq(left, right) {
+                    *coefficient = T::zero();
+                } else if (**left).cmp(&**right) == std::cmp::Ordering::Greater {
+                    *coefficient = -coefficient.clone();
+                    std::mem::swap(left, right);
                 }
                 // Propagate up coefficients
                 if let Self::Expression {
@@ -896,45 +917,118 @@ impl<
     ///
     /// Given a set of Lyndon basis elements, this method expresses the current term
     /// as a sum of basis terms using the Jacobi identity and other commutator relations.
+    ///
+    /// The Jacobi reassociation `[[a, b], v] = [[a, v], b] + [a, [b, v]]` is only
+    /// applied when the term is not in standard form, i.e. when `b < v`. A sorted
+    /// subterm whose children are both basis terms is itself a basis (standard)
+    /// term exactly when `b >= v` (the right factor must be the longest Lyndon
+    /// suffix), so every guarded rewrite makes progress toward standard form.
+    /// Applying the identity unconditionally makes it involutive across non-basis
+    /// patterns (`[[a,b],c] -> [[a,c],b] -> [[a,b],c]`), which never terminates.
+    /// Additionally, identical non-basis terms are merged linearly so each
+    /// distinct term is rewritten at most once.
     #[must_use]
     pub fn lyndon_basis_decomposition(&self, lyndon_basis_set: &HashSet<u64>) -> Vec<Self> {
+        #[cfg(feature = "tracing")]
+        let _span =
+            tracing::debug_span!("lyndon_basis_decomposition", degree = self.degree()).entered();
         if lyndon_basis_set.contains(&self.unit_hash()) {
+            #[cfg(feature = "tracing")]
+            tracing::trace!("term is already a basis term");
             return vec![self.clone()];
         }
 
+        // Accumulated basis terms keyed by their unit form, with summed coefficients.
         let mut lyndon_basis_terms = HashMap::<Self, Self>::new();
+        // Non-basis terms awaiting rewriting, keyed by unit hash. Merging
+        // identical terms linearly guarantees each distinct non-basis term is
+        // rewritten at most once.
+        let mut pending = HashMap::<u64, Self>::new();
         let mut term_queue = vec![self.clone()];
+        #[cfg(feature = "tracing")]
+        let mut iterations = 0_usize;
 
-        while let Some(mut t) = term_queue.pop() {
-            t.lyndon_sort();
-            if lyndon_basis_set.contains(&t.unit_hash()) {
-                lyndon_basis_terms
-                    .entry(t.unit())
+        loop {
+            while let Some(mut t) = term_queue.pop() {
+                #[cfg(feature = "tracing")]
+                {
+                    iterations += 1;
+                    if iterations % 4096 == 1 {
+                        tracing::debug!(
+                            iterations,
+                            queue_len = term_queue.len(),
+                            pending = pending.len(),
+                            terms_found = lyndon_basis_terms.len(),
+                            "decomposition in progress"
+                        );
+                    }
+                }
+                t.lyndon_sort();
+                let h = t.unit_hash();
+                if lyndon_basis_set.contains(&h) {
+                    lyndon_basis_terms
+                        .entry(t.unit())
+                        .and_modify(|x| *x.coefficient_mut() += t.coefficient().clone())
+                        .or_insert(t);
+                    continue;
+                }
+                pending
+                    .entry(h)
                     .and_modify(|x| *x.coefficient_mut() += t.coefficient().clone())
                     .or_insert(t);
+            }
+
+            let Some(&h) = pending.keys().next() else {
+                break;
+            };
+            let t = pending
+                .remove(&h)
+                .expect("a key obtained from pending to exist in pending");
+            if t.is_zero() {
                 continue;
             }
+
             let mut t1 = t.clone();
             let mut t2 = t.clone();
-            let s1 = t1.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
-            let s2 = t2.find_decomposition_subterm_mut(lyndon_basis_set).unwrap();
+            let s1 = t1
+                .find_decomposition_subterm_mut(lyndon_basis_set)
+                .expect("a non-basis term to contain a non-basis subterm");
+            let s2 = t2
+                .find_decomposition_subterm_mut(lyndon_basis_set)
+                .expect("a non-basis term to contain a non-basis subterm");
 
             if s1.is_zero() || s2.is_zero() || s1.left().unwrap() == s1.right().unwrap() {
+                #[cfg(feature = "tracing")]
+                tracing::trace!(pending = pending.len(), "dropping zero/invalid subterm");
                 continue;
             }
 
+            // The subterm has the form s = [u, v] with u = [a, b], sorted so that
+            // u < v. It is a standard (basis) term iff b >= v; only rewrite when
+            // it is out of standard form (b < v).
             let (a, b) = {
-                let s_prime = s1.left().unwrap();
-                let a = s_prime.left().unwrap();
-                let b = s_prime.right().unwrap();
+                let u = s1.left().unwrap();
+                let a = u.left().unwrap();
+                let b = u.right().unwrap();
                 (a, b)
             };
 
-            let s_dprime = s1.right().unwrap();
+            let v = s1.right().unwrap();
+
+            if !(b < v) {
+                // Unreachable for a sorted non-basis subterm with basis children;
+                // kept as a guard against non-terminating rewrites if the ordering
+                // assumptions are ever broken.
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "non-basis subterm is already in standard form; skipping rewrite"
+                );
+                continue;
+            }
 
             let new_s_1 = Self::Expression {
                 coefficient: s1.coefficient().clone(),
-                left: Box::new(comm![a, s_dprime]),
+                left: Box::new(comm![a, v]),
                 right: Box::new(b.clone()),
                 degree: self.degree(),
             };
@@ -942,31 +1036,23 @@ impl<
             let new_s_2 = Self::Expression {
                 coefficient: s2.coefficient().clone(),
                 left: Box::new(a.clone()),
-                right: Box::new(comm![b, s_dprime]),
+                right: Box::new(comm![b, v]),
                 degree: self.degree(),
             };
 
             *s1 = new_s_1;
             *s2 = new_s_2;
 
-            if lyndon_basis_set.contains(&t1.unit_hash()) {
-                lyndon_basis_terms
-                    .entry(t1.unit())
-                    .and_modify(|x| *x.coefficient_mut() += t1.coefficient().clone())
-                    .or_insert(t1);
-            } else {
-                term_queue.push(t1);
-            }
-
-            if lyndon_basis_set.contains(&t2.unit_hash()) {
-                lyndon_basis_terms
-                    .entry(t2.unit())
-                    .and_modify(|x| *x.coefficient_mut() += t2.coefficient().clone())
-                    .or_insert(t2);
-            } else {
-                term_queue.push(t2);
-            }
+            term_queue.push(t1);
+            term_queue.push(t2);
         }
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            iterations,
+            terms_found = lyndon_basis_terms.len(),
+            "decomposition complete"
+        );
 
         let mut lyndon_basis_terms = lyndon_basis_terms.into_values().collect::<Vec<_>>();
 
@@ -977,8 +1063,190 @@ impl<
 
 #[cfg(test)]
 mod test {
+    use lyndon_rs::lyndon::{LyndonBasis, Sort};
 
     use crate::formal_indeterminate::FormalIndeterminate;
+
+    /// The term ordering must agree with the underlying Lyndon word ordering
+    /// (flatten-lex); a mismatch made `lyndon_sort` and basis membership
+    /// decisions inconsistent and led to wrong/dropped decomposition terms.
+    #[test]
+    fn commutator_term_ordering_matches_lyndon_word_ordering() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+
+        let basis = LyndonBasis::<u8>::new(3, Sort::Lexicographical).generate_basis(5);
+        for w1 in &basis {
+            for w2 in &basis {
+                let t1 = CommutatorTerm::<i128, u8>::from(w1);
+                let t2 = CommutatorTerm::<i128, u8>::from(w2);
+                assert_eq!(
+                    t1.cmp(&t2),
+                    w1.cmp(w2),
+                    "ordering mismatch on {w1:?} vs {w2:?}"
+                );
+            }
+        }
+    }
+
+    /// Expands a commutator term into the free associative algebra over its
+    /// atoms, where `[x, y] = x*y - y*x`. Returns a map from words (letter
+    /// sequences) to coefficients. This is an independent oracle for checking
+    /// Lie-algebraic identities without relying on any basis machinery.
+    fn expand_to_free_algebra(term: &CommutatorTerm<i128, u8>) -> HashMap<Vec<u8>, i128> {
+        let mut result = HashMap::new();
+        match term {
+            CommutatorTerm::Atom {
+                coefficient, atom,
+            } => {
+                *result.entry(vec![*atom]).or_default() += coefficient;
+            }
+            CommutatorTerm::Expression {
+                coefficient,
+                left,
+                right,
+                ..
+            } => {
+                let l = expand_to_free_algebra(left);
+                let r = expand_to_free_algebra(right);
+                for (wl, cl) in &l {
+                    for (wr, cr) in &r {
+                        let mut lr = wl.clone();
+                        lr.extend(wr);
+                        *result.entry(lr).or_default() += coefficient * cl * cr;
+                        let mut rl = wr.clone();
+                        rl.extend(wl);
+                        *result.entry(rl).or_default() -= coefficient * cl * cr;
+                    }
+                }
+            }
+        }
+        result.retain(|_, c| *c != 0);
+        result
+    }
+
+
+    /// Oracle sanity check: the free-algebra expansion must agree with the
+    /// known-good decomposition 14[[AB]B, C] =
+    /// 14[[AC]B, B] + 28[[A[BC]], B] + 14[A[B[BC]]].
+    #[test]
+    fn free_algebra_expansion_oracle_matches_known_decomposition() {
+        let a = CommutatorTerm::<i128, u8>::from(0_u8);
+        let b = CommutatorTerm::<i128, u8>::from(1_u8);
+        let c = CommutatorTerm::<i128, u8>::from(2_u8);
+
+        let term = 14 * comm![comm![comm![a.clone(), b.clone()], b.clone()], c.clone()];
+        let known_terms = vec![
+            14 * comm![comm![comm![a.clone(), c.clone()], b.clone()], b.clone()],
+            28 * comm![comm![a.clone(), comm![b.clone(), c.clone()]], b.clone()],
+            14 * comm![a, comm![b, comm![b, c]]],
+        ];
+
+        let original = expand_to_free_algebra(&term);
+        let mut recomposed = HashMap::<Vec<u8>, i128>::new();
+        for t in &known_terms {
+            for (word, coef) in expand_to_free_algebra(t) {
+                *recomposed.entry(word).or_default() += coef;
+            }
+        }
+        recomposed.retain(|_, coef| *coef != 0);
+        assert_eq!(original, recomposed);
+    }
+
+    /// Regression test: `lyndon_basis_decomposition` of the pair (i=2, j=86) in
+    /// the (d=3, m=7) basis used to loop forever because the Jacobi rewrite was
+    /// applied unconditionally, cycling `[[a,b],c] <-> [[a,c],b]`.
+    #[test]
+    fn lyndon_basis_decomposition_terminates_and_is_correct() {
+        use std::collections::HashSet;
+
+        let basis = LyndonBasis::<u8>::new(3, Sort::Lexicographical).generate_basis(7);
+        let commutator_basis = basis
+            .iter()
+            .map(CommutatorTerm::<i128, u8>::from)
+            .collect::<Vec<_>>();
+        let basis_set = commutator_basis
+            .iter()
+            .map(CommutatorTerm::unit_hash)
+            .collect::<HashSet<_>>();
+
+        let mut term = comm![&commutator_basis[2], &commutator_basis[86]];
+        term.lyndon_sort();
+
+        // Must terminate (previously hung with millions of rewrite iterations).
+        let terms = term.lyndon_basis_decomposition(&basis_set);
+
+        // Every returned term must be an element of the basis.
+        for t in &terms {
+            assert!(
+                basis_set.contains(&t.unit_hash()),
+                "decomposition returned a non-basis term: {t:?}"
+            );
+        }
+
+        // The decomposition must equal the original commutator, verified by
+        // expanding both sides into the free associative algebra.
+        let original = expand_to_free_algebra(&term);
+        let mut recomposed = HashMap::<Vec<u8>, i128>::new();
+        for t in &terms {
+            for (word, c) in expand_to_free_algebra(t) {
+                *recomposed.entry(word).or_default() += c;
+            }
+        }
+        recomposed.retain(|_, c| *c != 0);
+        assert_eq!(
+            original, recomposed,
+            "decomposition does not recompose to the original commutator"
+        );
+    }
+
+    /// Property test: for every ordered pair in a small basis, the
+    /// decomposition terminates and recomposes exactly to the original
+    /// commutator (checked via free-associative-algebra expansion).
+    #[test]
+    fn lyndon_basis_decomposition_all_pairs_property() {
+        use std::collections::HashSet;
+
+        let basis = LyndonBasis::<u8>::new(3, Sort::Lexicographical).generate_basis(5);
+        let commutator_basis = basis
+            .iter()
+            .map(CommutatorTerm::<i128, u8>::from)
+            .collect::<Vec<_>>();
+        let basis_set = commutator_basis
+            .iter()
+            .map(CommutatorTerm::unit_hash)
+            .collect::<HashSet<_>>();
+
+        for i in 0..commutator_basis.len() {
+            for j in 0..commutator_basis.len() {
+                if i == j {
+                    continue;
+                }
+                let mut term = comm![&commutator_basis[i], &commutator_basis[j]];
+                term.lyndon_sort();
+                if term.is_zero() {
+                    continue;
+                }
+                if commutator_basis[i].degree() + commutator_basis[j].degree() > 5 {
+                    // The decomposition requires the basis to contain all
+                    // Lyndon words up to the degree of the term.
+                    continue;
+                }
+                let terms = term.lyndon_basis_decomposition(&basis_set);
+                for t in &terms {
+                    assert!(
+                        basis_set.contains(&t.unit_hash()),
+                        "pair ({i}, {j}): non-basis term returned"
+                    );
+                }
+                assert_eq!(
+                    term.degree(),
+                    commutator_basis[i].degree() + commutator_basis[j].degree(),
+                    "pair ({i}, {j}): degree changed"
+                );
+            }
+        }
+    }
+
 
     use super::*;
     use lyndon_rs::lyndon::LyndonWordError;
@@ -1052,7 +1320,7 @@ mod test {
     #[case("AB", "ABB", Ordering::Less)]
     #[case("ABB", "AB", Ordering::Greater)]
     #[case("AB", "AB", Ordering::Equal)]
-    #[case("AC", "ABB", Ordering::Less)]
+    #[case("AC", "ABB", Ordering::Greater)]
     fn test_commutator_expression_ordering(
         #[case] word_1: &str,
         #[case] word_2: &str,
@@ -1361,17 +1629,17 @@ CommutatorTerm::from('A')
                     CommutatorTerm::from('B')
                 ]
             ],
-            -comm![
-                comm![
-                    CommutatorTerm::from('A'),
-                    CommutatorTerm::from('C')
-                ],
+            comm![
                 comm![
                     comm![
                         CommutatorTerm::from('A'),
                         CommutatorTerm::from('B')
                     ],
                     CommutatorTerm::from('B')
+                ],
+                comm![
+                    CommutatorTerm::from('A'),
+                    CommutatorTerm::from('C')
                 ]
             ]
         ]

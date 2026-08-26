@@ -13,6 +13,19 @@
 //! let generator = BchSeriesGenerator::<ENotation>::new(basis, 5);
 //! let bch_series: LieSeries<ENotation, Ratio<i64>> = generator.generate_lie_series();
 //! ```
+//!
+//! ## Crate Features
+//!
+//! - `progress`: displays progress bars (via `indicatif`) for long-running
+//!   computations.
+//! - `tracing`: instruments the potentially expensive operations (basis
+//!   factorization, Goldberg and BCH coefficient generation, Lie series
+//!   construction, and commutator evaluation) with [`tracing`] spans, so
+//!   timings flow into any subscriber configured by the consuming binary.
+//!
+//! To see the instrumentation in test output, run e.g.
+//! `cargo test -p lie-rs --features tracing -- --nocapture`
+//! (respects `RUST_LOG`, defaults to `lie_rs=debug`).
 
 mod bch;
 pub mod bch_series_generator;
