@@ -88,6 +88,13 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
     /// This constructor precomputes all necessary factorizations and indices
     /// for efficient BCH coefficient computation.
     #[must_use]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            fields(alphabet_size = basis.alphabet_size, max_degree)
+        )
+    )]
     pub fn new(basis: LyndonBasis<T>, max_degree: usize) -> Self {
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
@@ -100,6 +107,8 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
         let alphabet_size = basis.alphabet_size;
         let number_of_words_per_degree = basis.number_of_words_per_degree(max_degree);
         let basis = basis.generate_basis(max_degree);
+        #[cfg(feature = "tracing")]
+        tracing::debug!(basis_len = basis.len(), "generated Lyndon basis");
 
         let mut left_factor = vec![0; basis.len()];
         for (i, lf) in left_factor.iter_mut().enumerate().take(alphabet_size) {
@@ -121,6 +130,10 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
             pb.tick();
         }
 
+        #[cfg(feature = "tracing")]
+        let _factorize_span =
+            tracing::debug_span!("factorize_lyndon_words", num_words = basis.len()).entered();
+
         basis
             .par_iter()
             .zip(left_factor.par_iter_mut())
@@ -129,6 +142,12 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
             .for_each(|(((word, lf), rf), wl)| {
                 if word.len() > 1 {
                     let (l, r) = word.factorize();
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!(
+                        left_len = l.len(),
+                        right_len = r.len(),
+                        "factorized word"
+                    );
                     for (k, basis_k) in basis
                         .iter()
                         .enumerate()
@@ -158,6 +177,14 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
         #[cfg(feature = "progress")]
         pb.finish();
 
+        #[cfg(feature = "tracing")]
+        drop(_factorize_span);
+        #[cfg(feature = "tracing")]
+        tracing::debug!(basis_len = basis.len(), "factorized all Lyndon words");
+        #[cfg(feature = "tracing")]
+        let _multi_degree_span =
+            tracing::debug_span!("compute_multi_degrees", num_words = basis.len()).entered();
+
         let mut multi_degree = vec![0; basis.len()];
         let mut alphabet_index = HashMap::new();
         for (i, letter) in alphabet.iter().enumerate() {
@@ -178,6 +205,12 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
                 letter_counts[alphabet_index[&word.letters[j]]] += 1;
             }
             multi_degree[i] = tuple_index(&letter_counts);
+            #[cfg(feature = "tracing")]
+            tracing::trace!(
+                word_index = i,
+                multi_degree = multi_degree[i],
+                "computed multi-degree"
+            );
             #[cfg(feature = "progress")]
             pb.inc(1);
         }
@@ -212,6 +245,13 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
     >(
         &self,
     ) -> Vec<U> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::info_span!(
+            "generate_goldberg_coefficient_numerators",
+            basis_len = self.basis.len()
+        )
+        .entered();
+
         #[cfg(feature = "progress")]
         let style = ProgressStyle::with_template(
             "[{eta_precise}] [{bar:35.green/white}] {pos:>2}/{len:2} {msg}",
@@ -235,6 +275,8 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
             .zip(goldberg_coefficient_numerators.par_iter_mut())
             .for_each(|(word, numer)| {
                 let goldberg_partition = word.goldberg();
+                #[cfg(feature = "tracing")]
+                tracing::trace!(degree = word.len(), "computing Goldberg coefficient");
                 let a_first = word.letters[0] == alphabet[0];
                 *numer = goldberg_coeff_numerator(&goldberg_partition, a_first);
             });
@@ -276,6 +318,14 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
     >(
         &self,
     ) -> Vec<U> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::info_span!(
+            "generate_bch_coefficients",
+            max_degree = self.max_degree,
+            basis_len = self.basis.len()
+        )
+        .entered();
+
         if self.max_degree == 0 {
             return vec![];
         }
@@ -296,6 +346,8 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
         .unwrap()
         .progress_chars("=>-");
         let mut bch_coefficient_numerators = self.generate_goldberg_coefficient_numerators::<U>();
+        #[cfg(feature = "tracing")]
+        tracing::debug!("computed Goldberg coefficient numerators for full basis");
         let alphabet = T::alphabet(1);
 
         // Loop over the words of max degree
@@ -319,6 +371,15 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
         let coeffs_addr = bch_coefficient_numerators.as_mut_ptr() as usize;
         let len = bch_coefficient_numerators.len();
 
+        #[cfg(feature = "tracing")]
+        let _multi_degree_group_span = tracing::debug_span!(
+            "bch_multi_degree_groups",
+            first_group = h1,
+            last_group = h2,
+            num_groups = h2 - h1 + 1
+        )
+        .entered();
+
         (h1..=h2).into_par_iter().for_each(|h| {
             let words_in_group = self.basis[start..=end]
                 .iter()
@@ -326,6 +387,13 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
                 .filter(|&(i, _)| self.multi_degree[i + start] == h)
                 .map(|(i, _)| i + start)
                 .collect::<Vec<_>>();
+
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                group = h,
+                num_words = words_in_group.len(),
+                "processing multi-degree group"
+            );
 
             let mut matrix_tree = MatrixTree::<T>::new(self.max_degree as u8, self.alphabet_size);
             let mut group_matrix_indices = Vec::with_capacity(words_in_group.len());
@@ -344,6 +412,13 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
                 ));
             }
 
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                group = h,
+                matrices = matrix_tree.matrices.len(),
+                "built matrix tree for group"
+            );
+
             let mut x = vec![0_i64; matrix_tree.matrices.len()];
             let mut stop = 0;
             for idx in 0..words_in_group.len() {
@@ -356,6 +431,13 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
 
                 let (num_right_factors, right_factors) = self.right_factors(i, self.max_degree);
                 let word = &self.basis[i];
+                #[cfg(feature = "tracing")]
+                tracing::trace!(
+                    group = h,
+                    word = i,
+                    num_right_factors,
+                    "evaluating word with matrix tree"
+                );
                 matrix_tree.run(&mut x, word, stop);
 
                 let mut index_of_non_initial_generator = 0;
@@ -387,8 +469,13 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
                     }
                 }
             }
+
+            #[cfg(feature = "tracing")]
+            tracing::debug!(group = h, "finished multi-degree group");
         });
 
+        #[cfg(feature = "tracing")]
+        tracing::debug!("computed BCH coefficient numerators");
         #[cfg(feature = "progress")]
         {
             p1.finish();
@@ -425,6 +512,13 @@ impl<
         + MulAssign,
 > LieSeriesGenerator<T, U> for BchSeriesGenerator<T>
 {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            fields(max_degree = self.max_degree, basis_len = self.basis.len())
+        )
+    )]
     fn generate_lie_series(&self) -> LieSeries<T, U> {
         let basis = self.basis.clone();
         let coefficients = self.generate_bch_coefficients::<U>();
@@ -487,8 +581,12 @@ impl<T: Generator + Eq> MatrixTree<T> {
     ) -> usize {
         let key = (word_index << 8) | l as usize;
         if let Some(&v) = self.memoization_cache.get(&key) {
+            #[cfg(feature = "tracing")]
+            tracing::trace!(word_index, l, "matrix tree cache hit");
             return v;
         }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(word_index, l, "matrix tree cache miss");
 
         // Recursively decompose the word into its factors
         let a11 = self.append(
@@ -522,10 +620,19 @@ impl<T: Generator + Eq> MatrixTree<T> {
 
         self.memoization_cache.insert(key, self.matrices.len());
         self.matrices.push(Matrix2x2 { a11, a12, a21, a22 });
+        #[cfg(feature = "tracing")]
+        tracing::trace!(matrices = self.matrices.len(), "matrix tree grew");
         self.matrices.len() - 1
     }
 
     pub fn run(&self, x: &mut [i64], word: &LyndonWord<T>, mut stop: usize) {
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
+            degree = self.degree,
+            matrices = self.matrices.len(),
+            stop,
+            "running matrix tree"
+        );
         let alphabet = T::alphabet(self.alphabet_size);
         if stop >= self.matrices.len() {
             stop = self.matrices.len() - 1;
@@ -569,9 +676,11 @@ mod test {
 
     use lyndon_rs::lyndon::Sort;
     use num_rational::Ratio;
+    use tracing_test::traced_test;
 
     use super::*;
 
+    #[traced_test]
     #[test]
     fn test_construction() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
@@ -650,6 +759,7 @@ mod test {
         }
     }
 
+    #[traced_test]
     #[test]
     fn test_goldberg_series() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
@@ -689,6 +799,7 @@ mod test {
         }
     }
 
+    #[traced_test]
     #[test]
     fn test_bch_series() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);
@@ -719,6 +830,7 @@ mod test {
         }
     }
 
+    #[traced_test]
     #[test]
     fn test_bch_series_degree_1() {
         let basis = LyndonBasis::<char>::new(2, Sort::Lexicographical);

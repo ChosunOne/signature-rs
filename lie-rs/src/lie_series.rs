@@ -8,6 +8,9 @@ use lyndon_rs::generators::Generator;
 use lyndon_rs::lyndon::LyndonWord;
 use num_traits::{One, Zero};
 
+#[cfg(feature = "progress")]
+use indicatif::{ProgressBar, ProgressStyle};
+
 /// Represents a formal power series in the free Lie algebra.
 ///
 /// A `LieSeries` is a linear combination of Lyndon words (represented as commutator terms)
@@ -263,6 +266,10 @@ impl<
 > LieSeries<T, U>
 {
     #[must_use]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(basis_len = basis.len()))
+    )]
     pub fn new(basis: Vec<LyndonWord<T>>, coefficients: Vec<U>) -> Self {
         let mut commutator_basis = Vec::<CommutatorTerm<U, T>>::with_capacity(basis.len());
         let max_degree = if basis.is_empty() {
@@ -273,6 +280,12 @@ impl<
         for word in &basis {
             commutator_basis.push(CommutatorTerm::from(word));
         }
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            max_degree,
+            basis_len = commutator_basis.len(),
+            "converted Lyndon basis to commutator terms"
+        );
         let commutator_basis_set = commutator_basis
             .iter()
             .map(commutator_rs::CommutatorTerm::unit_hash)
@@ -282,19 +295,53 @@ impl<
         for (i, a) in commutator_basis.iter().enumerate() {
             commutator_basis_index_map.insert(a.unit_hash(), i);
         }
+        #[cfg(feature = "tracing")]
+        tracing::debug!("built commutator basis maps");
 
         let mut commutator_basis_map = vec![vec![]; basis.len() * basis.len()];
         let mut commutator_basis_map_coefficients = vec![vec![]; basis.len() * basis.len()];
+        #[cfg(feature = "tracing")]
+        let _structure_constants_span = tracing::debug_span!(
+            "compute_structure_constants",
+            pairs = basis.len() * basis.len(),
+            max_degree
+        )
+        .entered();
+        #[cfg(feature = "progress")]
+        let pb = {
+            let style = ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:35.cyan/blue}] {pos}/{len} structure-constant rows ({msg})",
+            )
+            .unwrap()
+            .progress_chars("=>-");
+            let pb = ProgressBar::new(basis.len() as u64).with_style(style);
+            pb
+        };
         for (i, a) in commutator_basis.iter().enumerate() {
+            #[cfg(feature = "progress")]
+            {
+                pb.set_message(format!("degree {}", a.degree()));
+                pb.inc(1);
+            }
+            #[cfg(feature = "tracing")]
+            if i == 0 || commutator_basis[i - 1].degree() != a.degree() {
+                tracing::debug!(row = i, degree = a.degree(), "computing structure constants");
+            }
             for (j, b) in commutator_basis.iter().enumerate() {
                 if a == b || max_degree < a.degree() + b.degree() {
                     continue;
                 }
+                #[cfg(feature = "tracing")]
+                tracing::trace!(i, j, "computing commutator term");
                 let mut term = comm![a, b];
+                #[cfg(feature = "tracing")]
+                tracing::trace!(i, j, "sorting commutator term");
                 term.lyndon_sort();
 
                 // For some non-basis term T, and its decomposition to basis terms A, B, and C, ...
                 // T -> [c_1 * A, c_2 * B, c_3 * C, ...]
+                #[cfg(feature = "tracing")]
+                tracing::trace!(i, j, "decomposing into Lyndon basis");
                 let basis_terms = term.lyndon_basis_decomposition(&commutator_basis_set);
                 // Get the coefficients [c_1, c_2, c_3, ...]
                 let basis_term_coefficients = basis_terms
@@ -307,11 +354,22 @@ impl<
                     .into_iter()
                     .map(|x| commutator_basis_index_map[&x.unit_hash()])
                     .collect::<Vec<_>>();
+                #[cfg(feature = "tracing")]
+                tracing::trace!(
+                    i,
+                    j,
+                    terms = basis_term_indices.len(),
+                    "decomposed commutator into basis terms"
+                );
                 commutator_basis_map_coefficients[i * basis.len() + j] = basis_term_coefficients;
                 commutator_basis_map[i * basis.len() + j] = basis_term_indices;
             }
         }
 
+        #[cfg(feature = "tracing")]
+        tracing::debug!(basis_len = basis.len(), "finished computing structure constants");
+        #[cfg(feature = "progress")]
+        pb.finish_with_message("done");
         Self {
             basis,
             commutator_basis,
@@ -329,6 +387,18 @@ impl<
     U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign,
 > LieSeries<T, U>
 {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "lie_series_commutator_coefficients",
+            skip_all,
+            fields(
+                basis_len = a_series.basis.len(),
+                max_degree = a_series.max_degree
+            )
+        )
+    )]
     pub fn commutator_coefficients(
         a_series: &LieSeries<T, U>,
         a_coefficients: &[U],
@@ -349,6 +419,13 @@ impl<
             .filter(|(i, _)| a_series.commutator_basis[*i].degree() != a_series.max_degree)
             .map(|x| x.0);
 
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            nonzero_a = nonzero_coefficients.len(),
+            nonzero_b = other_nonzero_coefficients.clone().count(),
+            "computing commutator coefficients"
+        );
+
         for i in nonzero_coefficients {
             let a: &CommutatorTerm<U, T> = &a_series.commutator_basis[i];
             for j in other_nonzero_coefficients.clone() {
@@ -358,6 +435,8 @@ impl<
                 }
 
                 if a.degree() + b.degree() > a_series.max_degree {
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!(i, j, "skipping pair above max degree");
                     break;
                 }
 
