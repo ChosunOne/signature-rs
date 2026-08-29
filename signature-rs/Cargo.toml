@@ -23,3 +23,9 @@ commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
 [dev-dependencies]
 rstest = "^0.26.1"
 num-rational = "^0.4.2"
+criterion = { version = "^0.8.2", features = ["html_reports"] }
+rand = "^0.10.2"
+
+[[bench]]
+name = "logsig"
+harness = false
