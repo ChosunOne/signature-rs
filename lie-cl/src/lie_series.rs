@@ -38,7 +38,7 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
         let max_basis_terms = (0..lie_series.coefficients.len())
             .flat_map(|i| (0..lie_series.coefficients.len()).map(move |j| (i, j)))
             .filter_map(|(i, j)| lie_series.decomposition(i, j))
-            .map(|(indices, _)| indices.len())
+            .map(|(indices, _, _)| indices.len())
             .max()
             .unwrap_or(0);
         let basis_map_shape = vec![
@@ -51,16 +51,29 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
 
         for i in 0..lie_series.coefficients.len() {
             for j in 0..lie_series.coefficients.len() {
-                let (basis_indices, basis_coefficients) =
-                    lie_series.decomposition(i, j).unwrap_or((&[], &[]));
-                for k in 0..max_basis_terms {
-                    if k >= basis_indices.len() {
+                if let Some((basis_indices, basis_coefficients, negate)) =
+                    lie_series.decomposition(i, j)
+                {
+                    for k in 0..max_basis_terms {
+                        if k >= basis_indices.len() {
+                            basis_map_padded.push(-1i32);
+                            basis_coefficients_padded.push(T::from_int(0));
+                            continue;
+                        }
+                        basis_map_padded.push(basis_indices[k] as i32);
+                        if negate {
+                            let mut coefficient = T::from_int(0);
+                            coefficient -= basis_coefficients[k].into();
+                            basis_coefficients_padded.push(coefficient);
+                        } else {
+                            basis_coefficients_padded.push(basis_coefficients[k].into());
+                        }
+                    }
+                } else {
+                    for _ in 0..max_basis_terms {
                         basis_map_padded.push(-1i32);
                         basis_coefficients_padded.push(T::from_int(0));
-                        continue;
                     }
-                    basis_map_padded.push(basis_indices[k] as i32);
-                    basis_coefficients_padded.push(basis_coefficients[k].into());
                 }
             }
         }
@@ -113,7 +126,7 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
         let max_basis_terms = (0..lie_series.coefficients.len())
             .flat_map(|i| (0..lie_series.coefficients.len()).map(move |j| (i, j)))
             .filter_map(|(i, j)| lie_series.decomposition(i, j))
-            .map(|(indices, _)| indices.len())
+            .map(|(indices, _, _)| indices.len())
             .max()
             .unwrap_or(0);
         let basis_map_shape = vec![
@@ -125,16 +138,29 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
         let mut basis_coefficients_padded = vec![];
         for i in 0..lie_series.coefficients.len() {
             for j in 0..lie_series.coefficients.len() {
-                let (basis_indices, basis_coefficients) =
-                    lie_series.decomposition(i, j).unwrap_or((&[], &[]));
-                for k in 0..max_basis_terms {
-                    if k >= basis_indices.len() {
+                if let Some((basis_indices, basis_coefficients, negate)) =
+                    lie_series.decomposition(i, j)
+                {
+                    for k in 0..max_basis_terms {
+                        if k >= basis_indices.len() {
+                            basis_map_padded.push(-1i32);
+                            basis_coefficients_padded.push(T::from_int(0));
+                            continue;
+                        }
+                        basis_map_padded.push(basis_indices[k] as i32);
+                        if negate {
+                            let mut coefficient = T::from_int(0);
+                            coefficient -= basis_coefficients[k].into();
+                            basis_coefficients_padded.push(coefficient);
+                        } else {
+                            basis_coefficients_padded.push(basis_coefficients[k].into());
+                        }
+                    }
+                } else {
+                    for _ in 0..max_basis_terms {
                         basis_map_padded.push(-1i32);
                         basis_coefficients_padded.push(T::from_int(0));
-                        continue;
                     }
-                    basis_map_padded.push(basis_indices[k] as i32);
-                    basis_coefficients_padded.push(basis_coefficients[k].into());
                 }
             }
         }

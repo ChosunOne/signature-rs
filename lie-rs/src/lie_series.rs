@@ -332,7 +332,7 @@ impl<
                 );
             }
             for (j, b) in commutator_basis.iter().enumerate() {
-                if i == j || max_degree < a.degree() + b.degree() {
+                if j <= i || max_degree < a.degree() + b.degree() {
                     continue;
                 }
                 #[cfg(feature = "tracing")]
@@ -395,8 +395,25 @@ impl<T, U> LieSeries<T, U> {
     /// Decomposition of the bracket `[basis[i], basis[j]]` onto the basis,
     /// for pairs stored in the feasible table (`i != j` and degree-feasible).
     /// Returns parallel slices (basis indices, non-zero coefficients).
-    pub fn decomposition(&self, i: usize, j: usize) -> Option<(&[u32], &[U])> {
+    #[must_use]
+    pub fn decomposition(&self, i: usize, j: usize) -> Option<(&[u32], &[U], bool)> {
         self.feasible_decompositions.get(i, j)
+    }
+}
+
+fn scatter_decomposition<U: Clone + Mul<Output = U> + AddAssign>(
+    basis_indices: &[u32],
+    basis_coefficients: &[U],
+    t: &U,
+    result: &mut [U],
+) {
+    // SAFETY: `basis_index` comes from the structure constant table
+    // built in `LieSeries::new` as a decomposition onto this same
+    // basis, so it is always < basis.len() == result.len() for the
+    // duration of the call.
+    for (&basis_index, basis_coefficient) in basis_indices.iter().zip(basis_coefficients) {
+        *unsafe { result.get_unchecked_mut(basis_index as usize) } +=
+            basis_coefficient.clone() * t.clone();
     }
 }
 
@@ -463,25 +480,100 @@ impl<
             "computing commutator coefficients"
         );
 
-        let mut b_present = vec![0u64; a_series.basis.len().div_ceil(64)];
+        let words = a_series.basis.len().div_ceil(64);
+        let mut presence = vec![0u64; 2 * words];
+        let (a_present, b_present) = presence.split_at_mut(words);
+
+        for &i in a_nonzero {
+            a_present[i / 64] |= 1u64 << (i % 64);
+        }
         for &j in b_nonzero {
             b_present[j / 64] |= 1u64 << (j % 64);
         }
 
-        for &i in a_nonzero {
-            let a_coefficient = a_coefficients[i].clone();
-            for (j, basis_indices, basis_coefficients) in a_series.feasible_decompositions.row(i) {
-                if b_present[j / 64] & (1u64 << (j % 64)) == 0 {
-                    continue;
-                }
-                let b_coefficient = &b_coefficients[j];
+        // Rows are sorted by `j` and the non-zero lists are sorted,
+        // so a row of `k` can only match within `j` in `[lo, hi]` of
+        // the opposite side's support. `row_window` binary searches that range,
+        // keeping the scan proportional to the matching entries.
+        let (b_lo, b_hi) = match (b_nonzero.first(), b_nonzero.last()) {
+            (Some(&lo), Some(&hi)) => (lo as u32, hi as u32),
+            _ => return, // b is identically zero: no pair can contribute
+        };
+        let (a_lo, a_hi) = match (a_nonzero.first(), a_nonzero.last()) {
+            (Some(&lo), Some(&hi)) => (lo as u32, hi as u32),
+            _ => return, // a is identically zero: no pair can contribute
+        };
 
-                // Perform L_new[i_n] += c_n * L_a[i] * L_b[j]
-                for (&basis_index, basis_coefficient) in
-                    basis_indices.iter().zip(basis_coefficients)
-                {
-                    *unsafe { result_coefficients.get_unchecked_mut(basis_index as usize) } +=
-                        basis_coefficient.clone() * a_coefficient.clone() * b_coefficient.clone();
+        // Sweep 1: canonical rows whose smaller index is in A.
+        // The stored decomposition is that of `[basis[k], basis[j]]`
+        // with `k < j`, so the fused contribution is `c * (a_k * b_j - a_j * b_k)`
+        // orientation (a = k, b = j) is active iff `j` is in B,
+        // orientation (a = j, b = k) iff additionally `k` is in B and
+        // `j` is in A.
+        for &k in a_nonzero {
+            if b_hi < k as u32 {
+                continue;
+            }
+
+            let a_k = &a_coefficients[k];
+            let k_in_b = b_present[k / 64] & (1u64 << (k % 64)) != 0;
+            let b_k = &b_coefficients[k];
+
+            let (lo, hi) = if k_in_b {
+                (b_lo.min(a_lo), b_hi.max(a_hi))
+            } else {
+                (b_lo, b_hi)
+            };
+
+            for (j, basis_indices, basis_coefficients) in
+                a_series.feasible_decompositions.row_window(k, lo, hi)
+            {
+                if b_present[j / 64] & (1u64 << (j % 64)) != 0 {
+                    let mut t = a_k.clone() * b_coefficients[j].clone();
+                    if k_in_b && a_present[j / 64] & (1u64 << (j % 64)) != 0 {
+                        t += -(a_coefficients[j].clone() * b_k.clone());
+                    }
+                    scatter_decomposition(
+                        basis_indices,
+                        basis_coefficients,
+                        &t,
+                        result_coefficients,
+                    );
+                } else if k_in_b && a_present[j / 64] & (1u64 << (j % 64)) != 0 {
+                    let t = -(a_coefficients[j].clone() * b_k.clone());
+                    scatter_decomposition(
+                        basis_indices,
+                        basis_coefficients,
+                        &t,
+                        result_coefficients,
+                    );
+                }
+            }
+        }
+
+        // Sweep 2: canonical rows whose smaller index is in B but not in A.
+        // Only orientation (a = j, b = k) can be active there
+        for &k in b_nonzero {
+            if a_present[k / 64] & (1u64 << (k % 64)) != 0 {
+                continue;
+            }
+
+            if a_hi <= k as u32 {
+                continue;
+            }
+
+            let b_k = &b_coefficients[k];
+            for (j, basis_indices, basis_coefficients) in
+                a_series.feasible_decompositions.row_window(k, a_lo, a_hi)
+            {
+                if a_present[j / 64] & (1u64 << (j % 64)) != 0 {
+                    let t = -(a_coefficients[j].clone() * b_k.clone());
+                    scatter_decomposition(
+                        basis_indices,
+                        basis_coefficients,
+                        &t,
+                        result_coefficients,
+                    );
                 }
             }
         }
@@ -661,9 +753,12 @@ mod test {
             for i in 0..d_len {
                 let row: Vec<_> = series.feasible_decompositions.row(i).collect();
                 assert!(row.windows(2).all(|w| w[0].0 < w[1].0), "j not ascending");
+                assert!(
+                    row.iter().all(|(j, _, _)| *j > i),
+                    "non-canonical pair stored"
+                );
 
                 for (j, indices, coefficients) in &row {
-                    assert_ne!(i, *j);
                     assert!(degree(i) + degree(*j) <= m, "infeasible pair stored");
 
                     let mut term = comm![&series.commutator_basis[i], &series.commutator_basis[*j]];
@@ -685,9 +780,64 @@ mod test {
                         "(i={i}, j={j}) coeffs"
                     );
                     feasible += 1;
+
+                    let (mirrored_indices, mirrored_coefficients, swapped) =
+                        series.decomposition(*j, i).expect("mirrored pair query");
+
+                    assert!(swapped, "(i={i}, j={j}) mirrored query not flagged");
+                    assert_eq!(mirrored_indices, &expected_indices[..]);
+                    assert_eq!(
+                        mirrored_coefficients,
+                        &expected_coefficients[..],
+                        "(i={i}, j={j}) mirrored data differs from canonical"
+                    );
                 }
             }
             assert_eq!(series.feasible_decompositions.len(), feasible);
+        }
+    }
+
+    #[test]
+    fn commutator_of_series_with_itself_is_zero() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use ordered_float::NotNan;
+
+        for (d, m) in [(2usize, 6usize), (3, 5)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i % 7 + 1) as f64) / 3.0 - 1.1).unwrap())
+                .collect();
+            let series: LieSeries<u8, NotNan<f64>> = LieSeries::new(words, coefficients);
+            let result: LieSeries<u8, NotNan<f64>> = series.commutator(&series);
+            assert!(
+                result.coefficients.iter().all(|c| c.is_zero()),
+                "non-zero coefficient in [A, A] for d={d}, m={m}"
+            );
+        }
+    }
+
+    #[test]
+    fn commutator_is_antisymmetric() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use num_rational::Ratio;
+
+        for (d, m) in [(2usize, 7usize), (3, 6)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let a_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| Ratio::from_integer(((i * 13 + 5) % 23) as i128 - 11))
+                .collect();
+            let b_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| Ratio::from_integer(((i * 29 + 11) % 19) as i128 - 9))
+                .collect();
+            let a: LieSeries<u8, Ratio<i128>> = LieSeries::new(words.clone(), a_coefficients);
+            let b: LieSeries<u8, Ratio<i128>> = LieSeries::new(words, b_coefficients);
+            let ab: LieSeries<u8, Ratio<i128>> = a.commutator(&b);
+            let ba: LieSeries<u8, Ratio<i128>> = b.commutator(&a);
+            for (x, y) in ab.coefficients.iter().zip(&ba.coefficients) {
+                assert_eq!(*x, -*y, "antisymmetry violated for d={d}, m={m}");
+            }
         }
     }
 }

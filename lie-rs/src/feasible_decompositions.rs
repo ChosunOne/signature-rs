@@ -1,6 +1,8 @@
+use std::cmp::Ordering;
+
 /// A compact, CSR-style storage for coefficient pairs.
 ///
-/// Only pairs `(i, j)` with `i != j` and `deg(i) + deg(j) <= max_degree`
+/// Only *canonical* pairs `(i, j)` with `i != j` and `deg(i) + deg(j) <= max_degree`
 /// are stored in ascending `j` order per row.
 #[derive(Clone)]
 pub(crate) struct FeasibleDecompositions<U> {
@@ -44,22 +46,52 @@ impl<U> FeasibleDecompositions<U> {
         })
     }
 
-    /// The stored decomposition for the feasible pair `(i, j)`, if any.
-    pub(crate) fn get(&self, i: usize, j: usize) -> Option<(&[u32], &[U])> {
+    #[inline]
+    pub(crate) fn row_window(
+        &self,
+        i: usize,
+        lo: u32,
+        hi: u32,
+    ) -> impl Iterator<Item = (usize, &[u32], &[U])> + '_ {
         let start = self.row_offsets[i] as usize;
         let end = self.row_offsets[i + 1] as usize;
+        let pair_j = &self.pair_j[start..end];
+        let from = start + pair_j.partition_point(|&j| j < lo);
+        let to = start + pair_j.partition_point(|&j| j <= hi);
+        let pair_j = &self.pair_j[from..to];
+        let offsets = &self.decomp_offsets[from..=to];
+        let indices = &self.decomp_indices;
+        let coefficients = &self.decomp_coefficients;
+        pair_j.iter().enumerate().map(move |(k, &j)| {
+            let from = offsets[k] as usize;
+            let to = offsets[k + 1] as usize;
+            (j as usize, &indices[from..to], &coefficients[from..to])
+        })
+    }
+
+    /// The stored decomposition for the feasible pair `(i, j)`, if any.
+    pub(crate) fn get(&self, i: usize, j: usize) -> Option<(&[u32], &[U], bool)> {
+        let (row, col, swapped) = match i.cmp(&j) {
+            Ordering::Less => (i, j, false),
+            Ordering::Greater => (j, i, true),
+            Ordering::Equal => return None,
+        };
+
+        let start = self.row_offsets[row] as usize;
+        let end = self.row_offsets[row + 1] as usize;
         let row = &self.pair_j[start..end];
-        let pos = start + row.binary_search(&(j as u32)).ok()?;
+        let pos = start + row.binary_search(&(col as u32)).ok()?;
         let from = self.decomp_offsets[pos] as usize;
         let to = self.decomp_offsets[pos + 1] as usize;
         Some((
             &self.decomp_indices[from..to],
             &self.decomp_coefficients[from..to],
+            swapped,
         ))
     }
 }
 
-/// Incremental builder used during `LieSeries::new`: pairs arrive
+/// Incremental builder used during `LieSeries::new`: canonical pairs arrive
 /// row-major (`i` ascending, `j` ascending within a row) as the
 /// structure constants are computed.
 pub(crate) struct Builder<U> {
@@ -73,6 +105,10 @@ impl<U: Clone> Builder<U> {
         }
     }
 
+    /// Records the decomposition of the canonical pair `(i, j)`
+    /// with `i < j`. Callers must push pairs in row-major order
+    /// (`i` ascending, `j > i` ascending within a row) and must
+    /// not push infeasible pairs.
     pub(crate) fn push(&mut self, i: usize, j: usize, indices: &[usize], coefficients: &[U]) {
         self.rows[i].push((
             u32::try_from(j).expect("basis index exceeds u32"),
@@ -135,7 +171,7 @@ mod test {
         let mut b = Builder::<f64>::new(3);
         b.push(0, 1, &[2, 0], &[1.5, -2.0]);
         b.push(0, 2, &[1], &[0.25]);
-        b.push(2, 0, &[], &[]);
+        b.push(1, 2, &[], &[]);
         let t = b.finish();
 
         assert_eq!(t.num_rows(), 3);
@@ -149,13 +185,17 @@ mod test {
         assert_eq!(row0[1].0, 2);
         assert_eq!(row0[1].1, &[1u32]);
 
-        assert_eq!(t.row(1).count(), 0);
+        let row1 = t.row(1).collect::<Vec<_>>();
+        assert_eq!(row1.len(), 1);
+        assert_eq!(row1[0].0, 2);
+        assert_eq!(row1[0].1, &[] as &[u32]);
+        assert_eq!(row1[0].2, &[] as &[f64]);
 
-        let row2 = t.row(2).collect::<Vec<_>>();
-        assert_eq!(row2.len(), 1);
-        assert_eq!(row2[0].0, 0);
-        assert_eq!(row2[0].1, &[]);
-        assert_eq!(row2[0].2, &[]);
+        assert_eq!(t.row(2).count(), 0);
+
+        assert_eq!(t.get(0, 1), Some((&[2u32, 0][..], &[1.5, -2.0][..], false)));
+        assert_eq!(t.get(1, 0), Some((&[2u32, 0][..], &[1.5, -2.0][..], true)));
+        assert_eq!(t.get(2, 1), Some((&[] as &[u32], &[] as &[f64], true)));
     }
 
     #[test]
