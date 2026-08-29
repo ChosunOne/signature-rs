@@ -289,7 +289,10 @@ impl<
     /// the paths represented by `self` and `rhs`. The result captures the geometry
     /// of the combined path.
     #[must_use]
-    pub fn concatenate(&self, rhs: &Self) -> Self {
+    pub fn concatenate(&self, rhs: &Self) -> Self
+    where
+        U: Send + Sync,
+    {
         let mut concatenated_log_sig = self.clone();
 
         concatenated_log_sig.concatenate_assign(rhs);
@@ -301,11 +304,17 @@ impl<
     ///
     /// This is the mutable version of `concatenate` that modifies `self` instead
     /// of creating a new log signature. More memory-efficient for chaining operations.
-    pub fn concatenate_assign(&mut self, rhs: &Self) {
+    pub fn concatenate_assign(&mut self, rhs: &Self)
+    where
+        U: Send + Sync,
+    {
         self.concatenate_assign_coefficients(&rhs.series.coefficients);
     }
 
-    pub(crate) fn concatenate_assign_coefficients(&mut self, rhs_coefficients: &[U]) {
+    pub(crate) fn concatenate_assign_coefficients(&mut self, rhs_coefficients: &[U])
+    where
+        U: Send + Sync,
+    {
         let original_coefficients = self.series.coefficients.clone();
 
         let a_nonzero = self
@@ -787,4 +796,156 @@ mod test {
             assert_eq!(concat_c, full_path_c);
         }
     }
+
+    /// Differential test: after the first fold (which builds the node lists
+    /// through the collecting pass), the steady level-batch evaluation must
+    /// produce bit-identical node buffers to a fresh DAG's collecting
+    /// rebuild — the oracle — for every subsequent fold.
+    #[test]
+    fn steady_batch_matches_rebuild_oracle() {
+        use ordered_float::NotNan;
+
+        for (d, m, folds) in [(3usize, 3usize, 6), (3, 4, 6), (2, 8, 6), (4, 5, 4)] {
+            let builder = LogSignatureBuilder::<u8>::new()
+                .with_num_dimensions(d)
+                .with_max_degree(m);
+            let mut log_sig = builder.build::<NotNan<f64>>();
+
+            let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+                d,
+                lyndon_rs::lyndon::Sort::Lexicographical,
+            )
+            .generate_basis(m);
+            let mut seed = 0x5eed_u64;
+            let mut lcg = |seed: &mut u64| {
+                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((*seed >> 33) as i64) as f64
+            };
+            let acc: Vec<NotNan<f64>> = (0..basis.len())
+                .map(|_| NotNan::new(lcg(&mut seed)).unwrap())
+                .collect();
+            log_sig.series.coefficients.clone_from(&acc);
+
+            for fold in 0..folds {
+                // Alternate letter-only displacements (the production fold's
+                // regime) with dense ones (worst case for the gating).
+                let dense = fold % 2 == 1;
+                let disp: Vec<NotNan<f64>> = (0..basis.len())
+                    .map(|k| {
+                        NotNan::new(if dense || k < d { lcg(&mut seed) } else { 0.0 }).unwrap()
+                    })
+                    .collect();
+                let mut disp_sig = builder.build::<NotNan<f64>>();
+                disp_sig.series.coefficients.clone_from(&disp);
+
+                let original = log_sig.series.coefficients.clone();
+                let a_nonzero = log_sig.series.nonzero_coefficient_indices(&original);
+                let b_nonzero = log_sig.series.nonzero_coefficient_indices(&disp);
+                log_sig.dag.evaluate(
+                    &log_sig.series,
+                    &original,
+                    &a_nonzero,
+                    &disp,
+                    &b_nonzero,
+                );
+
+                // Oracle: a fresh DAG has no lists, so its evaluate takes the
+                // collecting-rebuild path with the identical inputs.
+                let mut oracle = CommutatorDag::<NotNan<f64>>::from_bch_series(
+                    &log_sig.bch_series,
+                );
+                oracle.evaluate(&log_sig.series, &original, &a_nonzero, &disp, &b_nonzero);
+                for (k, (buf, reff)) in
+                    log_sig.dag.buffers.iter().zip(&oracle.buffers).enumerate()
+                {
+                    assert_eq!(
+                        buf.len(),
+                        reff.len(),
+                        "d={d} m={m} fold={fold}: node {} buffer lengths differ",
+                        k + 2
+                    );
+                    for (i, (x, y)) in buf.iter().zip(reff.iter()).enumerate() {
+                        assert!(
+                            x == y,
+                            "d={d} m={m} fold={fold}: node {} index {} differs: {x:?} vs {y:?}",
+                            k + 2,
+                            i
+                        );
+                    }
+                }
+
+                // Complete the fold so the next one sees the evolved
+                // accumulator (and the steady-batch lists).
+                for (source, weight) in log_sig.dag.terms() {
+                    let ct: &[NotNan<f64>] = match source {
+                        TermSource::Node(node) => log_sig.dag.buffer(node),
+                        TermSource::Displacement => &disp,
+                    };
+                    for (c, comm) in log_sig.series.coefficients.iter_mut().zip(ct) {
+                        *c += comm.clone() * weight.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fold-step probe for large grids, env-gated so normal test runs skip it.
+    /// PROF_GRID="d,m" PROF_FOLDS=n cargo test --release -p signature-rs --lib bench_probe -- --nocapture
+    /// Builds the series ONCE (the O(D^2) table build dominates), then times
+    /// steady-state letter-displacement folds. RAYON_NUM_THREADS selects the
+    /// regime under test.
+    #[test]
+    fn probe_large_grid_folds() {
+        let Some(grid) = std::env::var_os("PROF_GRID") else { return };
+        let grid = grid.to_str().unwrap().to_owned();
+        let (d, m) = grid.split_once(',').unwrap();
+        let (d, m) = (d.parse::<usize>().unwrap(), m.parse::<usize>().unwrap());
+        let folds: usize = std::env::var("PROF_FOLDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+
+        use ordered_float::NotNan;
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let t = std::time::Instant::now();
+        let mut log_sig = builder.build::<NotNan<f64>>();
+        let build = t.elapsed();
+        println!("PROBE d={d} m={m} D={} series_build={build:?}", log_sig.series.coefficients.len());
+
+        let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+            d,
+            lyndon_rs::lyndon::Sort::Lexicographical,
+        )
+        .generate_basis(m);
+        let mut seed = 0xfeed_u64;
+        let mut lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) as i64) as f64
+        };
+        let acc: Vec<NotNan<f64>> = (0..basis.len())
+            .map(|_| NotNan::new(lcg(&mut seed)).unwrap())
+            .collect();
+        log_sig.series.coefficients.clone_from(&acc);
+        let disp: Vec<NotNan<f64>> = (0..basis.len())
+            .map(|k| NotNan::new(if k < d { lcg(&mut seed) } else { 0.0 }).unwrap())
+            .collect();
+        let mut seg = log_sig.clone();
+        seg.series.coefficients.clone_from(&disp);
+
+        // warm: the first fold takes the collecting-rebuild path, the rest
+        // run the steady level-batch
+        for _ in 0..4 {
+            log_sig.concatenate_assign(&seg);
+        }
+        let t = std::time::Instant::now();
+        for k in 0..folds {
+            log_sig.concatenate_assign(&seg);
+            std::hint::black_box(&log_sig);
+            if k + 1 == folds {
+                println!("PROBE d={d} m={m} threads={} fold={:?} ({} folds)",
+                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+                    t.elapsed() / (folds as u32), folds);
+            }
+        }
+    }
+
 }
