@@ -8,6 +8,8 @@ use lyndon_rs::generators::Generator;
 use lyndon_rs::lyndon::LyndonWord;
 use num_traits::{One, Zero};
 
+use crate::feasible_decompositions::{Builder, FeasibleDecompositions};
+
 #[cfg(feature = "progress")]
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -22,15 +24,9 @@ pub struct LieSeries<T, U> {
     /// The commutator representation of the Lyndon basis elements.
     pub commutator_basis: Vec<CommutatorTerm<U, T>>,
     /// Maps arbitrary commutator terms to their decomposition in the basis.
-    ///
-    /// Invariant: no entry in these tables has a zero coefficient; zeros are
-    /// filtered at construction time in [`LieSeries::new`].
-    pub commutator_basis_map: Vec<Vec<usize>>,
-    /// Maps arbitrary commutator terms to their decomposition coefficients in the basis.
-    ///
-    /// Invariant: no entry in these tables has a zero coefficient; zeros are
-    /// filtered at construction time in [`LieSeries::new`].
-    pub commutator_basis_map_coefficients: Vec<Vec<U>>,
+    /// Invariant: no stored decomposition has a zero coefficient.
+    pub(crate) feasible_decompositions: FeasibleDecompositions<U>,
+
     /// Maps basis elements to their index positions for efficient lookup.
     pub commutator_basis_index_map: HashMap<u64, usize>,
     /// The coefficients corresponding to each basis element.
@@ -44,10 +40,9 @@ impl<T: Debug, U: Debug> Debug for LieSeries<T, U> {
         f.debug_struct("LieSeries")
             .field("basis", &self.basis)
             .field("commutator_basis", &self.commutator_basis)
-            .field("commutator_basis_map", &self.commutator_basis_map)
             .field(
-                "commutator_basis_map_coefficients",
-                &self.commutator_basis_map_coefficients,
+                "feasible_decompositions",
+                &self.feasible_decompositions.len(),
             )
             .field(
                 "commutator_basis_index_map",
@@ -82,10 +77,9 @@ impl<T: Clone, U: Clone> Clone for LieSeries<T, U> {
         Self {
             basis: self.basis.clone(),
             commutator_basis: self.commutator_basis.clone(),
-            commutator_basis_map: self.commutator_basis_map.clone(),
-            commutator_basis_map_coefficients: self.commutator_basis_map_coefficients.clone(),
             commutator_basis_index_map: self.commutator_basis_index_map.clone(),
             coefficients: self.coefficients.clone(),
+            feasible_decompositions: self.feasible_decompositions.clone(),
             max_degree: self.max_degree,
         }
     }
@@ -304,8 +298,8 @@ impl<
         #[cfg(feature = "tracing")]
         tracing::debug!("built commutator basis maps");
 
-        let mut commutator_basis_map = vec![vec![]; basis.len() * basis.len()];
-        let mut commutator_basis_map_coefficients = vec![vec![]; basis.len() * basis.len()];
+        let mut feasible_builder = Builder::new(basis.len());
+
         #[cfg(feature = "tracing")]
         let _structure_constants_span = tracing::debug_span!(
             "compute_structure_constants",
@@ -375,8 +369,7 @@ impl<
                     terms = basis_term_indices.len(),
                     "decomposed commutator into basis terms"
                 );
-                commutator_basis_map_coefficients[i * basis.len() + j] = basis_term_coefficients;
-                commutator_basis_map[i * basis.len() + j] = basis_term_indices;
+                feasible_builder.push(i, j, &basis_term_indices, &basis_term_coefficients);
             }
         }
 
@@ -390,12 +383,20 @@ impl<
         Self {
             basis,
             commutator_basis,
-            commutator_basis_map,
-            commutator_basis_map_coefficients,
             commutator_basis_index_map,
             coefficients,
+            feasible_decompositions: feasible_builder.finish(),
             max_degree,
         }
+    }
+}
+
+impl<T, U> LieSeries<T, U> {
+    /// Decomposition of the bracket `[basis[i], basis[j]]` onto the basis,
+    /// for pairs stored in the feasible table (`i != j` and degree-feasible).
+    /// Returns parallel slices (basis indices, non-zero coefficients).
+    pub fn decomposition(&self, i: usize, j: usize) -> Option<(&[u32], &[U])> {
+        self.feasible_decompositions.get(i, j)
     }
 }
 
@@ -462,37 +463,25 @@ impl<
             "computing commutator coefficients"
         );
 
+        let mut b_present = vec![0u64; a_series.basis.len().div_ceil(64)];
+        for &j in b_nonzero {
+            b_present[j / 64] |= 1u64 << (j % 64);
+        }
+
         for &i in a_nonzero {
-            let a: &CommutatorTerm<U, T> = &a_series.commutator_basis[i];
-            for &j in b_nonzero {
-                let b = &a_series.commutator_basis[j];
-                if i == j {
+            let a_coefficient = a_coefficients[i].clone();
+            for (j, basis_indices, basis_coefficients) in a_series.feasible_decompositions.row(i) {
+                if b_present[j / 64] & (1u64 << (j % 64)) == 0 {
                     continue;
                 }
+                let b_coefficient = &b_coefficients[j];
 
-                if a.degree() + b.degree() > a_series.max_degree {
-                    #[cfg(feature = "tracing")]
-                    tracing::trace!(i, j, "skipping pair above max degree");
-                    break;
-                }
-
-                // For some non lyndon term T_{ij} = [T_i, T_j]
-                // Get the indices of the lyndon basis terms T_{ij} -> [c_1 * A, c_2 * B, c_3 * C, ...]
-                // [i_A, i_B, i_C, ..., i_n]
-                let basis_indices: &[usize] =
-                    &a_series.commutator_basis_map[i * a_series.basis.len() + j];
-                // Get the coefficients of the basis terms
-                // [c_1, c_2, c_3, ..., c_n]
-                let basis_coefficients: &[U] =
-                    &a_series.commutator_basis_map_coefficients[i * a_series.basis.len() + j];
                 // Perform L_new[i_n] += c_n * L_a[i] * L_b[j]
                 for (&basis_index, basis_coefficient) in
                     basis_indices.iter().zip(basis_coefficients)
                 {
-                    *unsafe { result_coefficients.get_unchecked_mut(basis_index) } +=
-                        basis_coefficient.clone()
-                            * a_coefficients[i].clone()
-                            * b_coefficients[j].clone();
+                    *unsafe { result_coefficients.get_unchecked_mut(basis_index as usize) } +=
+                        basis_coefficient.clone() * a_coefficient.clone() * b_coefficient.clone();
                 }
             }
         }
@@ -628,6 +617,77 @@ mod test {
                 "{i}: {c:?} != {:?}",
                 expected_coefficients[i]
             );
+        }
+    }
+
+    #[test]
+    fn decompositions_contain_no_zero_coefficients() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use ordered_float::NotNan;
+
+        for (d, m) in [(2usize, 6usize), (3, 5), (4, 4)] {
+            let words = LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let series = LieSeries::<u8, NotNan<f64>>::new(words, Vec::new());
+            assert!(
+                (0..series.feasible_decompositions.num_rows())
+                    .flat_map(|i| series.feasible_decompositions.row(i))
+                    .flat_map(|(_, _, coefficients)| coefficients)
+                    .all(|c| !c.is_zero()),
+                "zero coefficient found in decompositions for d={d}, m={m}"
+            );
+        }
+    }
+
+    #[test]
+    fn feasible_decompositions_match_independent_recomputation() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use ordered_float::NotNan;
+
+        for (d, m) in [(2usize, 6usize), (3, 5), (4, 4)] {
+            let words = LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let series = LieSeries::<u8, NotNan<f64>>::new(words, Vec::new());
+            let d_len = series.commutator_basis.len();
+            let degree = |x: usize| series.commutator_basis[x].degree();
+            let index_of = |term: &CommutatorTerm<NotNan<f64>, u8>| {
+                series.commutator_basis_index_map[&term.unit_hash()]
+            };
+            let basis_set: HashSet<_> = series
+                .commutator_basis
+                .iter()
+                .map(CommutatorTerm::unit_hash)
+                .collect();
+
+            let mut feasible = 0;
+            for i in 0..d_len {
+                let row: Vec<_> = series.feasible_decompositions.row(i).collect();
+                assert!(row.windows(2).all(|w| w[0].0 < w[1].0), "j not ascending");
+
+                for (j, indices, coefficients) in &row {
+                    assert_ne!(i, *j);
+                    assert!(degree(i) + degree(*j) <= m, "infeasible pair stored");
+
+                    let mut term = comm![&series.commutator_basis[i], &series.commutator_basis[*j]];
+                    term.lyndon_sort();
+                    let expected: Vec<_> = term
+                        .lyndon_basis_decomposition(&basis_set)
+                        .into_iter()
+                        .filter(|x| !x.coefficient().is_zero())
+                        .collect();
+                    let expected_indices: Vec<u32> =
+                        expected.iter().map(|x| index_of(x) as u32).collect();
+                    let expected_coefficients: Vec<_> =
+                        expected.iter().map(|x| x.coefficient().clone()).collect();
+
+                    assert_eq!(*indices, &expected_indices[..], "(i={i}, j={j}) indices");
+                    assert_eq!(
+                        *coefficients,
+                        &expected_coefficients[..],
+                        "(i={i}, j={j}) coeffs"
+                    );
+                    feasible += 1;
+                }
+            }
+            assert_eq!(series.feasible_decompositions.len(), feasible);
         }
     }
 }

@@ -391,7 +391,6 @@ fn evaluate_commutator_term<
                 let b = &b_res.0;
                 let b_nonzero = &b_res.1;
                 let mut coefficients = vec![U::default(); a_coefficients.len()];
-                let nonzero = series.nonzero_coefficient_indices(&coefficients);
                 LieSeries::commutator_coefficients_with_nonzero(
                     series,
                     a,
@@ -400,6 +399,7 @@ fn evaluate_commutator_term<
                     b_nonzero,
                     &mut coefficients,
                 );
+                let nonzero = series.nonzero_coefficient_indices(&coefficients);
                 computed_commutations.insert(t, (coefficients, nonzero));
                 &computed_commutations[t]
             }

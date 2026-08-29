@@ -30,6 +30,7 @@
 mod bch;
 pub mod bch_series_generator;
 mod constants;
+mod feasible_decompositions;
 pub mod lie_series;
 pub mod rooted_tree;
 

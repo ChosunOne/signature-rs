@@ -35,10 +35,12 @@ impl<R: Runtime, T: Numeric + CubeElement> Clone for LieSeriesCLData<R, T> {
 
 impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
     pub fn new(client: &ComputeClient<R>, lie_series: &LieSeries<u8, impl Into<T> + Copy>) -> Self {
-        let max_basis_terms = lie_series
-            .commutator_basis_map
-            .iter()
-            .fold(0, |x, y| usize::max(x, y.len()));
+        let max_basis_terms = (0..lie_series.coefficients.len())
+            .flat_map(|i| (0..lie_series.coefficients.len()).map(move |j| (i, j)))
+            .filter_map(|(i, j)| lie_series.decomposition(i, j))
+            .map(|(indices, _)| indices.len())
+            .max()
+            .unwrap_or(0);
         let basis_map_shape = vec![
             lie_series.commutator_basis.len(),
             lie_series.commutator_basis.len(),
@@ -49,10 +51,8 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
 
         for i in 0..lie_series.coefficients.len() {
             for j in 0..lie_series.coefficients.len() {
-                let basis_indices =
-                    &lie_series.commutator_basis_map[i * lie_series.basis.len() + j];
-                let basis_coefficients =
-                    &lie_series.commutator_basis_map_coefficients[i * lie_series.basis.len() + j];
+                let (basis_indices, basis_coefficients) =
+                    lie_series.decomposition(i, j).unwrap_or((&[], &[]));
                 for k in 0..max_basis_terms {
                     if k >= basis_indices.len() {
                         basis_map_padded.push(-1i32);
@@ -110,10 +110,12 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
         client: &ComputeClient<R>,
         lie_series: &LieSeries<u8, impl Into<T> + Copy>,
     ) -> Self {
-        let max_basis_terms = lie_series
-            .commutator_basis_map
-            .iter()
-            .fold(0, |x, y| usize::max(x, y.len()));
+        let max_basis_terms = (0..lie_series.coefficients.len())
+            .flat_map(|i| (0..lie_series.coefficients.len()).map(move |j| (i, j)))
+            .filter_map(|(i, j)| lie_series.decomposition(i, j))
+            .map(|(indices, _)| indices.len())
+            .max()
+            .unwrap_or(0);
         let basis_map_shape = vec![
             lie_series.commutator_basis.len(),
             lie_series.commutator_basis.len(),
@@ -123,10 +125,8 @@ impl<R: Runtime, T: Numeric + CubeElement> LieSeriesCLData<R, T> {
         let mut basis_coefficients_padded = vec![];
         for i in 0..lie_series.coefficients.len() {
             for j in 0..lie_series.coefficients.len() {
-                let basis_indices =
-                    &lie_series.commutator_basis_map[i * lie_series.basis.len() + j];
-                let basis_coefficients =
-                    &lie_series.commutator_basis_map_coefficients[i * lie_series.basis.len() + j];
+                let (basis_indices, basis_coefficients) =
+                    lie_series.decomposition(i, j).unwrap_or((&[], &[]));
                 for k in 0..max_basis_terms {
                     if k >= basis_indices.len() {
                         basis_map_padded.push(-1i32);
