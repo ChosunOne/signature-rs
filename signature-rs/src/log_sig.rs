@@ -300,6 +300,11 @@ impl<
         let mut computed_commutations = HashMap::new();
         let original_coefficients = self.series.coefficients.clone();
 
+        let a_nonzero = self
+            .series
+            .nonzero_coefficient_indices(&original_coefficients);
+        let b_nonzero = self.series.nonzero_coefficient_indices(rhs_coefficients);
+
         for (i, term) in self
             .bch_series
             .commutator_basis
@@ -312,10 +317,13 @@ impl<
                 term,
                 &self.series,
                 &original_coefficients,
+                &a_nonzero,
                 rhs_coefficients,
+                &b_nonzero,
                 &mut computed_commutations,
             );
-            for (self_coeff, comm_coeff) in &mut self.series.coefficients.iter_mut().zip(ct.iter())
+            for (self_coeff, comm_coeff) in
+                &mut self.series.coefficients.iter_mut().zip(ct.0.iter())
             {
                 *self_coeff += comm_coeff.clone() * self.bch_series[i].clone();
             }
@@ -336,16 +344,18 @@ fn evaluate_commutator_term<
     term: &'b CommutatorTerm<U, u8>,
     series: &LieSeries<T, U>,
     a_coefficients: &[U],
+    a_nonzero: &[usize],
     b_coefficients: &[U],
-    computed_commutations: &'a mut HashMap<&'b CommutatorTerm<U, u8>, Vec<U>>,
-) -> &'a [U] {
+    b_nonzero: &[usize],
+    computed_commutations: &'a mut HashMap<&'b CommutatorTerm<U, u8>, (Vec<U>, Vec<usize>)>,
+) -> &'a (Vec<U>, Vec<usize>) {
     match term {
         t @ &CommutatorTerm::Atom { atom: a, .. } => {
             if a == 0 {
-                computed_commutations.insert(t, a_coefficients.to_vec());
+                computed_commutations.insert(t, (a_coefficients.to_vec(), a_nonzero.to_vec()));
                 &computed_commutations[t]
             } else {
-                computed_commutations.insert(t, b_coefficients.to_vec());
+                computed_commutations.insert(t, (b_coefficients.to_vec(), b_nonzero.to_vec()));
                 &computed_commutations[t]
             }
         }
@@ -355,25 +365,42 @@ fn evaluate_commutator_term<
             }
             // SAFETY: Commutator terms form trees
             unsafe {
-                let map_ptr =
-                    computed_commutations as *mut HashMap<&'b CommutatorTerm<U, u8>, Vec<U>>;
-                let a = evaluate_commutator_term(
+                let map_ptr = std::ptr::from_mut::<
+                    HashMap<&'b CommutatorTerm<U, u8>, (Vec<U>, Vec<usize>)>,
+                >(computed_commutations);
+                let a_res = evaluate_commutator_term(
                     left,
                     series,
                     a_coefficients,
+                    a_nonzero,
                     b_coefficients,
+                    b_nonzero,
                     &mut *map_ptr,
                 );
-                let b = evaluate_commutator_term(
+                let b_res = evaluate_commutator_term(
                     right,
                     series,
                     a_coefficients,
+                    a_nonzero,
                     b_coefficients,
+                    b_nonzero,
                     &mut *map_ptr,
                 );
+                let a = &a_res.0;
+                let a_nonzero = &a_res.1;
+                let b = &b_res.0;
+                let b_nonzero = &b_res.1;
                 let mut coefficients = vec![U::default(); a_coefficients.len()];
-                LieSeries::commutator_coefficients(series, a, b, &mut coefficients);
-                computed_commutations.insert(t, coefficients);
+                let nonzero = series.nonzero_coefficient_indices(&coefficients);
+                LieSeries::commutator_coefficients_with_nonzero(
+                    series,
+                    a,
+                    a_nonzero,
+                    b,
+                    b_nonzero,
+                    &mut coefficients,
+                );
+                computed_commutations.insert(t, (coefficients, nonzero));
                 &computed_commutations[t]
             }
         }

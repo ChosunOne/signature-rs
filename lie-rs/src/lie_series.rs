@@ -22,8 +22,14 @@ pub struct LieSeries<T, U> {
     /// The commutator representation of the Lyndon basis elements.
     pub commutator_basis: Vec<CommutatorTerm<U, T>>,
     /// Maps arbitrary commutator terms to their decomposition in the basis.
+    ///
+    /// Invariant: no entry in these tables has a zero coefficient; zeros are
+    /// filtered at construction time in [`LieSeries::new`].
     pub commutator_basis_map: Vec<Vec<usize>>,
     /// Maps arbitrary commutator terms to their decomposition coefficients in the basis.
+    ///
+    /// Invariant: no entry in these tables has a zero coefficient; zeros are
+    /// filtered at construction time in [`LieSeries::new`].
     pub commutator_basis_map_coefficients: Vec<Vec<U>>,
     /// Maps basis elements to their index positions for efficient lookup.
     pub commutator_basis_index_map: HashMap<u64, usize>,
@@ -325,10 +331,14 @@ impl<
             }
             #[cfg(feature = "tracing")]
             if i == 0 || commutator_basis[i - 1].degree() != a.degree() {
-                tracing::debug!(row = i, degree = a.degree(), "computing structure constants");
+                tracing::debug!(
+                    row = i,
+                    degree = a.degree(),
+                    "computing structure constants"
+                );
             }
             for (j, b) in commutator_basis.iter().enumerate() {
-                if a == b || max_degree < a.degree() + b.degree() {
+                if i == j || max_degree < a.degree() + b.degree() {
                     continue;
                 }
                 #[cfg(feature = "tracing")]
@@ -342,7 +352,11 @@ impl<
                 // T -> [c_1 * A, c_2 * B, c_3 * C, ...]
                 #[cfg(feature = "tracing")]
                 tracing::trace!(i, j, "decomposing into Lyndon basis");
-                let basis_terms = term.lyndon_basis_decomposition(&commutator_basis_set);
+                let basis_terms = term
+                    .lyndon_basis_decomposition(&commutator_basis_set)
+                    .into_iter()
+                    .filter(|x| !x.coefficient().is_zero())
+                    .collect::<Vec<_>>();
                 // Get the coefficients [c_1, c_2, c_3, ...]
                 let basis_term_coefficients = basis_terms
                     .iter()
@@ -367,7 +381,10 @@ impl<
         }
 
         #[cfg(feature = "tracing")]
-        tracing::debug!(basis_len = basis.len(), "finished computing structure constants");
+        tracing::debug!(
+            basis_len = basis.len(),
+            "finished computing structure constants"
+        );
         #[cfg(feature = "progress")]
         pb.finish_with_message("done");
         Self {
@@ -387,6 +404,18 @@ impl<
     U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign,
 > LieSeries<T, U>
 {
+    /// Indices of non-zero coefficients that the commutation kernel will
+    /// actually use: non-zero values on basis elements below `max_degree`.
+    pub fn nonzero_coefficient_indices(&self, coefficients: &[U]) -> Vec<usize> {
+        coefficients
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_zero())
+            .filter(|(i, _c)| self.commutator_basis[*i].degree() != self.max_degree)
+            .map(|x| x.0)
+            .collect()
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -405,30 +434,37 @@ impl<
         b_coefficients: &[U],
         result_coefficients: &mut [U],
     ) {
-        let nonzero_coefficients = a_coefficients
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.is_zero())
-            .filter(|(i, _)| a_series.commutator_basis[*i].degree() != a_series.max_degree)
-            .map(|x| x.0)
-            .collect::<Vec<_>>();
-        let other_nonzero_coefficients = b_coefficients
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.is_zero())
-            .filter(|(i, _)| a_series.commutator_basis[*i].degree() != a_series.max_degree)
-            .map(|x| x.0);
+        let a_nonzero = a_series.nonzero_coefficient_indices(a_coefficients);
+        let b_nonzero = a_series.nonzero_coefficient_indices(b_coefficients);
 
+        LieSeries::commutator_coefficients_with_nonzero(
+            a_series,
+            a_coefficients,
+            &a_nonzero,
+            b_coefficients,
+            &b_nonzero,
+            result_coefficients,
+        );
+    }
+
+    pub fn commutator_coefficients_with_nonzero(
+        a_series: &LieSeries<T, U>,
+        a_coefficients: &[U],
+        a_nonzero: &[usize],
+        b_coefficients: &[U],
+        b_nonzero: &[usize],
+        result_coefficients: &mut [U],
+    ) {
         #[cfg(feature = "tracing")]
         tracing::debug!(
-            nonzero_a = nonzero_coefficients.len(),
-            nonzero_b = other_nonzero_coefficients.clone().count(),
+            nonzero_a = a_nonzero.len(),
+            nonzero_b = b_nonzero.len(),
             "computing commutator coefficients"
         );
 
-        for i in nonzero_coefficients {
+        for &i in a_nonzero {
             let a: &CommutatorTerm<U, T> = &a_series.commutator_basis[i];
-            for j in other_nonzero_coefficients.clone() {
+            for &j in b_nonzero {
                 let b = &a_series.commutator_basis[j];
                 if i == j {
                     continue;
@@ -450,14 +486,13 @@ impl<
                 let basis_coefficients: &[U] =
                     &a_series.commutator_basis_map_coefficients[i * a_series.basis.len() + j];
                 // Perform L_new[i_n] += c_n * L_a[i] * L_b[j]
-                for (&basis_index, basis_coefficient) in basis_indices
-                    .iter()
-                    .zip(basis_coefficients)
-                    .filter(|(_, b_c)| !b_c.is_zero())
+                for (&basis_index, basis_coefficient) in
+                    basis_indices.iter().zip(basis_coefficients)
                 {
-                    result_coefficients[basis_index] += basis_coefficient.clone()
-                        * a_coefficients[i].clone()
-                        * b_coefficients[j].clone();
+                    *unsafe { result_coefficients.get_unchecked_mut(basis_index) } +=
+                        basis_coefficient.clone()
+                            * a_coefficients[i].clone()
+                            * b_coefficients[j].clone();
                 }
             }
         }
