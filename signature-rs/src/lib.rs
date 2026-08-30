@@ -17,6 +17,7 @@
 //! let log_sig = builder.build_from_path(&path.view());
 //! ```
 
+pub(crate) mod commutator_dag;
 pub mod log_sig;
 
 // Re-export main types for convenience

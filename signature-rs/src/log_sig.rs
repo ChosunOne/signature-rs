@@ -1,4 +1,3 @@
-use commutator_rs::CommutatorTerm;
 use lie_rs::LieSeriesGenerator;
 use lie_rs::{LieSeries, bch_series_generator::BchSeriesGenerator};
 use lyndon_rs::lyndon::LyndonWord;
@@ -11,11 +10,12 @@ use ndarray::{ArrayView, Axis, Dimension, RemoveAxis};
 use num_traits::{FromPrimitive, One, Zero};
 use std::ops::{Mul, Sub};
 use std::{
-    collections::HashMap,
     fmt::Debug,
     hash::Hash,
     ops::{AddAssign, Div, Index, IndexMut, MulAssign, Neg, SubAssign},
 };
+
+use crate::commutator_dag::{CommutatorDag, TermSource};
 
 /// Builder for constructing log signatures from path data.
 ///
@@ -125,10 +125,15 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
     ) -> LogSignature<T, U> {
         let bch_basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
         let bch_series = BchSeriesGenerator::new(bch_basis, self.max_degree).generate_lie_series();
+        let dag = CommutatorDag::from_bch_series(&bch_series);
         let basis = self.lyndon_basis.generate_basis(self.max_degree);
         let coefficients = vec![U::default(); basis.len()];
         let series = LieSeries::<T, U>::new(basis, coefficients);
-        LogSignature::<T, U> { series, bch_series }
+        LogSignature::<T, U> {
+            series,
+            bch_series,
+            dag,
+        }
     }
 
     /// Computes the log signature of a path from multidimensional array data.
@@ -182,6 +187,8 @@ pub struct LogSignature<T, U> {
     pub series: LieSeries<T, U>,
     /// The BCH series used for concatenating log signatures.
     pub bch_series: LieSeries<u8, U>,
+    /// Compiled evaluation plan for [`LogSignature::concatenate_assign`]
+    dag: CommutatorDag<U>,
 }
 
 impl<T: Debug, U: Debug> Debug for LogSignature<T, U> {
@@ -189,6 +196,7 @@ impl<T: Debug, U: Debug> Debug for LogSignature<T, U> {
         f.debug_struct("LogSignature")
             .field("series", &self.series)
             .field("bch_series", &self.bch_series)
+            .field("dag", &self.dag)
             .finish()
     }
 }
@@ -198,6 +206,7 @@ impl<T: Clone, U: Clone> Clone for LogSignature<T, U> {
         Self {
             series: self.series.clone(),
             bch_series: self.bch_series.clone(),
+            dag: self.dag.clone_shallow(),
         }
     }
 }
@@ -297,7 +306,6 @@ impl<
     }
 
     pub(crate) fn concatenate_assign_coefficients(&mut self, rhs_coefficients: &[U]) {
-        let mut computed_commutations = HashMap::new();
         let original_coefficients = self.series.coefficients.clone();
 
         let a_nonzero = self
@@ -305,103 +313,21 @@ impl<
             .nonzero_coefficient_indices(&original_coefficients);
         let b_nonzero = self.series.nonzero_coefficient_indices(rhs_coefficients);
 
-        for (i, term) in self
-            .bch_series
-            .commutator_basis
-            .iter()
-            .filter(|x| !x.is_zero())
-            .enumerate()
-            .skip(1)
-        {
-            let ct = evaluate_commutator_term(
-                term,
-                &self.series,
-                &original_coefficients,
-                &a_nonzero,
-                rhs_coefficients,
-                &b_nonzero,
-                &mut computed_commutations,
-            );
-            for (self_coeff, comm_coeff) in
-                &mut self.series.coefficients.iter_mut().zip(ct.0.iter())
-            {
-                *self_coeff += comm_coeff.clone() * self.bch_series[i].clone();
-            }
-        }
-    }
-}
+        self.dag.evaluate(
+            &self.series,
+            &original_coefficients,
+            &a_nonzero,
+            rhs_coefficients,
+            &b_nonzero,
+        );
 
-/// Evaluates a commutator term by recursively applying the commutator operation.
-///
-/// This function interprets commutator expressions from the BCH series and applies
-/// them to concrete Lie series, using memoization to avoid recomputing identical subterms.
-fn evaluate_commutator_term<
-    'a,
-    'b: 'a,
-    T: Clone + Ord + Generator + Hash,
-    U: Clone + Eq + Hash + Default + One + Zero + MulAssign + Neg<Output = U> + AddAssign,
->(
-    term: &'b CommutatorTerm<U, u8>,
-    series: &LieSeries<T, U>,
-    a_coefficients: &[U],
-    a_nonzero: &[usize],
-    b_coefficients: &[U],
-    b_nonzero: &[usize],
-    computed_commutations: &'a mut HashMap<&'b CommutatorTerm<U, u8>, (Vec<U>, Vec<usize>)>,
-) -> &'a (Vec<U>, Vec<usize>) {
-    match term {
-        t @ &CommutatorTerm::Atom { atom: a, .. } => {
-            if a == 0 {
-                computed_commutations.insert(t, (a_coefficients.to_vec(), a_nonzero.to_vec()));
-                &computed_commutations[t]
-            } else {
-                computed_commutations.insert(t, (b_coefficients.to_vec(), b_nonzero.to_vec()));
-                &computed_commutations[t]
-            }
-        }
-        t @ CommutatorTerm::Expression { left, right, .. } => {
-            if computed_commutations.contains_key(t) {
-                return &computed_commutations[t];
-            }
-            // SAFETY: Commutator terms form trees
-            unsafe {
-                let map_ptr = std::ptr::from_mut::<
-                    HashMap<&'b CommutatorTerm<U, u8>, (Vec<U>, Vec<usize>)>,
-                >(computed_commutations);
-                let a_res = evaluate_commutator_term(
-                    left,
-                    series,
-                    a_coefficients,
-                    a_nonzero,
-                    b_coefficients,
-                    b_nonzero,
-                    &mut *map_ptr,
-                );
-                let b_res = evaluate_commutator_term(
-                    right,
-                    series,
-                    a_coefficients,
-                    a_nonzero,
-                    b_coefficients,
-                    b_nonzero,
-                    &mut *map_ptr,
-                );
-                let a = &a_res.0;
-                let a_nonzero = &a_res.1;
-                let b = &b_res.0;
-                let b_nonzero = &b_res.1;
-                let mut coefficients = vec![U::default(); a_coefficients.len()];
-                LieSeries::commutator_coefficients_with_nonzero(
-                    series,
-                    a,
-                    a_nonzero,
-                    b,
-                    b_nonzero,
-                    &mut coefficients,
-                );
-                let nonzero = series.nonzero_coefficient_indices(&coefficients);
-                computed_commutations.insert(t, (coefficients, nonzero));
-                &computed_commutations[t]
+        for (source, weight) in self.dag.terms() {
+            let ct: &[U] = match source {
+                TermSource::Node(node) => self.dag.buffer(node),
+                TermSource::Displacement => rhs_coefficients,
+            };
+            for (self_coeff, comm_coeff) in self.series.coefficients.iter_mut().zip(ct.iter()) {
+                *self_coeff += comm_coeff.clone() * weight.clone();
             }
         }
     }
