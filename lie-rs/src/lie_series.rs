@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::ops::{Add, AddAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub, SubAssign};
+use std::sync::Arc;
 
 use commutator_rs::{Commutator, CommutatorTerm, comm};
 use lyndon_rs::generators::Generator;
@@ -20,15 +21,15 @@ use indicatif::{ProgressBar, ProgressStyle};
 /// involving Baker-Campbell-Hausdorff series and other Lie algebraic operations.
 pub struct LieSeries<T, U> {
     /// The Lyndon word basis for the free Lie algebra.
-    pub basis: Vec<LyndonWord<T>>,
+    pub basis: Arc<Vec<LyndonWord<T>>>,
     /// The commutator representation of the Lyndon basis elements.
-    pub commutator_basis: Vec<CommutatorTerm<U, T>>,
+    pub commutator_basis: Arc<Vec<CommutatorTerm<U, T>>>,
     /// Maps arbitrary commutator terms to their decomposition in the basis.
     /// Invariant: no stored decomposition has a zero coefficient.
-    pub(crate) feasible_decompositions: FeasibleDecompositions<U>,
+    pub(crate) feasible_decompositions: Arc<FeasibleDecompositions<U>>,
 
     /// Maps basis elements to their index positions for efficient lookup.
-    pub commutator_basis_index_map: HashMap<u64, usize>,
+    pub commutator_basis_index_map: Arc<HashMap<u64, usize>>,
     /// The coefficients corresponding to each basis element.
     pub coefficients: Vec<U>,
     /// The maximum degree of terms included in this series.
@@ -59,7 +60,7 @@ impl<T: Display, U: Display + One + PartialEq> Display for LieSeries<T, U> {
         for (i, (coefficient, basis_term)) in self
             .coefficients
             .iter()
-            .zip(&self.commutator_basis)
+            .zip(self.commutator_basis.iter())
             .enumerate()
         {
             if i == 0 {
@@ -76,10 +77,10 @@ impl<T: Clone, U: Clone> Clone for LieSeries<T, U> {
     fn clone(&self) -> Self {
         Self {
             basis: self.basis.clone(),
-            commutator_basis: self.commutator_basis.clone(),
-            commutator_basis_index_map: self.commutator_basis_index_map.clone(),
+            commutator_basis: Arc::clone(&self.commutator_basis),
+            commutator_basis_index_map: Arc::clone(&self.commutator_basis_index_map),
             coefficients: self.coefficients.clone(),
-            feasible_decompositions: self.feasible_decompositions.clone(),
+            feasible_decompositions: Arc::clone(&self.feasible_decompositions),
             max_degree: self.max_degree,
         }
     }
@@ -381,17 +382,29 @@ impl<
         #[cfg(feature = "progress")]
         pb.finish_with_message("done");
         Self {
-            basis,
-            commutator_basis,
-            commutator_basis_index_map,
+            basis: Arc::new(basis),
+            commutator_basis: Arc::new(commutator_basis),
+            commutator_basis_index_map: Arc::new(commutator_basis_index_map),
             coefficients,
-            feasible_decompositions: feasible_builder.finish(),
+            feasible_decompositions: Arc::new(feasible_builder.finish()),
             max_degree,
         }
     }
 }
 
 impl<T, U> LieSeries<T, U> {
+    #[must_use]
+    pub fn with_coefficients(&self, coefficients: Vec<U>) -> Self {
+        Self {
+            basis: Arc::clone(&self.basis),
+            commutator_basis: Arc::clone(&self.commutator_basis),
+            feasible_decompositions: Arc::clone(&self.feasible_decompositions),
+            commutator_basis_index_map: Arc::clone(&self.commutator_basis_index_map),
+            coefficients,
+            max_degree: self.max_degree,
+        }
+    }
+
     /// Decomposition of the bracket `[basis[i], basis[j]]` onto the basis,
     /// for pairs stored in the feasible table (`i != j` and degree-feasible).
     /// Returns parallel slices (basis indices, non-zero coefficients).
@@ -600,7 +613,6 @@ impl<
 
     /// Calculates the lie bracket `[A, B]` for a lie series for terms within the commutator basis.
     fn commutator(&self, other: &Self) -> Self::Output {
-        let mut result = self.clone();
         let mut coefficients = vec![U::default(); self.coefficients.len()];
         LieSeries::<T, U>::commutator_coefficients(
             self,
@@ -609,8 +621,7 @@ impl<
             &other.coefficients,
             &mut coefficients,
         );
-        result.coefficients = coefficients;
-        result
+        self.with_coefficients(coefficients)
     }
 }
 
