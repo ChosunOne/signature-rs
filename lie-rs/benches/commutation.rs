@@ -1,5 +1,5 @@
 use commutator_rs::Commutator;
-use criterion::{BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lie_rs::LieSeries;
 use lyndon_rs::LyndonBasis;
 use ordered_float::NotNan;
@@ -34,9 +34,6 @@ fn make_series(d: usize, m: usize) -> (usize, LieSeries<u8, S>, LieSeries<u8, S>
 
 fn bench_commutation_kernel(c: &mut Criterion) {
     let mut group = c.benchmark_group("commutator_kernel");
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(5));
     for (d, m) in grid() {
         let (len, a, b, _) = make_series(d, m);
         group.bench_with_input(
@@ -61,9 +58,6 @@ fn bench_commutation_kernel(c: &mut Criterion) {
 
 fn bench_commutator(c: &mut Criterion) {
     let mut group = c.benchmark_group("commutator");
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(5));
     for (d, m) in grid() {
         let (_, a, b, _) = make_series(d, m);
         group.bench_with_input(
@@ -79,9 +73,6 @@ fn bench_commutator(c: &mut Criterion) {
 
 fn bench_lie_series_new(c: &mut Criterion) {
     let mut group = c.benchmark_group("lie_series_new");
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(5));
     for (d, m) in grid() {
         let (len, _, _, basis) = make_series(d, m);
         group.bench_with_input(

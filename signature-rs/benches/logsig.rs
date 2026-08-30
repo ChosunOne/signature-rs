@@ -58,9 +58,6 @@ const WARM_SEGMENTS: usize = 16;
 
 fn bench_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("build");
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(5));
     for (d, m) in grid() {
         let b = builder(d, m);
         group.bench_with_input(
@@ -97,9 +94,6 @@ fn bench_e2e(c: &mut Criterion) {
 
 fn bench_concat_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("concat_single");
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(5));
     for (d, m) in grid() {
         let b = builder(d, m);
         let path = synthetic_path(d, 200);

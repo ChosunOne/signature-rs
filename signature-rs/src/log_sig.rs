@@ -342,6 +342,68 @@ mod test {
 
     use super::*;
 
+    #[test]
+    fn dag_node_lists_cover_buffer_support() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (3usize, 5usize);
+        let builder: LogSignatureBuilder<u8> = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let mut log_sig: LogSignature<u8, NotNan<f64>> = builder.build::<NotNan<f64>>();
+
+        // Dense accumulator, then several letter-displacement folds: the   Not Committed Yet
+        // first fold goes through the collecting rebuild, later folds reuse
+        // the fixed-point lists.
+        let basis: Vec<LyndonWord<u8>> =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mut seed: u64 = 0xabcd_u64;
+        let mut lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) as i64) as f64
+        };
+        let acc: Vec<NotNan<f64>> = (0..basis.len())
+            .map(|_| NotNan::new(lcg(&mut seed)).unwrap())
+            .collect();
+        log_sig.series.coefficients.clone_from(&acc);
+
+        for _ in 0..4 {
+            let disp: Vec<NotNan<f64>> = (0..basis.len())
+                .map(|k| NotNan::new(if k < d { lcg(&mut seed) } else { 0.0 }).unwrap())
+                .collect();
+            let mut disp_sig: LogSignature<u8, NotNan<f64>> = builder.build::<NotNan<f64>>();
+            disp_sig.series.coefficients.clone_from(&disp);
+            log_sig.concatenate_assign(&disp_sig);
+
+            let dag: &CommutatorDag<NotNan<f64>> = &log_sig.dag;
+            let cutoff: usize = log_sig
+                .series
+                .commutator_basis
+                .iter()
+                .take_while(|w| w.degree() != m)
+                .count();
+            for k in 2..dag.structure.nodes.len() {
+                let buffer: &Vec<NotNan<f64>> = &dag.buffers[k - 2];
+                let list: &Vec<usize> = &dag.nonzeros[k - 2];
+                let mut sorted: Vec<usize> = list.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(
+                    sorted.len(),
+                    list.len(),
+                    "node {k}: list contains duplicate indices"
+                );
+                for (i, c) in buffer.iter().enumerate().take(cutoff) {
+                    assert!(
+                        c.is_zero() || list.contains(&i),
+                        "node {k}: index {i} is non-zero but not listed"
+                    );
+                }
+            }
+        }
+    }
+
     #[rstest]
     #[case(
         3,

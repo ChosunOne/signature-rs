@@ -299,7 +299,11 @@ impl<
         #[cfg(feature = "tracing")]
         tracing::debug!("built commutator basis maps");
 
-        let mut feasible_builder = Builder::new(basis.len());
+        let basis_degrees = commutator_basis
+            .iter()
+            .map(|w| u8::try_from(w.degree()).expect("word degree exceeds u8"))
+            .collect::<Vec<_>>();
+        let mut feasible_builder = Builder::new(&basis_degrees);
 
         #[cfg(feature = "tracing")]
         let _structure_constants_span = tracing::debug_span!(
@@ -414,17 +418,50 @@ impl<T, U> LieSeries<T, U> {
     }
 }
 
-fn scatter_decomposition<U: Clone + Mul<Output = U> + AddAssign>(
+pub(crate) trait ScatterSink {
+    #[inline(always)]
+    fn scatter(&mut self, _index: usize) {}
+}
+
+pub(crate) struct NoSink;
+
+impl ScatterSink for NoSink {}
+
+pub(crate) struct CollectSink<'a> {
+    dirty: &'a mut [u64],
+    out: &'a mut Vec<usize>,
+    cutoff: usize,
+}
+
+impl ScatterSink for CollectSink<'_> {
+    #[inline(always)]
+    fn scatter(&mut self, index: usize) {
+        if index >= self.cutoff {
+            return;
+        }
+        let word = &mut self.dirty[index / 64];
+        let bit = 1u64 << (index % 64);
+        if *word & bit == 0 {
+            *word |= bit;
+            self.out.push(index);
+        }
+    }
+}
+
+fn scatter_decomposition<U: Clone + Mul<Output = U> + AddAssign, S: ScatterSink>(
     basis_indices: &[u32],
     basis_coefficients: &[U],
     t: &U,
     result: &mut [U],
+    block_start: usize,
+    sink: &mut S,
 ) {
-    // SAFETY: `basis_index` comes from the structure constant table
-    // built in `LieSeries::new` as a decomposition onto this same
-    // basis, so it is always < basis.len() == result.len() for the
-    // duration of the call.
+    // SAFETY: `basis_index` is relative to the result slice handed in — for   Not Committed Yet
+    // the commutation kernel, the degree-`target` slice of the full result —
+    // and comes from the structure-constant table built in `LieSeries::new`,
+    // so it is always < result.len() for the duration of the call.
     for (&basis_index, basis_coefficient) in basis_indices.iter().zip(basis_coefficients) {
+        sink.scatter(block_start + basis_index as usize);
         *unsafe { result.get_unchecked_mut(basis_index as usize) } +=
             basis_coefficient.clone() * t.clone();
     }
@@ -438,11 +475,14 @@ impl<
     /// Indices of non-zero coefficients that the commutation kernel will
     /// actually use: non-zero values on basis elements below `max_degree`.
     pub fn nonzero_coefficient_indices(&self, coefficients: &[U]) -> Vec<usize> {
-        coefficients
+        let cutoff = self
+            .feasible_decompositions
+            .degree_start(self.max_degree)
+            .min(coefficients.len());
+        coefficients[..cutoff]
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.is_zero())
-            .filter(|(i, _c)| self.commutator_basis[*i].degree() != self.max_degree)
             .map(|x| x.0)
             .collect()
     }
@@ -478,6 +518,37 @@ impl<
         );
     }
 
+    pub fn commutator_coefficients_with_nonzero_collecting(
+        a_series: &LieSeries<T, U>,
+        a_coefficients: &[U],
+        a_nonzero: &[usize],
+        b_coefficients: &[U],
+        b_nonzero: &[usize],
+        result_coefficients: &mut [U],
+        dirty: &mut [u64],
+        targets: &mut Vec<usize>,
+    ) {
+        for word in dirty.iter_mut() {
+            *word = 0;
+        }
+        targets.clear();
+        let cutoff = a_series
+            .feasible_decompositions
+            .degree_start(a_series.max_degree);
+        Self::commutation_kernel(
+            a_series,
+            a_coefficients,
+            a_nonzero,
+            b_coefficients,
+            b_nonzero,
+            result_coefficients,
+            &mut CollectSink {
+                dirty,
+                out: targets,
+                cutoff,
+            },
+        );
+    }
     pub fn commutator_coefficients_with_nonzero(
         a_series: &LieSeries<T, U>,
         a_coefficients: &[U],
@@ -485,6 +556,26 @@ impl<
         b_coefficients: &[U],
         b_nonzero: &[usize],
         result_coefficients: &mut [U],
+    ) {
+        Self::commutation_kernel(
+            a_series,
+            a_coefficients,
+            a_nonzero,
+            b_coefficients,
+            b_nonzero,
+            result_coefficients,
+            &mut NoSink,
+        );
+    }
+
+    fn commutation_kernel<S: ScatterSink>(
+        a_series: &LieSeries<T, U>,
+        a_coefficients: &[U],
+        a_nonzero: &[usize],
+        b_coefficients: &[U],
+        b_nonzero: &[usize],
+        result_coefficients: &mut [U],
+        sink: &mut S,
     ) {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -504,90 +595,59 @@ impl<
             b_present[j / 64] |= 1u64 << (j % 64);
         }
 
-        // Rows are sorted by `j` and the non-zero lists are sorted,
-        // so a row of `k` can only match within `j` in `[lo, hi]` of
-        // the opposite side's support. `row_window` binary searches that range,
-        // keeping the scan proportional to the matching entries.
-        let (b_lo, b_hi) = match (b_nonzero.first(), b_nonzero.last()) {
-            (Some(&lo), Some(&hi)) => (lo as u32, hi as u32),
-            _ => return, // b is identically zero: no pair can contribute
-        };
-        let (a_lo, a_hi) = match (a_nonzero.first(), a_nonzero.last()) {
-            (Some(&lo), Some(&hi)) => (lo as u32, hi as u32),
-            _ => return, // a is identically zero: no pair can contribute
-        };
-
-        // Sweep 1: canonical rows whose smaller index is in A.
-        // The stored decomposition is that of `[basis[k], basis[j]]`
-        // with `k < j`, so the fused contribution is `c * (a_k * b_j - a_j * b_k)`
-        // orientation (a = k, b = j) is active iff `j` is in B,
-        // orientation (a = j, b = k) iff additionally `k` is in B and
-        // `j` is in A.
-        for &k in a_nonzero {
-            if b_hi < k as u32 {
-                continue;
-            }
-
-            let a_k = &a_coefficients[k];
-            let k_in_b = b_present[k / 64] & (1u64 << (k % 64)) != 0;
-            let b_k = &b_coefficients[k];
-
-            let (lo, hi) = if k_in_b {
-                (b_lo.min(a_lo), b_hi.max(a_hi))
-            } else {
-                (b_lo, b_hi)
-            };
-
-            for (j, basis_indices, basis_coefficients) in
-                a_series.feasible_decompositions.row_window(k, lo, hi)
-            {
-                if b_present[j / 64] & (1u64 << (j % 64)) != 0 {
-                    let mut t = a_k.clone() * b_coefficients[j].clone();
-                    if k_in_b && a_present[j / 64] & (1u64 << (j % 64)) != 0 {
-                        t += -(a_coefficients[j].clone() * b_k.clone());
-                    }
-                    scatter_decomposition(
-                        basis_indices,
-                        basis_coefficients,
-                        &t,
-                        result_coefficients,
-                    );
-                } else if k_in_b && a_present[j / 64] & (1u64 << (j % 64)) != 0 {
-                    let t = -(a_coefficients[j].clone() * b_k.clone());
-                    scatter_decomposition(
-                        basis_indices,
-                        basis_coefficients,
-                        &t,
-                        result_coefficients,
-                    );
-                }
-            }
+        let table = &a_series.feasible_decompositions;
+        let max_degree = table.max_degree();
+        let mut a_deg = vec![false; max_degree + 1];
+        let mut b_deg = vec![false; max_degree + 1];
+        for &i in a_nonzero {
+            a_deg[table.degree_of(i)] = true;
+        }
+        for &j in b_nonzero {
+            b_deg[table.degree_of(j)] = true;
         }
 
-        // Sweep 2: canonical rows whose smaller index is in B but not in A.
-        // Only orientation (a = j, b = k) can be active there
-        for &k in b_nonzero {
-            if a_present[k / 64] & (1u64 << (k % 64)) != 0 {
+        for block in table.blocks() {
+            let (p, q) = (block.p as usize, block.q as usize);
+            let o1 = a_deg[p] && b_deg[q];
+            let o2 = a_deg[q] && b_deg[p];
+            if !o1 && !o2 {
                 continue;
             }
-
-            if a_hi <= k as u32 {
-                continue;
-            }
-
-            let b_k = &b_coefficients[k];
-            for (j, basis_indices, basis_coefficients) in
-                a_series.feasible_decompositions.row_window(k, a_lo, a_hi)
-            {
-                if a_present[j / 64] & (1u64 << (j % 64)) != 0 {
-                    let t = -(a_coefficients[j].clone() * b_k.clone());
-                    scatter_decomposition(
-                        basis_indices,
-                        basis_coefficients,
-                        &t,
-                        result_coefficients,
-                    );
+            let (rs, re) = table.degree_range(block.target);
+            let result = &mut result_coefficients[rs..re];
+            let span = table.entry_span(block);
+            let decomp_indices = table.decomp_indices_rel();
+            let decomp_coefficients = table.decomp_coeffs();
+            for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
+                let (i, j) = (entry.i as usize, entry.j as usize);
+                let p_active = o1
+                    && a_present[i / 64] & (1u64 << (i % 64)) != 0
+                    && b_present[j / 64] & (1u64 << (j % 64)) != 0;
+                let q_active = o2
+                    && a_present[j / 64] & (1u64 << (j % 64)) != 0
+                    && b_present[i / 64] & (1u64 << (i % 64)) != 0;
+                if !p_active && !q_active {
+                    continue;
                 }
+                let term = if p_active {
+                    let mut t = a_coefficients[i].clone() * b_coefficients[j].clone();
+                    if q_active {
+                        t += -(a_coefficients[j].clone() * b_coefficients[i].clone());
+                    }
+                    t
+                } else {
+                    -(a_coefficients[j].clone() * b_coefficients[i].clone())
+                };
+                let from = entry.decomp_start as usize;
+                let to = next.decomp_start as usize;
+                scatter_decomposition(
+                    &decomp_indices[from..to],
+                    &decomp_coefficients[from..to],
+                    &term,
+                    result,
+                    rs,
+                    sink,
+                );
             }
         }
     }
@@ -732,9 +792,10 @@ mod test {
             let words = LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
             let series = LieSeries::<u8, NotNan<f64>>::new(words, Vec::new());
             assert!(
-                (0..series.feasible_decompositions.num_rows())
-                    .flat_map(|i| series.feasible_decompositions.row(i))
-                    .flat_map(|(_, _, coefficients)| coefficients)
+                series
+                    .feasible_decompositions
+                    .iter_entries()
+                    .flat_map(|(_, _, _, coefficients)| coefficients)
                     .all(|c| !c.is_zero()),
                 "zero coefficient found in decompositions for d={d}, m={m}"
             );
@@ -749,7 +810,6 @@ mod test {
         for (d, m) in [(2usize, 6usize), (3, 5), (4, 4)] {
             let words = LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
             let series = LieSeries::<u8, NotNan<f64>>::new(words, Vec::new());
-            let d_len = series.commutator_basis.len();
             let degree = |x: usize| series.commutator_basis[x].degree();
             let index_of = |term: &CommutatorTerm<NotNan<f64>, u8>| {
                 series.commutator_basis_index_map[&term.unit_hash()]
@@ -761,18 +821,35 @@ mod test {
                 .collect();
 
             let mut feasible = 0;
-            for i in 0..d_len {
-                let row: Vec<_> = series.feasible_decompositions.row(i).collect();
-                assert!(row.windows(2).all(|w| w[0].0 < w[1].0), "j not ascending");
+            for block in series.feasible_decompositions.blocks() {
+                let (p, q, target) = (block.p as usize, block.q as usize, block.target as usize);
+                assert!(p <= q, "block degrees are not canonical: ({p}, {q})");
+                assert_eq!(p + q, target, "block target degree mismatch");
+                let entries = series
+                    .feasible_decompositions
+                    .block_iter(block)
+                    .map(|(e, _, _)| (e.i as usize, e.j as usize))
+                    .collect::<Vec<_>>();
                 assert!(
-                    row.iter().all(|(j, _, _)| *j > i),
-                    "non-canonical pair stored"
+                    entries.windows(2).all(|w| w[0] < w[1]),
+                    "block ({p}, {q}) entries are not sorted by (i, j)"
                 );
 
-                for (j, indices, coefficients) in &row {
-                    assert!(degree(i) + degree(*j) <= m, "infeasible pair stored");
+                for (i, j) in entries {
+                    assert!(i < j, "non-canonical pair stored");
+                    assert_eq!(
+                        series.feasible_decompositions.degree_of(i),
+                        p,
+                        "pair ({i}, {j}) in a block of the wrong degree"
+                    );
+                    assert_eq!(
+                        series.feasible_decompositions.degree_of(j),
+                        q,
+                        "pair ({i}, {j}) in a block of the wrong degree"
+                    );
+                    assert!(degree(i) + degree(j) <= m, "infeasible pair stored");
 
-                    let mut term = comm![&series.commutator_basis[i], &series.commutator_basis[*j]];
+                    let mut term = comm![&series.commutator_basis[i], &series.commutator_basis[j]];
                     term.lyndon_sort();
                     let expected: Vec<_> = term
                         .lyndon_basis_decomposition(&basis_set)
@@ -784,16 +861,23 @@ mod test {
                     let expected_coefficients: Vec<_> =
                         expected.iter().map(|x| x.coefficient().clone()).collect();
 
-                    assert_eq!(*indices, &expected_indices[..], "(i={i}, j={j}) indices");
+                    let (canonical_indices, canonical_coefficients, swapped) =
+                        series.decomposition(i, j).expect("canonical pair query");
+                    assert!(!swapped, "(i={i}, j={j}) canonical query flagged");
                     assert_eq!(
-                        *coefficients,
+                        canonical_indices,
+                        &expected_indices[..],
+                        "(i={i}, j={j}) indices"
+                    );
+                    assert_eq!(
+                        canonical_coefficients,
                         &expected_coefficients[..],
                         "(i={i}, j={j}) coeffs"
                     );
                     feasible += 1;
 
                     let (mirrored_indices, mirrored_coefficients, swapped) =
-                        series.decomposition(*j, i).expect("mirrored pair query");
+                        series.decomposition(j, i).expect("mirrored pair query");
 
                     assert!(swapped, "(i={i}, j={j}) mirrored query not flagged");
                     assert_eq!(mirrored_indices, &expected_indices[..]);

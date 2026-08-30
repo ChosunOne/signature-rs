@@ -20,19 +20,23 @@ pub(crate) enum TermSource {
     Displacement,
 }
 
-struct DagStructure<U> {
+pub(crate) struct DagStructure<U> {
     /// Topologically sorted: ids 0 and 1 are the atoms, every
     /// internal node's children have strictly smaller ids.
-    nodes: Vec<DagNode>,
+    pub(crate) nodes: Vec<DagNode>,
     /// `(source, BCH weight)` per accumulated term, in the
     /// original term order (float summation order preserved).
     terms: Vec<(TermSource, U)>,
 }
 
 pub(crate) struct CommutatorDag<U> {
-    structure: Arc<DagStructure<U>>,
-    buffers: Vec<Vec<U>>,
-    nonzeros: Vec<Vec<usize>>,
+    pub(crate) structure: Arc<DagStructure<U>>,
+    pub(crate) buffers: Vec<Vec<U>>,
+    pub(crate) nonzeros: Vec<Vec<usize>>,
+    dirty: Vec<Vec<u64>>,
+    atom_a: Vec<usize>,
+    atom_b: Vec<usize>,
+    lists_built: bool,
 }
 
 /// Coefficient slice for a node `idx`: an atom reads the
@@ -124,6 +128,10 @@ impl<U: Clone + Zero> CommutatorDag<U> {
             structure: Arc::new(DagStructure { nodes, terms }),
             buffers: Vec::new(),
             nonzeros: Vec::new(),
+            dirty: Vec::new(),
+            atom_a: Vec::new(),
+            atom_b: Vec::new(),
+            lists_built: false,
         }
     }
 }
@@ -142,6 +150,8 @@ impl<U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash +
         let internal = self.structure.nodes.len() - 2;
         self.ensure_buffers(series.coefficients.len(), internal);
 
+        let rebuild = !self.lists_built || self.atom_a != a_nonzero || self.atom_b != b_nonzero;
+
         for k in 2..self.structure.nodes.len() {
             let (left, right) = match self.structure.nodes[k] {
                 DagNode::Binary { left, right } => (left, right),
@@ -157,9 +167,26 @@ impl<U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash +
             let lnz = node_nonzeros(left, nz_before, a_nonzero, b_nonzero);
             let rnz = node_nonzeros(right, nz_before, a_nonzero, b_nonzero);
 
-            LieSeries::commutator_coefficients_with_nonzero(series, lbuf, lnz, rbuf, rnz, result);
+            if rebuild {
+                let list = &mut nz_rest[0];
+                list.clear();
+                let dirty = &mut self.dirty[k - 2];
+                LieSeries::commutator_coefficients_with_nonzero_collecting(
+                    series, lbuf, lnz, rbuf, rnz, result, dirty, list,
+                );
+            } else {
+                LieSeries::commutator_coefficients_with_nonzero(
+                    series, lbuf, lnz, rbuf, rnz, result,
+                );
+            }
+        }
 
-            nz_rest[0] = series.nonzero_coefficient_indices(result);
+        if rebuild {
+            self.atom_a.clear();
+            self.atom_a.extend_from_slice(a_nonzero);
+            self.atom_b.clear();
+            self.atom_b.extend_from_slice(b_nonzero);
+            self.lists_built = true;
         }
     }
 
@@ -176,7 +203,14 @@ impl<U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash +
     fn ensure_buffers(&mut self, d: usize, count: usize) {
         if self.buffers.len() != count || self.buffers.first().is_none_or(|b| b.len() != d) {
             self.buffers = (0..count).map(|_| vec![U::default(); d]).collect();
-            self.nonzeros = vec![Vec::new(); count];
+            self.lists_built = false;
+        }
+        if self.nonzeros.len() != count {
+            self.nonzeros = (0..count).map(|_| Vec::new()).collect();
+        }
+        let words = d.div_ceil(64);
+        if self.dirty.len() != count || self.dirty.first().is_none_or(|w| w.len() != words) {
+            self.dirty = (0..count).map(|_| vec![0u64; words]).collect();
         }
     }
 }
@@ -187,6 +221,10 @@ impl<U> CommutatorDag<U> {
             structure: Arc::clone(&self.structure),
             buffers: Vec::new(),
             nonzeros: Vec::new(),
+            dirty: self.dirty.clone(),
+            atom_a: self.atom_a.clone(),
+            atom_b: self.atom_b.clone(),
+            lists_built: self.lists_built,
         }
     }
 }
@@ -298,7 +336,22 @@ mod tests {
             let weights: Vec<R> = log_sig.bch_series.coefficients.clone();
             let trees: Vec<CommutatorTerm<R, u8>> = log_sig.bch_series.commutator_basis.to_vec();
 
-            for step in 0..3 {
+            for step in 0..5 {
+                if step % 2 == 0 {
+                    for _ in 0..3 {
+                        let k = (lcg(&mut seed) as usize) % acc.len();
+                        acc[k] = R::from_integer(0);
+                        log_sig.series.coefficients[k] = R::from_integer(0)
+                    }
+                } else {
+                    for _ in 0..3 {
+                        let k = d + (lcg(&mut seed) as usize) % (acc.len() - d);
+                        let v = R::from_integer(lcg(&mut seed));
+                        acc[k] = v.clone();
+                        log_sig.series.coefficients[k] = v;
+                    }
+                }
+
                 // Production-shaped displacement: full-length coefficient
                 // vector with only the degree-1 letters non-zero.
                 let displacement: Vec<R> = (0..basis.len())
