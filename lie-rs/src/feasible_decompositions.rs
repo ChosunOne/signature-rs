@@ -12,6 +12,8 @@
 //! Decomposition indices are stored relative to the start of the
 //! target-degree slice, with an absolute copy for [`FeasibleDecompositions::get`].
 
+use std::sync::{Arc, OnceLock};
+
 /// A canonical pair `(i, j)` with `i < j`. Its decomposition slice is
 /// `decomp_start ..` up to the next flat entry's `decomp_start`.
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +43,31 @@ pub(crate) struct UnitMeta {
     pub(crate) end: u32,
 }
 
+/// One maximal active run of a unit's entries for the commutation kernel's
+/// sweep: a contiguous entry span gated on by degree support, scattering onto
+/// the degree-`target` result slice.
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveSegment {
+    /// The run's entry span in the flat entry array, *including* each
+    /// entry's flat successor: `entries[span_start .. span_end]` zipped with
+    /// itself shifted by one gives entry `k`'s decomposition range
+    /// `entries[k].decomp_start .. entries[k + 1].decomp_start`.
+    pub(crate) span_start: u32,
+    pub(crate) span_end: u32,
+    /// The result scatter region `[rs, re)` — the degree-`target` slice.
+    /// Decomposition indices are relative to `rs`.
+    pub(crate) rs: u32,
+    pub(crate) re: u32,
+    /// Orientation flags for this run's `p`: `o1` = `(a = i, b = j)` may
+    /// contribute, `o2` = the mirrored `(a = j, b = i)` may.
+    pub(crate) o1: bool,
+    pub(crate) o2: bool,
+    /// Whether this is the last active segment of its unit. Segments of one
+    /// unit scatter onto the same target words, so the parallel sweep must
+    /// keep them in one bundle; it may only cut a bundle after this flag.
+    pub(crate) last_of_unit: bool,
+}
+
 /// Coefficient type is generic; decomposition indices are stored as `u32`.
 #[derive(Clone)]
 pub(crate) struct FeasibleDecompositions<U> {
@@ -67,6 +94,92 @@ pub(crate) struct FeasibleDecompositions<U> {
     decomp_coefficients: Vec<U>,
     /// Number of real entries (the trailing sentinel entry is excluded).
     num_entries: usize,
+    /// Gating for full-support operands: one active segment per unit (every
+    /// p-run of every unit is active, both orientations on), so a kernel
+    /// call with `a_nonzero.len() == full-support cutoff` skips the gating
+    /// walk entirely.
+    full_support_segments: Arc<[ActiveSegment]>,
+    /// Within-degree class-contiguous scatter layout, populated at build
+    /// time only when a degree slice outgrows L1 (see
+    /// [`CLASS_ORDER_MIN_SLICE_WORDS`]) and otherwise created on demand by
+    /// [`FeasibleDecompositions::ensure_class_order`]. Held behind an
+    /// `Arc`: every kernel call and every series over the same basis
+    /// reuses one ordering.
+    class_order: OnceLock<Arc<ClassOrder>>,
+}
+
+/// Degree-slice size above which the commutation kernel's scatter writes
+/// leave L1 and the class-contiguous layout pays for its permutation
+/// epilogue. Below it the public-order scatter is already cache-resident.
+const CLASS_ORDER_MIN_SLICE_WORDS: usize = 4096;
+
+/// Within-degree class-contiguous scatter layout: the basis words of each
+/// degree are regrouped so that words of the same letter content (anagram
+/// class) are contiguous, with degree-slice boundaries preserved. A unit's
+/// decompositions only ever hit its own class (content homogeneity), so in
+/// this layout every unit's stores are dense and consecutive units write
+/// consecutive blocks.
+///
+/// The ordering depends only on the basis — every series over the same
+/// basis rearranges coefficients identically — so one handle (cheap to
+/// clone: `Arc` internally) amortizes across operand series, across every
+/// kernel call of a fold, and across batches of folds. Obtain it via
+/// [`ClassOrderedCommutation::class_order`](crate::ClassOrderedCommutation::class_order).
+#[derive(Clone)]
+pub struct ClassOrder {
+    /// Internal (class-contiguous) position -> public basis index.
+    perm: Vec<u32>,
+    /// Public basis index -> internal (class-contiguous) position. The
+    /// epilogue walks this in public order so its result writes are
+    /// sequential (full cache lines) while its scratch reads — internal
+    /// positions, just written by the sweep — stay cache-hot.
+    inv: Vec<u32>,
+    /// Decomposition scatter indices relative to the owning unit's degree
+    /// slice, expressed in the internal layout: a class-mode sweep writes
+    /// `scratch[rs + rel]` with `rel` dense over the unit's class block.
+    decomp_cls: Vec<u32>,
+    /// Entry table with `i`/`j` relabeled to internal positions, for
+    /// sweeps whose operands are class-ordered. Same order and
+    /// `decomp_start`s as the public table.
+    entries_cls: Vec<Entry>,
+    /// Lyndon degrees indexed by internal position.
+    degree_cls: Vec<u8>,
+}
+
+impl ClassOrder {
+    /// Internal (class-contiguous) position -> public basis index: the
+    /// final-epilogue map. `public[k] = class[inv()[k]]` translates a
+    /// class-ordered slice back to public order with sequential writes.
+    #[inline]
+    pub fn perm(&self) -> &[u32] {
+        &self.perm
+    }
+
+    /// Public basis index -> internal (class-contiguous) position: the
+    /// input-conversion map. `class[inv()[k]] = public[k]` gathers a
+    /// public-order slice into class order.
+    #[inline]
+    pub fn inv(&self) -> &[u32] {
+        &self.inv
+    }
+
+    /// Decomposition scatter indices in the internal layout.
+    #[inline]
+    pub(crate) fn decomp_cls(&self) -> &[u32] {
+        &self.decomp_cls
+    }
+
+    /// Entry table with internal-position endpoints.
+    #[inline]
+    pub(crate) fn entries_cls(&self) -> &[Entry] {
+        &self.entries_cls
+    }
+
+    /// Lyndon degrees indexed by internal position.
+    #[inline]
+    pub(crate) fn degree_cls(&self) -> &[u8] {
+        &self.degree_cls
+    }
 }
 
 /// Incremental builder used during `LieSeries::new`: canonical pairs arrive
@@ -229,6 +342,49 @@ impl<U: Clone> Builder<U> {
             j: 0,
             decomp_start: total,
         });
+        // Class-contiguous scatter layout: only worth building when some
+        // degree slice outgrows L1 — below that the public-order scatter is
+        // already cache-resident and the layout's permutation epilogue
+        // would only add work (12×2's whole kernel is smaller than one
+        // epilogue pass).
+        let max_slice = (0..=max_degree)
+            .map(|d| degree_starts[d + 1] - degree_starts[d])
+            .max()
+            .unwrap_or(0);
+        let class_order = OnceLock::new();
+        if max_slice as usize >= CLASS_ORDER_MIN_SLICE_WORDS {
+            let _ = class_order.set(Arc::new(build_class_order(
+                degrees,
+                contents,
+                &degree_starts,
+                &units,
+                &entries,
+                &decomp_indices,
+            )));
+        }
+
+        // Full-support gating: every run of every unit is active with both
+        // orientations, so one segment per unit spans the unit's whole entry
+        // range (the flat successor chain gives the same decomposition ranges
+        // the per-run segments would).
+        let full_support_segments: Vec<ActiveSegment> = units
+            .iter()
+            .map(|unit| {
+                let (rs, re) = (
+                    degree_starts[unit.target as usize],
+                    degree_starts[unit.target as usize + 1],
+                );
+                ActiveSegment {
+                    span_start: unit.start,
+                    span_end: unit.end + 1,
+                    rs,
+                    re,
+                    o1: true,
+                    o2: true,
+                    last_of_unit: true,
+                }
+            })
+            .collect();
 
         FeasibleDecompositions {
             index_degrees: degrees.clone(),
@@ -240,7 +396,82 @@ impl<U: Clone> Builder<U> {
             decomp_indices_abs,
             decomp_coefficients,
             num_entries,
+            full_support_segments: Arc::from(full_support_segments),
+            class_order,
         }
+    }
+}
+
+/// Builds the within-degree class-contiguous permutation and the
+/// re-indexed decomposition scatter array.
+///
+/// Within each degree, words are grouped by letter content (classes ordered
+/// by content bytes, words in public order inside a class); degree-slice
+/// boundaries are preserved, so a degree slice's start offset is valid in
+/// both layouts and only the positions inside the slice move.
+fn build_class_order(
+    degrees: &[u8],
+    contents: &[Vec<u8>],
+    degree_starts: &[u32],
+    units: &[UnitMeta],
+    entries: &[Entry],
+    decomp_rel: &[u32],
+) -> ClassOrder {
+    let len = degrees.len();
+    let mut inv: Vec<u32> = (0..len as u32).collect();
+    let max_degree = degree_starts.len() - 2;
+    for d in 0..=max_degree {
+        let lo = degree_starts[d] as usize;
+        let hi = degree_starts[d + 1] as usize;
+        if hi <= lo + 1 {
+            continue;
+        }
+        // Stable sort: equal contents (one class) keep their public order.
+        let mut order: Vec<usize> = (lo..hi).collect();
+        order.sort_by(|&a, &b| contents[a].cmp(&contents[b]));
+        for (pos, &w) in order.iter().enumerate() {
+            inv[w] = (lo + pos) as u32;
+        }
+    }
+    let mut perm: Vec<u32> = vec![0; len];
+    for (w, &p) in inv.iter().enumerate() {
+        perm[p as usize] = w as u32;
+    }
+    let inv = inv;
+    // Re-index the scatter array: `rel_cls = inv[rs + rel] - rs` per unit.
+    // The entries' sentinel-closed successor chains give each entry's
+    // decomposition range, exactly as the sweep reads it.
+    let mut decomp_cls = vec![0u32; decomp_rel.len()];
+    for unit in units {
+        let rs = degree_starts[unit.target as usize] as usize;
+        for ei in unit.start..unit.end {
+            let from = entries[ei as usize].decomp_start as usize;
+            let to = entries[ei as usize + 1].decomp_start as usize;
+            for k in from..to {
+                decomp_cls[k] = inv[rs + decomp_rel[k] as usize] - rs as u32;
+            }
+        }
+    }
+    // Entry table relabeled to internal positions (same order, same
+    // decomp_starts; the sentinel's endpoints are never read).
+    let entries_cls: Vec<Entry> = entries
+        .iter()
+        .map(|e| Entry {
+            i: inv[e.i as usize],
+            j: inv[e.j as usize],
+            decomp_start: e.decomp_start,
+        })
+        .collect();
+    let mut degree_cls = vec![0u8; degrees.len()];
+    for (w, &p) in inv.iter().enumerate() {
+        degree_cls[p as usize] = degrees[w];
+    }
+    ClassOrder {
+        perm,
+        inv,
+        decomp_cls,
+        entries_cls,
+        degree_cls,
     }
 }
 
@@ -248,6 +479,62 @@ impl<U> FeasibleDecompositions<U> {
     /// Total number of stored feasible pairs.
     pub(crate) fn len(&self) -> usize {
         self.num_entries
+    }
+
+    /// The class-contiguous layout when it was prebuilt at table
+    /// construction (degree slice above the L1 threshold); `None` means
+    /// the default kernel paths run direct.
+    #[inline]
+    pub(crate) fn cached_class_order(&self) -> Option<&Arc<ClassOrder>> {
+        self.class_order.get()
+    }
+
+    /// The class-contiguous layout, building it on first request when the
+    /// table did not prebuild one. Cheap after the first call, and shared
+    /// as an `Arc` across every consumer of this table.
+    #[inline]
+    pub(crate) fn ensure_class_order(&self) -> Arc<ClassOrder> {
+        self.class_order
+            .get_or_init(|| {
+                let units = self.units.clone();
+                let entries = self.entries.clone();
+                let decomp = self.decomp_indices.clone();
+                Arc::new(build_class_order(
+                    &self.index_degrees,
+                    &self.index_contents,
+                    &self.degree_starts,
+                    &units,
+                    &entries,
+                    &decomp,
+                ))
+            })
+            .clone()
+    }
+
+    /// Test hook: builds the class-contiguous layout regardless of the
+    /// slice-size threshold, so correctness tests can exercise the class
+    /// sweep on small (fast-to-build) shapes.
+    #[cfg(test)]
+    pub(crate) fn force_class_order(&mut self) {
+        let units = self.units.clone();
+        let entries = self.entries.clone();
+        let decomp = self.decomp_indices.clone();
+        let built = Arc::new(build_class_order(
+            &self.index_degrees,
+            &self.index_contents,
+            &self.degree_starts,
+            &units,
+            &entries,
+            &decomp,
+        ));
+        let _ = self.class_order.set(built);
+    }
+
+    /// Test hook: drops the class layout so a threshold-qualifying table
+    /// can serve as the direct-layout reference.
+    #[cfg(test)]
+    pub(crate) fn clear_class_order(&mut self) {
+        let _ = self.class_order.take();
     }
 
     /// The maximum basis degree.
@@ -281,6 +568,14 @@ impl<U> FeasibleDecompositions<U> {
     #[inline]
     pub(crate) fn entry_span(&self, unit: &UnitMeta) -> &[Entry] {
         &self.entries[unit.start as usize..=unit.end as usize]
+    }
+
+    /// Active segments for full-support operands (every run of every unit
+    /// active, both orientations on). Shared by all full-support kernel
+    /// calls, so the gating walk is skipped entirely.
+    #[inline]
+    pub(crate) fn full_support_segments(&self) -> &Arc<[ActiveSegment]> {
+        &self.full_support_segments
     }
 
     /// The flat relative decomposition index array (kernel scatter path).

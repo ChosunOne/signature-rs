@@ -4646,6 +4646,7 @@ dependencies = [
  "num-traits",
  "ordered-float",
  "rand 0.10.2",
+ "rayon",
  "rstest",
 ]
 

@@ -15,7 +15,7 @@ use std::{
     ops::{AddAssign, Div, Index, IndexMut, MulAssign, Neg, SubAssign},
 };
 
-use crate::commutator_dag::{CommutatorDag, TermSource};
+use crate::commutator_dag::CommutatorDag;
 
 /// Builder for constructing log signatures from path data.
 ///
@@ -330,15 +330,10 @@ impl<
             &b_nonzero,
         );
 
-        for (source, weight) in self.dag.terms() {
-            let ct: &[U] = match source {
-                TermSource::Node(node) => self.dag.buffer(node),
-                TermSource::Displacement => rhs_coefficients,
-            };
-            for (self_coeff, comm_coeff) in self.series.coefficients.iter_mut().zip(ct.iter()) {
-                *self_coeff += comm_coeff.clone() * weight.clone();
-            }
-        }
+        // The DAG accumulated every term in class-contiguous order; this
+        // single call applies the BCH weights and the one epilogue back to
+        // public basis order.
+        self.dag.accumulate_terms(&mut self.series.coefficients, rhs_coefficients);
     }
 }
 
@@ -876,15 +871,9 @@ mod test {
 
                 // Complete the fold so the next one sees the evolved
                 // accumulator (and the steady-batch lists).
-                for (source, weight) in log_sig.dag.terms() {
-                    let ct: &[NotNan<f64>] = match source {
-                        TermSource::Node(node) => log_sig.dag.buffer(node),
-                        TermSource::Displacement => &disp,
-                    };
-                    for (c, comm) in log_sig.series.coefficients.iter_mut().zip(ct) {
-                        *c += comm.clone() * weight.clone();
-                    }
-                }
+                log_sig
+                    .dag
+                    .accumulate_terms(&mut log_sig.series.coefficients, &disp);
             }
         }
     }

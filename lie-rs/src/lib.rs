@@ -39,8 +39,9 @@ use std::ops::{Div, MulAssign};
 // Re-export main types at crate root
 pub use bch_series_generator::{BchSeriesGenerator, Matrix2x2, MatrixTree};
 pub use lie_series::{
-    GatingCache, KernelJob, LieSeries, commutator_coefficients_batch,
-    commutator_coefficients_batch_with_cache,
+    ClassOrder, ClassOrderedCommutation, GatingCache, KernelJob, LieSeries,
+    commutator_coefficients_batch, commutator_coefficients_batch_with_cache,
+    commutator_coefficients_class_batch_with_cache,
 };
 pub use rooted_tree::{EdgePartitions, GraphPartitionTable, RootedTree};
 

@@ -6,12 +6,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::ops::{AddAssign, MulAssign, Neg};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use commutator_rs::CommutatorTerm;
-use lie_rs::{
-    GatingCache, KernelJob, LieSeries, commutator_coefficients_batch_with_cache,
-};
+use lie_rs::{ClassOrder, ClassOrderedCommutation, GatingCache, KernelJob, LieSeries};
 use lyndon_rs::generators::Generator;
 use num_traits::{One, Zero};
 
@@ -80,6 +78,14 @@ pub(crate) struct CommutatorDag<U> {
     /// the (a-mask, b-mask) keys — and hence the active-unit lists — repeat
     /// fold after fold. Built for this DAG's own series/table only.
     gating_cache: GatingCache,
+    /// The basis' class-contiguous ordering, created on the first fold and
+    /// shared by every kernel call of every fold through this DAG (and by
+    /// `clone_shallow` copies): the O(basis) planning is paid once.
+    ///
+    /// All fold work runs in this ordering — node buffers are class-ordered
+    /// and the support lists class-indexed — and
+    /// [`Self::accumulate_terms`] applies the single public-order epilogue.
+    class_order: OnceLock<Arc<ClassOrder>>,
 }
 
 /// Coefficient slice for node `idx`: an atom reads the fold's inputs, an
@@ -202,6 +208,7 @@ where
             atom_b: Vec::new(),
             lists_built: false,
             gating_cache: GatingCache::default(),
+            class_order: OnceLock::new(),
         }
     }
 }
@@ -230,6 +237,21 @@ where
         let internal = self.structure.nodes.len() - 2;
         self.ensure_buffers(series.coefficients.len(), internal);
 
+        // The class-contiguous ordering: created on the first fold, shared
+        // by every kernel call of every fold through this DAG. The fold's
+        // whole working set — node buffers and support lists — lives in the
+        // ordering; the single public-order epilogue runs in
+        // `accumulate_terms`.
+        let order = self.class_order.get_or_init(|| series.class_order());
+        let inv = order.inv();
+        // The fold's inputs arrive in public basis order: convert once per
+        // fold. (The rebuild trigger below keeps comparing the caller's
+        // public support lists, so it is unaffected by the relabeling.)
+        let a_cls = series.class_coefficients(order, a);
+        let b_cls = series.class_coefficients(order, b);
+        let a_nz_cls: Vec<usize> = a_nonzero.iter().copied().map(|i| inv[i] as usize).collect();
+        let b_nz_cls: Vec<usize> = b_nonzero.iter().copied().map(|i| inv[i] as usize).collect();
+
         // The node lists are a fixed point of the DAG's support propagation:
         // they change only when an atom support changes. Value-level changes
         // with an unchanged support leave them valid; a support change forces
@@ -250,16 +272,16 @@ where
                 let (before, rest) = self.buffers.split_at_mut(k - 2);
                 let result = &mut rest[0];
                 result.fill(U::default());
-                let lbuf = node_slice(left, before, a, b);
-                let rbuf = node_slice(right, before, a, b);
+                let lbuf = node_slice(left, before, &a_cls, &b_cls);
+                let rbuf = node_slice(right, before, &a_cls, &b_cls);
                 let (nz_before, nz_rest) = self.nonzeros.split_at_mut(k - 2);
-                let lnz = node_nonzeros(left, nz_before, a_nonzero, b_nonzero);
-                let rnz = node_nonzeros(right, nz_before, a_nonzero, b_nonzero);
+                let lnz = node_nonzeros(left, nz_before, &a_nz_cls, &b_nz_cls);
+                let rnz = node_nonzeros(right, nz_before, &a_nz_cls, &b_nz_cls);
                 let list = &mut nz_rest[0];
                 list.clear();
                 let dirty = &mut self.dirty[k - 2];
-                LieSeries::commutator_coefficients_with_nonzero_collecting(
-                    series, lbuf, lnz, rbuf, rnz, result, dirty, list,
+                series.class_commutation_with_nonzero_collecting(
+                    order, lbuf, lnz, rbuf, rnz, result, dirty, list,
                 );
             }
             self.atom_a.clear();
@@ -299,16 +321,16 @@ where
                 // distinct allocation, so the jobs' result pointers never
                 // alias each other or the operand slices.
                 let (a_ptr, a_len, a_nz): (*const U, usize, &[usize]) = match left {
-                    0 => (a.as_ptr(), a.len(), a_nonzero),
-                    1 => (b.as_ptr(), b.len(), b_nonzero),
+                    0 => (a_cls.as_ptr(), a_cls.len(), &a_nz_cls),
+                    1 => (b_cls.as_ptr(), b_cls.len(), &b_nz_cls),
                     id => {
                         let v = &self.buffers[id as usize - 2];
                         (v.as_ptr(), v.len(), &self.nonzeros[id as usize - 2])
                     }
                 };
                 let (b_ptr, b_len, b_nz): (*const U, usize, &[usize]) = match right {
-                    0 => (a.as_ptr(), a.len(), a_nonzero),
-                    1 => (b.as_ptr(), b.len(), b_nonzero),
+                    0 => (a_cls.as_ptr(), a_cls.len(), &a_nz_cls),
+                    1 => (b_cls.as_ptr(), b_cls.len(), &b_nz_cls),
                     id => {
                         let v = &self.buffers[id as usize - 2];
                         (v.as_ptr(), v.len(), &self.nonzeros[id as usize - 2])
@@ -323,7 +345,53 @@ where
                     result_len,
                 });
             }
-            commutator_coefficients_batch_with_cache(series, &mut jobs, &mut self.gating_cache);
+            series.class_commutation_batch(order, &mut jobs, &mut self.gating_cache);
+        }
+    }
+
+    /// Adds the evaluated terms, BCH-weighted, into `target` (a public
+    /// basis-order coefficient slice, e.g. the accumulating log
+    /// signature's). `rhs` is the displacement atom's public-order slice.
+    ///
+    /// The accumulation itself runs in the class-contiguous ordering — the
+    /// term buffers are class-ordered, so the per-position summation order
+    /// matches the public one exactly — and the single epilogue back to
+    /// public order runs once, at the end.
+    pub(crate) fn accumulate_terms(&mut self, target: &mut [U], rhs: &[U]) {
+        let order = self
+            .class_order
+            .get()
+            .expect("accumulate_terms called before evaluate");
+        let inv = order.inv();
+
+        // Gather the accumulator's current values and the displacement into
+        // class positions. From here to the epilogue every write is
+        // sequential in class order.
+        let mut acc: Vec<U> = vec![U::default(); inv.len()];
+        for (w, c) in target.iter().enumerate() {
+            acc[inv[w] as usize] = c.clone();
+        }
+        let mut rhs_cls: Vec<U> = vec![U::default(); rhs.len().min(inv.len())];
+        for (w, c) in rhs.iter().enumerate().take(inv.len()) {
+            rhs_cls[inv[w] as usize] = c.clone();
+        }
+
+        // Per-position term accumulation in the DAG's term order — the same
+        // summation order the public-loop version produced.
+        for (source, weight) in &self.structure.terms {
+            let ct: &[U] = match source {
+                TermSource::Node(node) => &self.buffers[*node as usize - 2],
+                TermSource::Displacement => &rhs_cls,
+            };
+            for (acc_coeff, comm_coeff) in acc.iter_mut().zip(ct) {
+                *acc_coeff += comm_coeff.clone() * weight.clone();
+            }
+        }
+
+        // The one epilogue: class-contiguous accumulator back to public
+        // basis order (assignment — `acc` already holds the full sum).
+        for (k, &src) in inv.iter().enumerate().take(target.len()) {
+            target[k] = acc[src as usize].clone();
         }
     }
 
@@ -385,6 +453,7 @@ impl<U> CommutatorDag<U> {
             atom_b: self.atom_b.clone(),
             lists_built: self.lists_built,
             gating_cache: self.gating_cache.clone(),
+            class_order: self.class_order.clone(),
         }
     }
 }
