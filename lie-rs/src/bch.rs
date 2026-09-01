@@ -62,7 +62,13 @@ pub fn goldberg_coeff_numerator<
         U::from_i128(FACTORIALS[n]).expect("failed to convert form i128") * bch_denominator(n);
     let m = q.len();
     #[cfg(feature = "tracing")]
-    tracing::trace!(?q, a_first, n, m, "computing Goldberg coefficient numerator");
+    tracing::trace!(
+        ?q,
+        a_first,
+        n,
+        m,
+        "computing Goldberg coefficient numerator"
+    );
     let mut c = vec![U::zero(); n * n];
     let mut a_current = a_first;
     if m % 2 == 0 {

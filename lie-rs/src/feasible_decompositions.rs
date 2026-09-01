@@ -66,6 +66,14 @@ pub(crate) struct ActiveSegment {
     /// unit scatter onto the same target words, so the parallel sweep must
     /// keep them in one bundle; it may only cut a bundle after this flag.
     pub(crate) last_of_unit: bool,
+    /// The left operand degree `p = deg(basis[i])` of this run — constant
+    /// within the run (segments are maximal equal-`p` entry runs). The
+    /// batch sweep hoists its compact-buffer address shifts per segment
+    /// from this and [`Self::td`].
+    pub(crate) p: u8,
+    /// The unit's target (bracket) degree: the scatter words of this
+    /// segment's decompositions all live in `degree_range(td)`.
+    pub(crate) td: u8,
 }
 
 /// Coefficient type is generic; decomposition indices are stored as `u32`.
@@ -175,9 +183,10 @@ impl ClassOrder {
         &self.entries_cls
     }
 
-    /// Lyndon degrees indexed by internal position.
+    /// Lyndon degrees indexed by internal (class) position. The positions
+    /// are degree-grouped, so this slice is non-decreasing.
     #[inline]
-    pub(crate) fn degree_cls(&self) -> &[u8] {
+    pub fn degree_cls(&self) -> &[u8] {
         &self.degree_cls
     }
 }
@@ -255,7 +264,10 @@ impl<U: Clone> Builder<U> {
         for (i, row) in self.rows.iter().enumerate() {
             for (j, indices, coefficients) in row {
                 let (p, q) = (degrees[i], degrees[*j as usize]);
-                debug_assert!(p <= q, "non-degree-grouped basis: i < j but deg(i) > deg(j)");
+                debug_assert!(
+                    p <= q,
+                    "non-degree-grouped basis: i < j but deg(i) > deg(j)"
+                );
                 let mut gamma = contents[i].clone();
                 for k in 0..gamma.len() {
                     gamma[k] += contents[*j as usize][k];
@@ -276,7 +288,10 @@ impl<U: Clone> Builder<U> {
             (a.0, &a.1, a.2, a.3, a.4, a.5).cmp(&(b.0, &b.1, b.2, b.3, b.4, b.5))
         });
 
-        let total: usize = flat.iter().map(|(_, _, _, _, _, _, idx, _)| idx.len()).sum();
+        let total: usize = flat
+            .iter()
+            .map(|(_, _, _, _, _, _, idx, _)| idx.len())
+            .sum();
         let mut units: Vec<UnitMeta> = Vec::new();
         let mut entries = Vec::with_capacity(flat.len());
         let mut decomp_indices = Vec::with_capacity(total);
@@ -364,27 +379,54 @@ impl<U: Clone> Builder<U> {
         }
 
         // Full-support gating: every run of every unit is active with both
-        // orientations, so one segment per unit spans the unit's whole entry
-        // range (the flat successor chain gives the same decomposition ranges
-        // the per-run segments would).
-        let full_support_segments: Vec<ActiveSegment> = units
-            .iter()
-            .map(|unit| {
-                let (rs, re) = (
-                    degree_starts[unit.target as usize],
-                    degree_starts[unit.target as usize + 1],
-                );
-                ActiveSegment {
-                    span_start: unit.start,
+        // orientations. Segments are maximal equal-`p` entry runs (the same
+        // shape the degree-gated prologue produces), so a segment's left
+        // operand degree — and with it the batch sweep's hoisted compact
+        // address shifts — is constant within the segment.
+        let mut full_support_segments: Vec<ActiveSegment> = Vec::new();
+        for unit in units.iter() {
+            let td = unit.target;
+            let (rs, re) = (
+                degree_starts[td as usize],
+                degree_starts[td as usize + 1],
+            );
+            let mut run_start = unit.start;
+            let mut cur_p = u8::MAX;
+            for ei in unit.start..unit.end {
+                let p = degrees[entries[ei as usize].i as usize];
+                if p == cur_p {
+                    continue;
+                }
+                if cur_p != u8::MAX {
+                    full_support_segments.push(ActiveSegment {
+                        span_start: run_start,
+                        span_end: ei + 1,
+                        rs,
+                        re,
+                        o1: true,
+                        o2: true,
+                        last_of_unit: false,
+                        p: cur_p,
+                        td,
+                    });
+                }
+                cur_p = p;
+                run_start = ei;
+            }
+            if cur_p != u8::MAX {
+                full_support_segments.push(ActiveSegment {
+                    span_start: run_start,
                     span_end: unit.end + 1,
                     rs,
                     re,
                     o1: true,
                     o2: true,
                     last_of_unit: true,
-                }
-            })
-            .collect();
+                    p: cur_p,
+                    td,
+                });
+            }
+        }
 
         FeasibleDecompositions {
             index_degrees: degrees.clone(),
@@ -623,6 +665,12 @@ impl<U> FeasibleDecompositions<U> {
     /// The result-vector range `[start, end)` holding the degree-`target`
     /// basis words.
     #[inline]
+    /// DEBUG/telemetry: per-position Lyndon degree + degree-slice starts.
+    #[doc(hidden)]
+    pub fn debug_degree_layout(&self) -> (Vec<u8>, Vec<u32>) {
+        (self.index_degrees.clone(), self.degree_starts.clone())
+    }
+
     pub(crate) fn degree_range(&self, target: u8) -> (usize, usize) {
         let t = target as usize;
         (
@@ -664,10 +712,7 @@ impl<U> FeasibleDecompositions<U> {
             std::cmp::Ordering::Greater => (j, i, true),
             std::cmp::Ordering::Equal => return None,
         };
-        let (min, max) = (
-            u32::try_from(min).ok()?,
-            u32::try_from(max).ok()?,
-        );
+        let (min, max) = (u32::try_from(min).ok()?, u32::try_from(max).ok()?);
         let (c_min, c_max) = (
             &self.index_contents[min as usize],
             &self.index_contents[max as usize],
@@ -710,6 +755,96 @@ impl<U> FeasibleDecompositions<U> {
 mod test {
     use super::*;
 
+    /// INVARIANT CHECK: within one degree-target slice, two different
+    /// units must never scatter onto the same basis word — the batch's
+    /// packs cut at unit boundaries and rely on per-word single-writer
+    /// accumulation for bit-identical results.
+    #[test]
+    fn debug_unit_word_ownership_disjoint() {
+        // Real 3-letter basis through degree 5: word contents from the
+        // Lyndon enumeration, in basis order.
+        let contents: Vec<Vec<u8>> = vec![
+            vec![1, 0, 0], // a
+            vec![0, 1, 0], // b
+            vec![0, 0, 1], // c
+            vec![1, 1, 0], // ab
+            vec![1, 0, 1], // ac
+            vec![0, 1, 1], // bc
+            vec![2, 1, 0], // aab
+            vec![1, 2, 0], // abb
+            vec![2, 0, 1], // aac
+            vec![1, 0, 2], // acc
+            vec![0, 2, 1], // bbc
+            vec![0, 1, 2], // bcc
+            vec![1, 1, 1], // abc
+            vec![3, 1, 0], // aaab
+            vec![1, 3, 0], // abbb
+            vec![1, 1, 2], // abcc
+            vec![2, 2, 1], // aabb
+        ];
+        let mut b = Builder::<f64>::new(&contents);
+        // Push every canonical pair with a decomposition into every word of
+        // the pair's content class at the target degree (row-major, as the
+        // kernel's table build does).
+        let n = contents.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut gamma = vec![0u8; 3];
+                for k in 0..3 {
+                    gamma[k] = contents[i][k] + contents[j][k];
+                }
+                let _target: u8 = gamma.iter().sum();
+                // all words of degree `target` with this content
+                let targets: Vec<usize> = (0..n).filter(|w| contents[*w] == gamma).collect();
+                if targets.is_empty() {
+                    continue; // no word of this content at this degree
+                }
+                b.push(i, j, &targets, &vec![1.0; targets.len()]);
+            }
+        }
+        let t = b.finish();
+
+        // Walk every unit; collect (target, rel) -> unit index.
+        let mut owner: std::collections::HashMap<(u8, u32), usize> =
+            std::collections::HashMap::new();
+        let mut violations = 0usize;
+        for (uid, unit) in t.units().iter().enumerate() {
+            let span = t.entry_span(unit);
+            for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
+                let from = entry.decomp_start as usize;
+                let to = next.decomp_start as usize;
+                for &rel in &t.decomp_indices_rel()[from..to] {
+                    let key = (unit.target, rel);
+                    match owner.get(&key) {
+                        Some(prev) if *prev != uid => {
+                            violations += 1;
+                            if violations <= 8 {
+                                println!(
+                                    "VIOLATION: degree {} rel {} claimed by units {} and {}",
+                                    unit.target, rel, prev, uid
+                                );
+                            }
+                        }
+                        _ => {
+                            owner.insert(key, uid);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "units={} rels={} (target,rel) keys={} violations={}",
+            t.units().len(),
+            t.decomp_indices_rel().len(),
+            owner.len(),
+            violations
+        );
+        assert_eq!(
+            violations, 0,
+            "units share scatter words — pack-level bit-identical accumulation is unsound"
+        );
+    }
+
     /// Five fake basis words over a 2-letter alphabet: `a`, `b` (degree 1),
     /// `ab` (degree 2), `aab`, `abb` (degree 3). Degree-`t` decompositions
     /// may only hit degree-`t` words whose content is the multiset union of
@@ -747,10 +882,7 @@ mod test {
             .iter()
             .map(|u| (u.target, u.gamma.clone()))
             .collect();
-        assert_eq!(
-            units,
-            [(2, vec![1, 1]), (3, vec![1, 2]), (3, vec![2, 1])]
-        );
+        assert_eq!(units, [(2, vec![1, 1]), (3, vec![1, 2]), (3, vec![2, 1])]);
         let unit12: &UnitMeta = t
             .units()
             .iter()

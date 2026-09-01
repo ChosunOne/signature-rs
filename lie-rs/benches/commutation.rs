@@ -1,6 +1,6 @@
 use commutator_rs::Commutator;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lie_rs::LieSeries;
+use lie_rs::{LieSeries, IDENTITY_SHIFTS};
 use lyndon_rs::LyndonBasis;
 use ordered_float::NotNan;
 
@@ -26,7 +26,10 @@ fn threads() -> Vec<usize> {
     std::env::var("BENCH_THREADS")
         .unwrap_or_else(|_| "1,2,4,8,16,32".to_owned())
         .split(',')
-        .map(|t| t.parse().expect("thread counts are comma-separated integers"))
+        .map(|t| {
+            t.parse()
+                .expect("thread counts are comma-separated integers")
+        })
         .collect()
 }
 
@@ -40,7 +43,10 @@ fn batch_grid() -> Vec<(usize, usize)> {
         .split(',')
         .map(|tok| {
             let (d, m) = tok.split_once('x').expect("grid entries are `dxm`");
-            (d.parse().expect("d is an integer"), m.parse().expect("m is an integer"))
+            (
+                d.parse().expect("d is an integer"),
+                m.parse().expect("m is an integer"),
+            )
         })
         .collect()
 }
@@ -71,9 +77,9 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_span_events(FmtSpan::CLOSE)
         .with_thread_ids(true)
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("lie_rs=debug")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("lie_rs=debug")),
+        )
         .with_writer(std::io::stderr)
         .try_init();
 }
@@ -151,7 +157,7 @@ fn bench_lie_series_new(c: &mut Criterion) {
 }
 
 fn bench_commutation_batch(c: &mut Criterion) {
-    use lie_rs::lie_series::{commutator_coefficients_batch_with_cache, GatingCache, KernelJob};
+    use lie_rs::lie_series::{GatingCache, KernelJob, commutator_coefficients_batch_with_cache};
 
     let mut group = c.benchmark_group("commutator_kernel_batch");
     for (d, m) in batch_grid() {
@@ -172,17 +178,23 @@ fn bench_commutation_batch(c: &mut Criterion) {
                     // at its production steady state (memoized/full-support).
                     let dense_nz = a.nonzero_coefficient_indices(&a.coefficients);
                     bencher.iter(|| {
-                        let mut outs: Vec<Vec<S>> = (0..BATCH_JOBS).map(|_| vec![S::default(); len]).collect();
+                        let mut outs: Vec<Vec<S>> =
+                            (0..BATCH_JOBS).map(|_| vec![S::default(); len]).collect();
                         let mut cache = GatingCache::default();
                         let mut jobs: Vec<KernelJob<S>> = outs
                             .iter_mut()
                             .map(|o| KernelJob {
-                                a: &a.coefficients,
+                                a: a.coefficients.as_ptr(),
+                                a_len: len,
                                 a_nonzero: &dense_nz,
-                                b: &b.coefficients,
+                                b: b.coefficients.as_ptr(),
+                                b_len: len,
                                 b_nonzero: &dense_nz,
                                 result: o.as_mut_ptr(),
                                 result_len: len,
+                                a_shift: IDENTITY_SHIFTS.as_ptr(),
+                                b_shift: IDENTITY_SHIFTS.as_ptr(),
+                                r_shift: IDENTITY_SHIFTS.as_ptr(),
                             })
                             .collect();
                         pool.install(|| {

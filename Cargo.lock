@@ -2528,6 +2528,7 @@ dependencies = [
  "commutator-rs",
  "criterion",
  "indicatif",
+ "libc",
  "lyndon-rs",
  "num-rational",
  "num-traits",

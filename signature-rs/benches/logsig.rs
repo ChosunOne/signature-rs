@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+};
 use ndarray::Array2;
 use ordered_float::NotNan;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -39,7 +41,10 @@ fn threads() -> Vec<usize> {
     std::env::var("BENCH_THREADS")
         .unwrap_or_else(|_| "1,2,4,8,16,32".to_owned())
         .split(',')
-        .map(|t| t.parse().expect("thread counts are comma-separated integers"))
+        .map(|t| {
+            t.parse()
+                .expect("thread counts are comma-separated integers")
+        })
         .collect()
 }
 
@@ -106,9 +111,8 @@ fn bench_e2e(c: &mut Criterion) {
                     // Per-iteration install: a full path build makes thousands
                     // of pool dispatches, so the single install handshake is
                     // negligible.
-                    bencher.iter(|| {
-                        pool.install(|| std::hint::black_box(b.build_from_path(&view)))
-                    });
+                    bencher
+                        .iter(|| pool.install(|| std::hint::black_box(b.build_from_path(&view))));
                 },
             );
         }
@@ -127,6 +131,11 @@ fn bench_concat_single(c: &mut Criterion) {
                 .slice(ndarray::s![WARM_SEGMENTS..=WARM_SEGMENTS + 1, ..])
                 .view(),
         );
+        // The batch's displacement set: the same segment folded K times
+        // (the steady-state concat workload).
+        let segs: Vec<_> = std::iter::repeat(seg.clone())
+            .take(KERNEL_CALLS_PER_ITER)
+            .collect();
         for t in threads() {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(t)
@@ -140,12 +149,11 @@ fn bench_concat_single(c: &mut Criterion) {
                     bencher.iter_batched(
                         || acc.clone(),
                         |mut acc| {
-                            // One install per K concatenations amortizes the
-                            // park/unpark handshake below measurement noise.
+                            // The production fold shape: one continuous
+                            // batch dispatch over all K displacements
+                            // (same batch driver as build_from_path).
                             pool.install(|| {
-                                for _ in 0..KERNEL_CALLS_PER_ITER {
-                                    acc.concatenate_assign(&seg);
-                                }
+                                acc.concatenate_batch(&segs);
                             });
                             std::hint::black_box(acc)
                         },
