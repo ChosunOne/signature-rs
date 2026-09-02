@@ -17,6 +17,15 @@ use std::{
 
 use crate::commutator_dag::CommutatorDag;
 
+/// True exactly for a NaN payload. `x != x` holds for no value except NaN,
+/// which keeps the check available for every coefficient type without adding
+/// a float-trait bound.
+#[inline]
+#[allow(clippy::eq_op)]
+fn is_nan_value<U: PartialEq>(c: &U) -> bool {
+    c != c
+}
+
 /// Builder for constructing log signatures from path data.
 ///
 /// The log signature is a mathematical transform that captures the geometry
@@ -158,7 +167,8 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
             + Zero
             + SubAssign
             + MulAssign
-            + Sub<Output = U>,
+            + Sub<Output = U>
+            + 'static,
     >(
         &self,
         path: &ArrayView<U, D>,
@@ -285,7 +295,8 @@ impl<
         + Default
         + One
         + Zero
-        + Neg<Output = U>,
+        + Neg<Output = U>
+        + 'static,
 > LogSignature<T, U>
 {
     /// Concatenates two log signatures using the Baker-Campbell-Hausdorff formula.
@@ -340,6 +351,19 @@ impl<
         // public basis order.
         self.dag
             .accumulate_terms(&mut self.series.coefficients, rhs_coefficients);
+        self.audit_no_nan();
+    }
+
+    /// The commutation kernel's raw-float fast path does not check NaN per
+    /// operation (see `lie_rs::raw_mul`'s NaN policy); the only way NaN can
+    /// arise is coefficient overflow producing infinities whose combination
+    /// cancels. Audit the accumulator once per fold step so that failure
+    /// stays loud instead of silently persisting a NaN through the `NotNan`
+    /// invariant.
+    fn audit_no_nan(&self) {
+        if self.series.coefficients.iter().any(|c| is_nan_value(c)) {
+            panic!("log-signature coefficients overflowed to NaN");
+        }
     }
 
     /// Folds every displacement in `rhss` into `self`, in order. Results
@@ -404,6 +428,7 @@ impl<
         }
         self.dag
             .fold_batch(&mut self.series, rhss, &a_nonzero, &b_nonzero);
+        self.audit_no_nan();
         true
     }
 
@@ -1154,6 +1179,75 @@ mod test {
         let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
         bat.concatenate_batch_coefficients(&slices);
         assert_eq!(seq.series.coefficients, bat.series.coefficients);
+    }
+
+    /// The raw-float fast path does not panic on per-operation overflow (see
+    /// `lie_rs::raw_mul`'s NaN policy); the fold audits the accumulator once
+    /// per step and fails loudly instead of persisting a NaN through the
+    /// `NotNan` invariant. All-`MAX` accumulator and letter displacement:
+    /// every product overflows to `inf`, and the fused two-orientation term
+    /// computes `inf + (-inf) = NaN` deterministically.
+    #[test]
+    #[should_panic(expected = "log-signature coefficients overflowed to NaN")]
+    fn fold_audits_nan_after_overflow() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (2usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let mut log_sig = builder.build::<NotNan<f64>>();
+        log_sig.series.coefficients =
+            vec![NotNan::new(f64::MAX).unwrap(); log_sig.series.coefficients.len()];
+        let mut seg = builder.build::<NotNan<f64>>();
+        seg.series.coefficients = (0..seg.series.coefficients.len())
+            .map(|k| {
+                NotNan::new(if k < d { f64::MAX } else { 0.0 }).unwrap()
+            })
+            .collect();
+        log_sig.concatenate_assign(&seg);
+    }
+
+    /// Same audit for the batched fold: NaN arising anywhere in a batch
+    /// survives every later add/multiply, so the single end-of-batch audit
+    /// still fails loudly.
+    #[test]
+    #[should_panic(expected = "log-signature coefficients overflowed to NaN")]
+    fn batch_fold_audits_nan_after_overflow() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (2usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let mut log_sig = builder.build::<NotNan<f64>>();
+        // Full, small-valued accumulator support, then warm folds to build
+        // the node lists and reach batch eligibility.
+        let mut seed = 0xfeed_u64;
+        let mut lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 7) as i128 - 3
+        };
+        let len = log_sig.series.coefficients.len();
+        log_sig.series.coefficients = (0..len)
+            .map(|k| {
+                NotNan::new(if k < d { 0.0 } else { lcg(&mut seed) as f64 }).unwrap()
+            })
+            .collect();
+        let letter_disp = |v: f64| -> Vec<NotNan<f64>> {
+            (0..len)
+                .map(|k| NotNan::new(if k < d { v } else { 0.0 }).unwrap())
+                .collect()
+        };
+        for _ in 0..4 {
+            log_sig.concatenate_assign_coefficients(&letter_disp(1.5));
+        }
+        // The overflowing displacement must take the batch path.
+        assert!(log_sig.dag.batch_eligible(
+            &log_sig.series.nonzero_coefficient_indices(&log_sig.series.coefficients),
+            &log_sig.series.nonzero_coefficient_indices(&letter_disp(f64::MAX)),
+        ));
+        log_sig.concatenate_batch_coefficients(&[&letter_disp(f64::MAX)]);
     }
 
     /// Fold structure analysis for class-partitioned scheduling: per level,

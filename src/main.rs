@@ -172,7 +172,8 @@ fn calculate_log_sig<
         + FromPrimitive
         + PrimitiveFloat
         + SubAssign
-        + MulAssign,
+        + MulAssign
+        + 'static,
 >(
     path: &Array2<T>,
     args: &Args,

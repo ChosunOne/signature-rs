@@ -326,7 +326,16 @@ where
 
 impl<U> CommutatorDag<U>
 where
-    U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign,
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + 'static,
 {
     /// Evaluates the whole plan for one concatenation.
     ///
@@ -1086,16 +1095,24 @@ where
                                 for (g, si) in
                                     (g0..g0 + run.len as usize).zip(0..run.len as usize)
                                 {
-                                    *acc.0.add(g) +=
-                                        (*run.src.add(si)).clone() * weight.clone();
+                                    // `raw_mul`/`raw_add_assign_ptr` skip the
+                                    // float wrappers' per-op NaN checks
+                                    // (raw-float fast path, see lie-rs
+                                    // `raw_mul`'s NaN policy).
+                                    lie_rs::raw_add_assign_ptr(
+                                        acc.0.add(g),
+                                        &lie_rs::raw_mul(&*run.src.add(si), weight),
+                                    );
                                     *run.src.add(si) = U::default();
                                 }
                             } else {
                                 for (g, si) in
                                     (g0..g0 + run.len as usize).zip(0..run.len as usize)
                                 {
-                                    *acc.0.add(g) +=
-                                        (*run.src.add(si)).clone() * weight.clone();
+                                    lie_rs::raw_add_assign_ptr(
+                                        acc.0.add(g),
+                                        &lie_rs::raw_mul(&*run.src.add(si), weight),
+                                    );
                                 }
                             }
                         }
@@ -1217,14 +1234,16 @@ where
         }
 
         // Per-position term accumulation in the DAG's term order — the same
-        // summation order the public-loop version produced.
+        // summation order the public-loop version produced. `raw_mul`/
+        // `raw_add_assign` skip the float wrappers' per-op NaN checks
+        // (raw-float fast path, see lie-rs `raw_mul`'s NaN policy).
         for (source, weight) in &self.structure.terms {
             let ct: &[U] = match source {
                 TermSource::Node(node) => &self.buffers[*node as usize - 2],
                 TermSource::Displacement => &rhs_cls,
             };
             for (acc_coeff, comm_coeff) in acc.iter_mut().zip(ct) {
-                *acc_coeff += comm_coeff.clone() * weight.clone();
+                lie_rs::raw_add_assign(acc_coeff, &lie_rs::raw_mul(comm_coeff, weight));
             }
         }
 

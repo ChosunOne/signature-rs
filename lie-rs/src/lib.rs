@@ -40,7 +40,8 @@ use std::ops::{Div, MulAssign};
 pub use bch_series_generator::{BchSeriesGenerator, Matrix2x2, MatrixTree};
 pub use lie_series::{
     CKS_ON, ClassBatchStage, ClassOrder, ClassOrderedCommutation, DEBUG_AB_ACC, DEBUG_AB_B,
-    DEBUG_AB_D, DEBUG_WRITES, GatingCache, KernelJob, LieSeries, commutator_coefficients_batch,
+    DEBUG_AB_D, DEBUG_WRITES, GatingCache, KernelJob, LieSeries, raw_add_assign,
+    raw_add_assign_ptr, raw_mul, commutator_coefficients_batch,
     commutator_coefficients_batch_with_cache, commutator_coefficients_class_batch_with_cache,
     commutator_coefficients_class_fold_with_cache, plan_class_sweep_stages, run_class_batch, IDENTITY_SHIFTS,
 };

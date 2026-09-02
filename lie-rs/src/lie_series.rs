@@ -1,3 +1,4 @@
+use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
@@ -16,6 +17,108 @@ use crate::feasible_decompositions::{self, ActiveSegment, Entry, FeasibleDecompo
 // Re-exported: the class-contiguous ordering handle behind
 // `ClassOrderedCommutation`.
 pub use crate::feasible_decompositions::ClassOrder;
+
+pub use self::raw_ops::{raw_add_assign, raw_add_assign_ptr, raw_mul};
+
+/// Raw-float fast path for the commutation kernel's coefficient arithmetic.
+///
+/// For the float coefficient types used in production the kernel's hot loops
+/// run their `*`/`+=` through these helpers instead of the arithmetic impls
+/// of the checking [`ordered_float::NotNan`] wrapper (each of which pays a
+/// per-operation NaN check, `ucomisd`+`jp` in the sweep's inner loop). The
+/// wrapper is `#[repr(transparent)]` over the primitive, so the helpers
+/// reinterpret the operands and compute in the primitive type; the
+/// `TypeId` comparisons constant-fold per monomorphization, so the dispatch
+/// is free for concrete callers and every other coefficient type (e.g.
+/// `Ratio<i128>`) keeps the identical generic path.
+///
+/// # NaN policy
+/// For the raw-float instantiations no per-operation NaN check runs. Finite
+/// inputs cannot produce NaN through `*`/`+=`; overflow produces infinities
+/// exactly as the checked path does, and only `inf - inf`-style combinations
+/// of those can yield NaN. Such a NaN is stored bit-for-bit into the
+/// `NotNan` slot (an invalid value for the wrapper's logical invariant, but
+/// not undefined behavior — the wrapper has no niche). Callers that persist
+/// results in `NotNan` slots audit them once per fold step (the
+/// log-signature fold) and fail loudly instead of leaving the broken
+/// invariant behind. Results are otherwise bitwise identical to the checked
+/// path.
+mod raw_ops {
+    use super::*;
+    use ordered_float::NotNan;
+
+    /// `a * b` without the float wrappers' per-operation NaN checks (see the
+    /// module-level [NaN policy]).
+    #[inline(always)]
+    pub fn raw_mul<U>(a: &U, b: &U) -> U
+    where
+        U: Clone + Mul<Output = U> + 'static,
+    {
+        if TypeId::of::<U>() == TypeId::of::<NotNan<f64>>() {
+            // SAFETY: `U` is `NotNan<f64>` (check above), which is
+            // `#[repr(transparent)]` over `f64`; every `NotNan<f64>` is a
+            // valid `f64`, so reading the operands through `f64` pointers is
+            // sound. The result may be NaN for overflowing inputs — the
+            // documented NaN policy covers that (callers audit).
+            unsafe {
+                let r = *(a as *const U).cast::<f64>() * *(b as *const U).cast::<f64>();
+                std::ptr::read((&r as *const f64).cast::<U>())
+            }
+        } else if TypeId::of::<U>() == TypeId::of::<NotNan<f32>>() {
+            // SAFETY: as the `f64` branch, with `NotNan<f32>` over `f32`.
+            unsafe {
+                let r = *(a as *const U).cast::<f32>() * *(b as *const U).cast::<f32>();
+                std::ptr::read((&r as *const f32).cast::<U>())
+            }
+        } else {
+            a.clone() * b.clone()
+        }
+    }
+
+    /// `*dst += src` without the float wrappers' per-operation NaN checks
+    /// (see the module-level [NaN policy]).
+    #[inline(always)]
+    pub fn raw_add_assign<U>(dst: &mut U, src: &U)
+    where
+        U: Clone + AddAssign + 'static,
+    {
+        // SAFETY: `dst` is a live, uniquely borrowed `U`.
+        unsafe { raw_add_assign_ptr(dst as *mut U, src as *const U) }
+    }
+
+    /// Raw-pointer counterpart of [`raw_add_assign`]: the parallel sweeps'
+    /// scatter targets are accessed through raw pointers (disjoint write
+    /// regions across tasks).
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes and point to a live `U`; `src` must be
+    /// valid for reads and point to a live `U`. Values written may be NaN for
+    /// overflowing float inputs (the documented NaN policy — callers audit).
+    #[inline(always)]
+    pub unsafe fn raw_add_assign_ptr<U>(dst: *mut U, src: *const U)
+    where
+        U: Clone + AddAssign + 'static,
+    {
+        if TypeId::of::<U>() == TypeId::of::<NotNan<f64>>() {
+            // SAFETY: `U` is `NotNan<f64>` (check above), `#[repr(transparent)]`
+            // over `f64`; both pointers reference live values and `dst` is
+            // uniquely owned by the caller's contract. A NaN write (overflow
+            // cancellation) is covered by the NaN policy.
+            unsafe {
+                *(dst.cast::<f64>()) += *src.cast::<f64>();
+            }
+        } else if TypeId::of::<U>() == TypeId::of::<NotNan<f32>>() {
+            // SAFETY: as the `f64` branch, with `NotNan<f32>` over `f32`.
+            unsafe {
+                *(dst.cast::<f32>()) += *src.cast::<f32>();
+            }
+        } else {
+            // SAFETY: `dst`/`src` are live per the caller's contract; the
+            // generic path is the wrapper's own checked `+=`.
+            unsafe { (*dst) += (*src).clone() };
+        }
+    }
+}
 
 #[cfg(feature = "progress")]
 use indicatif::{ProgressBar, ProgressStyle};
@@ -677,7 +780,8 @@ fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
         + Mul<Output = U>
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
     F: Fn(usize) + Sync,
 {
     use rayon::prelude::*;
@@ -740,15 +844,20 @@ fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
                         }
                         // SAFETY: i and j are class positions < the operand
                         // lengths (the gating's entries index the class space).
+                        // `raw_mul` skips the float wrappers' per-op NaN checks
+                        // (raw-float fast path); `-` never checks.
                         let term = unsafe {
                             if p_active {
-                                let mut t = (*job.a.add(i)).clone() * (*job.b.add(j)).clone();
+                                let mut t = raw_mul(&*job.a.add(i), &*job.b.add(j));
                                 if q_active {
-                                    t += -((*job.a.add(j)).clone() * (*job.b.add(i)).clone());
+                                    raw_add_assign(
+                                        &mut t,
+                                        &-raw_mul(&*job.a.add(j), &*job.b.add(i)),
+                                    );
                                 }
                                 t
                             } else {
-                                -((*job.a.add(j)).clone() * (*job.b.add(i)).clone())
+                                -raw_mul(&*job.a.add(j), &*job.b.add(i))
                             }
                         };
                         let from = entry.decomp_start as usize;
@@ -762,7 +871,7 @@ fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
                             // (content homogeneity), and is < the buffer
                             // length by the table invariant.
                             unsafe {
-                                writer.scatter_add(rs + rel as usize, c.clone() * term.clone());
+                                writer.scatter_add(rs + rel as usize, raw_mul(c, &term));
                             }
                         }
                     }
@@ -777,13 +886,15 @@ fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
 
 impl<U> RawResult<'_, U>
 where
-    U: AddAssign,
+    U: Clone + AddAssign + 'static,
 {
     #[inline(always)]
     unsafe fn scatter_add(&self, index: usize, value: U) {
         // SAFETY: callers guarantee `index` is in bounds and disjoint across
         // concurrent tasks (the job's result buffer and the unit partition).
-        unsafe { *self.ptr.add(index) += value };
+        // `raw_add_assign_ptr` skips the float wrappers' per-op NaN checks
+        // (raw-float fast path, see `raw_mul`'s NaN policy).
+        unsafe { raw_add_assign_ptr(self.ptr.add(index), &value) };
     }
 }
 
@@ -864,7 +975,8 @@ pub fn commutator_coefficients_batch<T, U>(
         + Mul<Output = U>
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     let mut cache = GatingCache::default();
     commutator_coefficients_batch_with_cache(a_series, jobs, &mut cache);
@@ -890,7 +1002,8 @@ pub fn commutator_coefficients_batch_with_cache<T, U>(
         + Mul<Output = U>
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     // Prologue per job (serial): presence bitsets, degree masks, active
     // units (memoized). Cheap relative to the sweep.
@@ -1132,7 +1245,8 @@ pub fn commutator_coefficients_class_batch_with_cache<T, U>(
         + Mul<Output = U>
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     debug_assert_eq!(
         order.inv().len(),
@@ -1351,7 +1465,8 @@ where
         + Mul<Output = U>
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     fn class_order(&self) -> Arc<ClassOrder> {
         self.feasible_decompositions.ensure_class_order()
@@ -1696,7 +1811,7 @@ struct FoldWalk<'a, U> {
     coeffs: &'a [U],
 }
 
-impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::Hash>
+impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::Hash + 'static>
     FoldWalk<'a, U>
 {
     /// Claims the next unclaimed pack of stage `s` off the stage's atomic
@@ -1824,27 +1939,32 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
                     // SAFETY: i and j are class positions of degrees p and q;
                     // the presence tests guarantee they are in the operands'
                     // supports, whose shift tables map them into the compact
-                    // (or full-d, shift 0) buffers below.
+                    // (or full-d, shift 0) buffers below. `raw_mul` skips the
+                    // float wrappers' per-op NaN checks (raw-float fast path);
+                    // `-` never checks.
                     let term = unsafe {
                         if p_active {
-                            let mut t = (*job.a.add(i - a_sh_p)).clone()
-                                * (*job.b.add(j - b_sh_q)).clone();
+                            let mut t =
+                                raw_mul(&*job.a.add(i - a_sh_p), &*job.b.add(j - b_sh_q));
                             if q_active {
-                                t += -((*job.a.add(j - a_sh_q)).clone()
-                                    * (*job.b.add(i - b_sh_p)).clone());
+                                raw_add_assign(
+                                    &mut t,
+                                    &-raw_mul(&*job.a.add(j - a_sh_q), &*job.b.add(i - b_sh_p)),
+                                );
                             }
                             t
                         } else {
-                            -((*job.a.add(j - a_sh_q)).clone()
-                                * (*job.b.add(i - b_sh_p)).clone())
+                            -raw_mul(&*job.a.add(j - a_sh_q), &*job.b.add(i - b_sh_p))
                         }
                     };
                     let from = entry.decomp_start as usize;
                     let to = next.decomp_start as usize;
                     for (&rel, c) in self.decomp[from..to].iter().zip(&self.coeffs[from..to]) {
                         // Raw-pointer accumulate: see the SAFETY note above.
+                        // `raw_add_assign_ptr` skips the float wrappers'
+                        // per-op NaN checks (raw-float fast path).
                         unsafe {
-                            *result.add(r_base + rel as usize) += c.clone() * term.clone();
+                            raw_add_assign_ptr(result.add(r_base + rel as usize), &raw_mul(c, &term));
                         }
                     }
                 }
@@ -1884,7 +2004,8 @@ where
         + Mul<Output = U>
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     let threads = rayon::current_num_threads().max(1);
     let mut stages = Vec::with_capacity(levels.len());
@@ -2050,7 +2171,14 @@ pub fn run_class_batch<T, U>(
     stages: &[&ClassBatchStage<'_, U>],
 ) where
     T: Clone + Ord + Generator + Hash,
-    U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::Hash + Send + Sync,
+    U: Clone
+        + Neg<Output = U>
+        + Mul<Output = U>
+        + AddAssign
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static,
 {
     // The walk is fully internal for sweep stages: relabeled entries gate
     // the presence tests and index the class-ordered operands. Results are
@@ -2207,7 +2335,8 @@ pub fn commutator_coefficients_class_fold_with_cache<T, U>(
         + Mul<Output = U>
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 {
     debug_assert_eq!(
         order.inv().len(),
@@ -2270,7 +2399,7 @@ impl<S: ScatterSink> ScatterSink for TranslateSink<'_, S> {
     }
 }
 
-fn scatter_decomposition<U: Clone + Mul<Output = U> + AddAssign, S: ScatterSink>(
+fn scatter_decomposition<U: Clone + Mul<Output = U> + AddAssign + 'static, S: ScatterSink>(
     basis_indices: &[u32],
     basis_coefficients: &[U],
     t: &U,
@@ -2278,20 +2407,33 @@ fn scatter_decomposition<U: Clone + Mul<Output = U> + AddAssign, S: ScatterSink>
     block_start: usize,
     sink: &mut S,
 ) {
-    // SAFETY: `basis_index` is relative to the result slice handed in — for   Not Committed Yet
+    // SAFETY: `basis_index` is relative to the result slice handed in — for
     // the commutation kernel, the degree-`target` slice of the full result —
     // and comes from the structure-constant table built in `LieSeries::new`,
     // so it is always < result.len() for the duration of the call.
     for (&basis_index, basis_coefficient) in basis_indices.iter().zip(basis_coefficients) {
         sink.scatter(block_start + basis_index as usize);
-        *unsafe { result.get_unchecked_mut(basis_index as usize) } +=
-            basis_coefficient.clone() * t.clone();
+        // `raw_mul`/`raw_add_assign` skip the float wrappers' per-op NaN
+        // checks (raw-float fast path, see `raw_mul`'s NaN policy).
+        raw_add_assign(
+            unsafe { result.get_unchecked_mut(basis_index as usize) },
+            &raw_mul(basis_coefficient, t),
+        );
     }
 }
 
 impl<
     T: Clone + Ord + Generator + Hash + Eq,
-    U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign,
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + 'static,
 > LieSeries<T, U>
 {
     /// Indices of non-zero coefficients that the commutation kernel will
@@ -2788,15 +2930,18 @@ impl<
                     continue;
                 }
                 let term = if p_active {
-                    let mut t = a_coefficients[i].clone() * b_coefficients[j].clone();
+                    let mut t = raw_mul(&a_coefficients[i], &b_coefficients[j]);
                     if q_active {
-                        t += -(a_coefficients[j].clone() * b_coefficients[i].clone());
+                        raw_add_assign(
+                            &mut t,
+                            &-raw_mul(&a_coefficients[j], &b_coefficients[i]),
+                        );
                     }
                     t
                 } else {
                     // Orientation (a = j, b = i) only: `[basis[j], basis[i]]`
                     // is the negation of the stored decomposition.
-                    -(a_coefficients[j].clone() * b_coefficients[i].clone())
+                    -raw_mul(&a_coefficients[j], &b_coefficients[i])
                 };
                 let from = entry.decomp_start as usize;
                 let to = next.decomp_start as usize;
@@ -2839,7 +2984,8 @@ impl<
         + Hash
         + AddAssign
         + Send
-        + Sync,
+        + Sync
+        + 'static,
 > Commutator<&Self> for LieSeries<T, U>
 {
     type Output = Self;
@@ -3604,5 +3750,113 @@ mod anagram {
                 }
             }
         }
+    }
+
+    /// The raw-float fast path (`NotNan<f64>` / `f64` dispatch) and the
+    /// generic path (`Ratio<i128>`) must agree. Integer-valued coefficients
+    /// keep every intermediate exactly representable in `f64` (magnitudes
+    /// stay far below 2^53), so the comparison is exact. (Ported from the
+    /// original raw-float fast path change.)
+    #[test]
+    fn raw_float_kernel_matches_rationals() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use num_rational::Ratio;
+        use num_traits::ToPrimitive;
+
+        for (d, m) in [(2usize, 6usize), (3, 5)] {
+            let words = LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let coeffs = |salt: usize| {
+                (0..words.len())
+                    .map(|i| ((i * 7 + salt * 13) % 21) as i128 - 10)
+                    .collect::<Vec<_>>()
+            };
+            let (a_int, b_int) = (coeffs(1), coeffs(2));
+
+            // Raw-float path.
+            let a_f = LieSeries::<u8, NotNan<f64>>::new(
+                words.clone(),
+                a_int
+                    .iter()
+                    .map(|&x| NotNan::new(x as f64).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            let b_f = LieSeries::<u8, NotNan<f64>>::new(
+                words.clone(),
+                b_int
+                    .iter()
+                    .map(|&x| NotNan::new(x as f64).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            let ab_f = a_f.commutator(&b_f);
+
+            // Generic exact path.
+            let a_r = LieSeries::<u8, Ratio<i128>>::new(
+                words.clone(),
+                a_int.iter().map(|&x| Ratio::from_integer(x)).collect(),
+            );
+            let b_r = LieSeries::<u8, Ratio<i128>>::new(
+                words.clone(),
+                b_int.iter().map(|&x| Ratio::from_integer(x)).collect(),
+            );
+            let ab_r = a_r.commutator(&b_r);
+
+            for (x, y) in ab_f.coefficients.iter().zip(&ab_r.coefficients) {
+                assert_eq!(
+                    x.into_inner(),
+                    y.to_f64().unwrap(),
+                    "d={d} m={m}: raw float vs exact rationals"
+                );
+            }
+        }
+    }
+
+    /// The raw helpers must behave bitwise like the primitive float ops and
+    /// must NOT panic where the wrapper's arithmetic would: overflow to
+    /// infinity and its NaN cancellation are the caller's audit (NaN policy
+    /// of `raw_mul`).
+    #[test]
+    fn raw_ops_match_primitive_semantics_without_panic() {
+        use num_rational::Ratio;
+
+        // Overflow: the wrapper's Mul panics on NaN results only; plain
+        // overflow to inf is fine in both. Check bitwise equality with the
+        // primitive for representative inputs, including the NaN-producing
+        // combination the checked path would panic on.
+        let cases = [
+            (3.0f64, 5.0f64),
+            (-2.5, 4.25),
+            (f64::MAX, f64::MAX),   // -> inf
+            (f64::MAX, -f64::MAX),  // -> -inf
+        ];
+        for (x, y) in cases {
+            let a = NotNan::new(x).unwrap();
+            let b = NotNan::new(y).unwrap();
+            let raw = raw_mul(&a, &b);
+            assert_eq!(raw.into_inner().to_bits(), (x * y).to_bits());
+        }
+        // NaN cancellation: inf + (-inf) — the wrapper's AddAssign panics,
+        // the raw helper writes the NaN (audit is the caller's job).
+        let mut acc = NotNan::new(f64::INFINITY).unwrap();
+        let neg_inf = NotNan::new(f64::NEG_INFINITY).unwrap();
+        raw_add_assign(&mut acc, &neg_inf);
+        assert!(is_nan_f64(acc.into_inner()));
+
+        // f32 mirrors f64.
+        let a = NotNan::new(f32::MAX).unwrap();
+        let raw = raw_mul(&a, &a);
+        assert_eq!(raw.into_inner().to_bits(), (f32::MAX * f32::MAX).to_bits());
+
+        // The generic (non-float) path is untouched: exact multiplication.
+        let r = Ratio::new(7i128, 3);
+        let s = Ratio::new(-2i128, 5);
+        let mut acc_r = r.clone();
+        raw_add_assign(&mut acc_r, &s);
+        assert_eq!(acc_r, r + s);
+        assert_eq!(raw_mul(&r, &s), r * s);
+    }
+
+    #[inline]
+    fn is_nan_f64(x: f64) -> bool {
+        x != x
     }
 }
