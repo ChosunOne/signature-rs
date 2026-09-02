@@ -69,8 +69,16 @@ struct AccumRun<U> {
     len: u32,
     /// Source pointer: the node's compact slot holding position `g0` (the
     /// fold displacement at `g0` for the displacement term); advances with
-    /// `g0`.
-    src: *const U,
+    /// `g0`. Mutable because fused runs write `U::default()` back after
+    /// consuming each slot (the pointer is derived from the batch's
+    /// mutable compact/displacement buffers).
+    src: *mut U,
+    /// Fused zero-after-add: each source slot is written back to
+    /// `U::default()` as it is consumed. Set only for a node referenced by
+    /// exactly one term (its slots are dead once that term has read them);
+    /// the displacement term's `b_cls` source is rewritten wholesale by
+    /// the next fold's gather, so it never needs this.
+    zero: bool,
 }
 
 /// One zero run of a block's work list: a contiguous stretch of one
@@ -179,6 +187,35 @@ fn node_nonzeros<'a>(
         if idx == 0 { a_nonzero } else { b_nonzero }
     } else {
         &before[idx as usize - 2]
+    }
+}
+
+/// Groups a sorted ascending position list into maximal runs of consecutive
+/// positions within one block (position `p` belongs to block
+/// `p * blocks / d`), invoking `emit(block, first_position, run_length)`
+/// per run in ascending order. Consecutive positions of one block merge
+/// into a single run; a block boundary or a position gap starts a new one.
+fn for_each_position_run(
+    positions: &[u32],
+    blocks: usize,
+    d: usize,
+    mut emit: impl FnMut(usize, u32, u32),
+) {
+    let mut i = 0;
+    while i < positions.len() {
+        let first = positions[i];
+        let block = first as usize * blocks / d;
+        let mut last = first;
+        let mut j = i + 1;
+        while j < positions.len()
+            && positions[j] == last + 1
+            && positions[j] as usize * blocks / d == block
+        {
+            last = positions[j];
+            j += 1;
+        }
+        emit(block, first, last - first + 1);
+        i = j;
     }
 }
 
@@ -800,88 +837,160 @@ where
         // compact node buffers before the first in-batch sweep (the
         // accumulate stages then maintain the zeroing); per fold, BG gathers
         // the displacement into class space and C accumulates the terms.
-        // The closures address the compact node buffers through their slice
-        // layouts: block `bi` owns class positions `[c0, c1)`, and a node's
-        // slots for that range are, per active degree slice, the contiguous
-        // run `[base + lo - rs, base + hi - rs)` for the slice's overlap
-        // `[lo, hi) = [rs, re) ∩ [c0, c1)`.
         //
-        // Those runs are materialized once per batch, here at plan time:
-        // block `b` only accumulates the (term, slice) pairs whose class
-        // positions intersect its range and zeroes the compact slots inside
-        // it, so its work lists hold exactly those — not every term and
-        // every layout. The runs keep the full walk's order (ascending term
-        // index; within a term, ascending degree slice), so every position's
-        // add sequence — value, weight, term order — is bit-identical to the
-        // full-d walk's, and the zero runs partition the compact slots
-        // across blocks exactly as before.
+        // Those runs are materialized once per batch, here at plan time —
+        // and only over each source's LIVE slots. A node's sweep scatters
+        // exactly onto its recorded scatter set (the planner's exact write
+        // set, re-recorded into `self.nonzeros` above), so compact slots
+        // outside it are padding that no sweep ever touches — permanently
+        // `U::default()`. Their `weight × (+0.0)` adds are value-zero and
+        // dropped: the only observable difference is the sign bit of an
+        // exact-zero accumulator slot (adding +0.0 turns a −0.0 into +0.0;
+        // adding −0.0 is a bitwise identity), never the `==` value. The
+        // runs keep the full walk's per-position add order (ascending term
+        // index; within a term, ascending degree slice and ascending
+        // position), so every position's add sequence — value, weight, term
+        // order — is unchanged. Zeroing is fused into the single
+        // referencing term's runs (a node is the canonical root of at most
+        // one BCH term — distinct Lyndon words have distinct canonical
+        // bracketings — so no other run reads the slot after that term's
+        // add); nodes no term accumulates (shared interior brackets, or
+        // defensively a multi-rooted node) keep explicit zero runs over
+        // their live slots.
         let mut block_work: Vec<BlockWork<U>> = (0..blocks)
             .map(|_| BlockWork {
                 accum: Vec::new(),
                 zero: Vec::new(),
             })
             .collect();
+        // Referencing terms per node: count 1 → that term's accum runs fuse
+        // the slot zeroing; count 0 (interior node) or ≥ 2 (defensive) →
+        // explicit zero runs.
+        let mut node_terms: Vec<Vec<u32>> = vec![Vec::new(); internal];
+        for (ti, (source, _)) in self.structure.terms.iter().enumerate() {
+            if let TermSource::Node(k) = source {
+                node_terms[*k as usize - 2].push(ti as u32);
+            }
+        }
         for (ti, (source, _)) in self.structure.terms.iter().enumerate() {
             match source {
                 TermSource::Displacement => {
-                    // Every block owns a contiguous class range, so its
-                    // displacement run is exactly that range (same as the
-                    // old per-block `for g in c0..c1` sweep, which every
-                    // block ran unconditionally).
+                    // The gather rewrites every b_cls slot each fold with
+                    // `rhs[perm[g]]` (`U::default()` beyond the rhs
+                    // length), and the batch driver guarantees every rhs is
+                    // value-zero outside the common support over the
+                    // kernel-reachable positions
+                    // `[0, degree_start(max_degree))` — exactly the prefix
+                    // below `tail` (class and public layouts share degree-
+                    // slice boundaries). The degree-`max_degree` tail lies
+                    // beyond that check, so its whole contiguous range
+                    // stays covered: its gather-written values fold
+                    // unconditionally, exactly as before. Everything
+                    // skipped in the prefix is a value-zero add (see the
+                    // sign-of-zero note above).
+                    let tail = deg_start[max_deg];
+                    let mut sup: Vec<u32> = b_nz_cls
+                        .iter()
+                        .copied()
+                        .map(|p| p as u32)
+                        .filter(|&p| p < tail)
+                        .collect();
+                    sup.sort_unstable();
+                    for_each_position_run(&sup, blocks, d, |b, first, len| {
+                        block_work[b].accum.push(AccumRun {
+                            term: ti as u32,
+                            g0: first,
+                            len,
+                            // b_cls is a full-d buffer: class position `p`
+                            // lives at slot `p`.
+                            src: unsafe { b_data.add(first as usize) },
+                            zero: false,
+                        });
+                    });
                     for (b, &(c0, c1)) in ranges.iter().enumerate() {
-                        if c0 < c1 {
+                        let lo = c0.max(tail);
+                        if lo < c1 {
                             block_work[b].accum.push(AccumRun {
                                 term: ti as u32,
-                                g0: c0,
-                                len: c1 - c0,
-                                src: unsafe { b_data.add(c0 as usize) } as *const U,
+                                g0: lo,
+                                len: c1 - lo,
+                                src: unsafe { b_data.add(lo as usize) },
+                                zero: false,
                             });
                         }
                     }
                 }
                 TermSource::Node(k) => {
-                    let (ptr, _) = compact_ptrs[*k as usize - 2];
-                    for &CompactSlice { base, rs, re } in &layouts[*k as usize - 2] {
-                        // Position x belongs to block `x * blocks / d`, so
-                        // the slice's first and last positions bracket the
-                        // blocks it intersects; only their overlaps are
-                        // appended, in ascending block (and position) order.
-                        let b_first = rs as usize * blocks / d;
-                        let b_last = (re as usize - 1) * blocks / d;
-                        for b in b_first..=b_last {
-                            let (c0, c1) = ranges[b];
-                            let lo = rs.max(c0);
-                            let hi = re.min(c1);
-                            if lo < hi {
-                                block_work[b].accum.push(AccumRun {
-                                    term: ti as u32,
-                                    g0: lo,
-                                    len: hi - lo,
-                                    src: unsafe { ptr.add((base + lo - rs) as usize) } as *const U,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (ni, &(ptr, _)) in compact_ptrs.iter().enumerate() {
-            for &CompactSlice { base, rs, re } in &layouts[ni] {
-                let b_first = rs as usize * blocks / d;
-                let b_last = (re as usize - 1) * blocks / d;
-                for b in b_first..=b_last {
-                    let (c0, c1) = ranges[b];
-                    let lo = rs.max(c0);
-                    let hi = re.min(c1);
-                    if lo < hi {
-                        block_work[b].zero.push(ZeroRun {
-                            ptr,
-                            s0: base + lo - rs,
-                            len: hi - lo,
+                    let ki = *k as usize - 2;
+                    let (ptr, _) = compact_ptrs[ki];
+                    // The node's exact batch scatter set (sorted class
+                    // positions): the positions its sweep writes, hence
+                    // the only slots that can be non-zero here.
+                    let sup: Vec<u32> = self.nonzeros[ki].iter().map(|&p| p as u32).collect();
+                    debug_assert!(sup.windows(2).all(|w| w[0] < w[1]));
+                    let fused = node_terms[ki].len() == 1;
+                    debug_assert!(!fused || node_terms[ki][0] == ti as u32);
+                    for &CompactSlice { base, rs, re } in &layouts[ki] {
+                        // The support positions inside the slice (both
+                        // lists ascending); position `p` lives at slot
+                        // `base + p - rs` and belongs to block
+                        // `p * blocks / d`.
+                        let s0 = sup.partition_point(|&p| p < rs);
+                        let s1 = sup.partition_point(|&p| p < re);
+                        for_each_position_run(&sup[s0..s1], blocks, d, |b, first, len| {
+                            block_work[b].accum.push(AccumRun {
+                                term: ti as u32,
+                                g0: first,
+                                len,
+                                src: unsafe { ptr.add((base + first - rs) as usize) },
+                                zero: fused,
+                            });
                         });
                     }
                 }
             }
+        }
+        // Zero runs for the slots no fused accum run zeroes: interior
+        // nodes (never accumulated — shared brackets read only as sweep
+        // operands) and, defensively, multi-rooted nodes.
+        #[cfg(debug_assertions)]
+        let mut zero_covered: Vec<u64> = vec![0; internal];
+        for (ni, &(ptr, _)) in compact_ptrs.iter().enumerate() {
+            if node_terms[ni].len() == 1 {
+                continue;
+            }
+            let sup: Vec<u32> = self.nonzeros[ni].iter().map(|&p| p as u32).collect();
+            debug_assert!(sup.windows(2).all(|w| w[0] < w[1]));
+            for &CompactSlice { base, rs, re } in &layouts[ni] {
+                let s0 = sup.partition_point(|&p| p < rs);
+                let s1 = sup.partition_point(|&p| p < re);
+                #[cfg(debug_assertions)]
+                let covered = &mut zero_covered[ni];
+                for_each_position_run(&sup[s0..s1], blocks, d, |b, first, len| {
+                    #[cfg(debug_assertions)]
+                    {
+                        *covered += len as u64;
+                    }
+                    block_work[b].zero.push(ZeroRun {
+                        ptr,
+                        s0: base + first - rs,
+                        len,
+                    });
+                });
+            }
+        }
+        // Plan-time coverage invariant: every live slot of every node is
+        // zeroed exactly once per fold — by its single referencing term's
+        // fused runs (which cover the node's whole scatter set) or by the
+        // explicit zero runs above.
+        #[cfg(debug_assertions)]
+        for (ni, sup) in self.nonzeros.iter().enumerate() {
+            let fused = node_terms[ni].len() == 1;
+            debug_assert_eq!(
+                zero_covered[ni] as usize + if fused { sup.len() } else { 0 },
+                sup.len(),
+                "node {ni}: live-slot zero coverage incomplete"
+            );
         }
         let work_shared = SendBlockWork(Arc::new(block_work));
         let mut block_closures: Vec<Box<dyn Fn(usize) + Send + Sync>> =
@@ -957,17 +1066,37 @@ where
                     let (work, acc, b, structure, ranges) = (&work, &acc, &b, &structure, &ranges);
                     let terms = &structure.terms;
                     unsafe {
-                        // This block's intersecting (term, slice) runs only,
-                        // in the original term order: each position's add
-                        // sequence matches the full walk bit for bit.
+                        // This block's intersecting runs only, in the
+                        // original term order: each position's add sequence
+                        // matches the full walk bit for bit. Fused runs
+                        // zero their source slot right after consuming it
+                        // — the node's slots are dead once its single
+                        // referencing term has read them — so the fold's
+                        // zeroing touches the same cache lines the adds
+                        // already do.
                         for run in &work.0[bi].accum {
                             let weight = &terms[run.term as usize].1;
                             let g0 = run.g0 as usize;
                             // SAFETY: the run's positions stay inside the
                             // block's disjoint range of `acc` and inside the
-                            // source buffer's run of live slots.
-                            for (g, si) in (g0..g0 + run.len as usize).zip(0..run.len as usize) {
-                                *acc.0.add(g) += (*run.src.add(si)).clone() * weight.clone();
+                            // source buffer's run of live slots; the fused
+                            // zero-back writes only slots this run just read
+                            // (owned by this block, dead afterwards).
+                            if run.zero {
+                                for (g, si) in
+                                    (g0..g0 + run.len as usize).zip(0..run.len as usize)
+                                {
+                                    *acc.0.add(g) +=
+                                        (*run.src.add(si)).clone() * weight.clone();
+                                    *run.src.add(si) = U::default();
+                                }
+                            } else {
+                                for (g, si) in
+                                    (g0..g0 + run.len as usize).zip(0..run.len as usize)
+                                {
+                                    *acc.0.add(g) +=
+                                        (*run.src.add(si)).clone() * weight.clone();
+                                }
                             }
                         }
                         // zero this block's slot runs of the compact buffers
