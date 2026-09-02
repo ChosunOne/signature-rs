@@ -12,7 +12,10 @@ use lyndon_rs::generators::Generator;
 use lyndon_rs::lyndon::LyndonWord;
 use num_traits::{One, Zero};
 
-use crate::feasible_decompositions::{self, ActiveSegment, Entry, FeasibleDecompositions};
+use crate::feasible_decompositions::{
+    self, ActiveSegment, Entry, FeasibleDecompositions, TICKET_INDEX_MASK, TICKET_P_ACTIVE,
+    TICKET_Q_ACTIVE,
+};
 
 // Re-exported: the class-contiguous ordering handle behind
 // `ClassOrderedCommutation`.
@@ -560,60 +563,68 @@ const BUNDLE_TARGET_ENTRIES: usize = 2048;
 /// integrity (bundles never split a unit) provides the natural minimum.
 const MIN_BUNDLE_ENTRIES: usize = 16;
 
-/// The kernel prologue's output: presence bitsets, the active anagram
-/// units (shared through a [`GatingCache`]), and the total visited-entry
-/// count.
+/// The kernel prologue's output: the active anagram units (shared through a
+/// [`GatingCache`]), their precomputed active-entry tickets, and the total
+/// visited-entry count.
 struct KernelGating {
-    presence: Vec<u64>,
-    words: usize,
     active: Arc<[ActiveSegment]>,
+    /// Flat list of packed active-entry tickets (see the `TICKET_*`
+    /// constants): per active segment, in `active` order, only the span's
+    /// entries that passed the owning job's presence tests, with the
+    /// resolved orientation in the top bits. A segment's
+    /// `ticket_start/ticket_end` slices this list; the sweeps iterate
+    /// tickets instead of re-testing every table entry, so the per-entry
+    /// presence resolution runs once per gating, not per kernel call.
+    tickets: Arc<[u32]>,
     total_entries: usize,
 }
 
-impl KernelGating {
-    #[inline]
-    fn presences(&self) -> (&[u64], &[u64]) {
-        self.presence.split_at(self.words)
-    }
-}
-
-/// Memo for [`LieSeries::commutator_coefficients_batch_with_cache`]: maps a
-/// job's degree-support masks to its active anagram-unit list.
+/// Memo for the commutation kernel's prologues: maps a job's operand
+/// support lists to its resolved gating — the active anagram-unit list
+/// plus the flat per-entry ticket list with the presence results baked
+/// in.
 ///
-/// Unit activity depends only on *which degrees* each side supports — not on
-/// coefficient values or the exact support indices — so the prologue reduces
-/// reduces each side's non-zero list to a `[u64; 2]` degree mask (covering
-/// degrees 0..127, the same range as the table's per-unit `p_mask`) and walks the unit table once per distinct mask pair.
-/// In a log-signature fold every DAG node's support lives in a single degree
-/// slice (degree homogeneity), so distinct mask pairs are few and nearly
-/// every kernel call after the first fold is a memo hit.
+/// The key is a 128-bit fingerprint per side of the *exact* support lists
+/// (not just their degree masks): the cached tickets bake per-entry
+/// presence results, which degree masks do not determine — two supports
+/// can cover the same degrees through different words (exactly what the
+/// old per-entry bit tests re-resolved on every kernel call). The
+/// fingerprints mix the list lengths in and avalanche-finish both streams,
+/// so distinct lists reuse an entry only with negligible probability; an
+/// entry's gating is reused solely for identical supports.
+///
+/// In a log-signature fold the DAG's node support lists are a value-
+/// independent fixed point, so steady-state folds (and whole batches)
+/// hit the cache for every job: the per-entry resolution runs once per
+/// distinct (job, operand supports), not per fold.
 ///
 /// The cache is valid only for the decomposition table of the series whose
 /// prologues populated it.
 #[derive(Clone, Default)]
 pub struct GatingCache {
-    /// Open-addressed linear-probe table keyed by the `(a_deg, b_deg)` mask
-    /// pair. Distinct pairs per configuration are few (degree-support
-    /// signatures of the DAG's nodes), so a fixed-capacity table with a
+    /// Open-addressed linear-probe table keyed by the two support
+    /// fingerprints. Distinct pairs per configuration are few (the DAG's
+    /// distinct node-support pairs), so a fixed-capacity table with a
     /// cheap multiplicative hash beats a full hash map: the lookup runs per
     /// kernel call, and at small grids the SipHash + bucket walk was a
     /// measurable share of the fold.
     slots: Vec<Slot>,
 }
 
-/// Key + value for one [`GatingCache`] slot. `None` key = empty; the zero
-/// mask pair is a legitimate key, so emptiness is tracked out of band.
+/// Key + value for one [`GatingCache`] slot. `None` key = empty; the all-
+/// zero fingerprint pair is a legitimate key (two empty supports), so
+/// emptiness is tracked out of band.
 #[derive(Clone, Default)]
 struct Slot {
     key: Option<([u64; 2], [u64; 2])>,
-    value: (Arc<[ActiveSegment]>, usize),
+    value: (Arc<[ActiveSegment]>, Arc<[u32]>, usize),
 }
 
 impl GatingCache {
-    /// Looks up `(a_deg, b_deg)`, returning the memoized
-    /// `(active segments, visited entry count)`.
+    /// Looks up the support fingerprint pair, returning the memoized
+    /// `(active segments, flat tickets, visited entry count)`.
     #[inline]
-    fn get(&self, key: ([u64; 2], [u64; 2])) -> Option<&(Arc<[ActiveSegment]>, usize)> {
+    fn get(&self, key: ([u64; 2], [u64; 2])) -> Option<&(Arc<[ActiveSegment]>, Arc<[u32]>, usize)> {
         let cap = self.slots.len();
         if cap == 0 {
             return None;
@@ -630,7 +641,7 @@ impl GatingCache {
     }
 
     /// Inserts, growing the table to the next power of two when full.
-    fn insert(&mut self, key: ([u64; 2], [u64; 2]), value: (Arc<[ActiveSegment]>, usize)) {
+    fn insert(&mut self, key: ([u64; 2], [u64; 2]), value: (Arc<[ActiveSegment]>, Arc<[u32]>, usize)) {
         if self.slots.len() * 3 / 4 <= self.len() {
             let old = std::mem::take(&mut self.slots);
             self.slots = vec![Slot::default(); (old.len() * 2).max(8)];
@@ -646,7 +657,7 @@ impl GatingCache {
     fn insert_unchecked(
         &mut self,
         key: ([u64; 2], [u64; 2]),
-        value: (Arc<[ActiveSegment]>, usize),
+        value: (Arc<[ActiveSegment]>, Arc<[u32]>, usize),
     ) {
         let cap = self.slots.len();
         let mut idx = Self::hash(&key) & (cap - 1);
@@ -827,21 +838,20 @@ fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
                     let job = &jobs[ji];
                     let writer = &writers[ji];
                     let gating = &gateways[ji];
-                    let (a_present, b_present) = gating.presences();
                     let rs = au.rs as usize;
                     let rel_indices = rel_tbl;
-                    let span = &entries_tbl[au.span_start as usize..au.span_end as usize];
-                    for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
+                    // Precomputed tickets (see `sweep_units_serial`): the
+                    // visit stream is the presence-resolved subsequence of
+                    // the span, orientation flags packed — no per-entry bit
+                    // tests in the hot loop, identical term computations.
+                    for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize]
+                    {
+                        let e = (ticket & TICKET_INDEX_MASK) as usize;
+                        let entry = entries_tbl[e];
+                        let next = entries_tbl[e + 1];
+                        let p_active = ticket & TICKET_P_ACTIVE != 0;
+                        let q_active = ticket & TICKET_Q_ACTIVE != 0;
                         let (i, j) = (entry.i as usize, entry.j as usize);
-                        let p_active = au.o1
-                            && a_present[i / 64] & (1u64 << (i % 64)) != 0
-                            && b_present[j / 64] & (1u64 << (j % 64)) != 0;
-                        let q_active = au.o2
-                            && a_present[j / 64] & (1u64 << (j % 64)) != 0
-                            && b_present[i / 64] & (1u64 << (i % 64)) != 0;
-                        if !p_active && !q_active {
-                            continue;
-                        }
                         // SAFETY: i and j are class positions < the operand
                         // lengths (the gating's entries index the class space).
                         // `raw_mul` skips the float wrappers' per-op NaN checks
@@ -1629,6 +1639,7 @@ pub static DEBUG_AB_ACC: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 pub static DEBUG_AB_B: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static DEBUG_AB_D: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+
 /// A park/wake gate for one stage boundary. Waiters poll the stage
 /// counter briefly (stage work is microsecond-scale; polling costs the
 /// finisher nothing), and only a waiter whose gate stays closed parks —
@@ -1885,7 +1896,6 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
             // no resize during the dispatch).
             let result: *mut U = job.result;
             let gating = &stage.gateways[ji];
-            let (a_present, b_present) = gating.presences();
             // Compact-layout address shifts (see `KernelJob`): class position
             // `x` of degree `d` lives at `x - shift[d]` in its buffer. The
             // shifts are per-degree tables (tiny, L1-resident) and the
@@ -1924,18 +1934,19 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
                 // `rs + rel - r_shift[td]` in the result buffer; hoist the
                 // constant part so the inner loop is one add, as before.
                 let r_base = rs - unsafe { *r_shift.add(td) } as usize;
-                let span = &self.entries[au.span_start as usize..au.span_end as usize];
-                for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
+                // Precomputed tickets (see `sweep_units_serial`): the visit
+                // stream is the presence-resolved subsequence of the span,
+                // orientation flags packed in the top bits — no per-entry
+                // bit tests in the hot loop, identical term computations.
+                for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize] {
+                    let e = (ticket & TICKET_INDEX_MASK) as usize;
+                    let entry = self.entries[e];
+                    // The table's trailing sentinel backs the +1 successor
+                    // (see `sweep_units_serial`).
+                    let next = self.entries[e + 1];
+                    let p_active = ticket & TICKET_P_ACTIVE != 0;
+                    let q_active = ticket & TICKET_Q_ACTIVE != 0;
                     let (i, j) = (entry.i as usize, entry.j as usize);
-                    let p_active = au.o1
-                        && a_present[i / 64] & (1u64 << (i % 64)) != 0
-                        && b_present[j / 64] & (1u64 << (j % 64)) != 0;
-                    let q_active = au.o2
-                        && a_present[j / 64] & (1u64 << (j % 64)) != 0
-                        && b_present[i / 64] & (1u64 << (i % 64)) != 0;
-                    if !p_active && !q_active {
-                        continue;
-                    }
                     // SAFETY: i and j are class positions of degrees p and q;
                     // the presence tests guarantee they are in the operands'
                     // supports, whose shift tables map them into the compact
@@ -2041,29 +2052,21 @@ where
             .collect();
         if want_scatter_sets {
             // Exact scatter sets for this level's jobs (same visit logic as
-            // `sweep_pack_range`: segment spans, orientation flags, per-entry
-            // presence tests, per-entry decomposition ranges).
+            // `sweep_pack_range`: the gating's precomputed tickets — the
+            // presence-resolved, orientation-packed subsequence of each
+            // segment's span — and per-entry decomposition ranges).
             let mut level_sets: Vec<Vec<u32>> = Vec::with_capacity(level.len());
             for (ji, _) in level.iter().enumerate() {
                 let gateway = &gateways[ji];
-                let (a_present, b_present) = gateway.presences();
                 let mut seen = vec![false; space];
                 for au in gateway.active.iter() {
                     let rs = au.rs as usize;
-                    let span = &entries_tbl[au.span_start as usize..au.span_end as usize];
-                    for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
-                        let (i, j) = (entry.i as usize, entry.j as usize);
-                        let p_active = au.o1
-                            && a_present[i / 64] & (1u64 << (i % 64)) != 0
-                            && b_present[j / 64] & (1u64 << (j % 64)) != 0;
-                        let q_active = au.o2
-                            && a_present[j / 64] & (1u64 << (j % 64)) != 0
-                            && b_present[i / 64] & (1u64 << (i % 64)) != 0;
-                        if !p_active && !q_active {
-                            continue;
-                        }
-                        let from = entry.decomp_start as usize;
-                        let to = next.decomp_start as usize;
+                    for &ticket in
+                        &gateway.tickets[au.ticket_start as usize..au.ticket_end as usize]
+                    {
+                        let e = (ticket & TICKET_INDEX_MASK) as usize;
+                        let from = entries_tbl[e].decomp_start as usize;
+                        let to = entries_tbl[e + 1].decomp_start as usize;
                         for &rel in &decomp_tbl[from..to] {
                             seen[rs + rel as usize] = true;
                         }
@@ -2634,138 +2637,205 @@ impl<
         b_nonzero: &[usize],
         cache: &mut GatingCache,
     ) -> KernelGating {
-        // Bitsets of the non-zero indices of both sides, for O(1) presence
-        // checks while walking the units. One allocation backs both:
-        // `[0..words]` is A's bitset, `[words..2*words]` is B's.
-        let words = a_series.basis.len().div_ceil(64);
         let table = &a_series.feasible_decompositions;
 
         // Full-support fast path: the nonzero lists are sorted and deduped
         // over `0..cutoff` (the degree-`max_degree` words are filtered
         // upstream), so covering the cutoff means covering every index the
         // sweep can ever test. Presence is all-ones, both orientations are
-        // on for every unit, and the active-segment list is the table's
-        // precomputed per-unit list — no per-index scan, no gating walk.
+        // on for every unit, and the active-segment and ticket lists are
+        // the table's precomputed full-support gating — no per-index scan,
+        // no gating walk.
         let cutoff = table.degree_start(table.max_degree());
         if a_nonzero.len() == cutoff && b_nonzero.len() == cutoff {
+            let (active, tickets) = table.full_support_gating();
             return KernelGating {
-                presence: vec![!0u64; 2 * words],
-                words,
-                active: table.full_support_segments().clone(),
+                active,
+                tickets,
                 total_entries: table.len(),
             };
         }
 
-        let mut presence = vec![0u64; 2 * words];
-        let (a_present, b_present) = presence.split_at_mut(words);
-        // One fused pass per side: set the presence bit AND the degree-support
-        // mask bit (bit `d` of `a_deg` is set iff A carries a non-zero
-        // coefficient on some degree-`d` basis word). Unit gating needs only
-        // the masks: a unit with degree pairs `(p, t - p)` contributes
-        // through orientation (a = i, b = j) iff some `p` has degree-`p`
-        // support in A and degree-`t - p` support in B, and through the
-        // mirrored orientation in the transpose case. (Degree-`max_degree`
-        // words are filtered from the non-zero lists upstream and never
-        // appear as pair endpoints, so only degrees below `max_degree` are
-        // ever set.)
-        let mut a_deg = [0u64; 2];
-        let mut b_deg = [0u64; 2];
-        for &i in a_nonzero {
-            a_present[i / 64] |= 1u64 << (i % 64);
-            let d = table.degree_of(i);
-            debug_assert!(d < 128, "degree masks cover degrees 0..127");
-            a_deg[d / 64] |= 1u64 << (d % 64);
-        }
-        for &j in b_nonzero {
-            b_present[j / 64] |= 1u64 << (j % 64);
-            let d = table.degree_of(j);
-            debug_assert!(d < 128, "degree masks cover degrees 0..127");
-            b_deg[d / 64] |= 1u64 << (d % 64);
-        }
-
-        // Memoized gating pass: a unit's entries are grouped into contiguous
-        // p-runs (entries are sorted `(p, q, i, j)` within the unit and
-        // `q = target - p` is forced), and a run is kept only when its own
-        // `(p, target - p)` degree pair is supported — unit-level gating
-        // would drag every other p's entries through presence tests that
-        // always fail. Surviving runs carry their pre-packed spans and
-        // orientation flags so neither sweep re-derives anything.
-        let cached = cache.get((a_deg, b_deg));
-        let (active, total_entries) = match cached {
-            Some((active, total)) => (active.clone(), *total),
+        // Memoized gating keyed by the exact support lists (see
+        // `GatingCache`): the fingerprint pass replaces the old per-call
+        // presence-bitset build, so on a hit neither the bitsets nor the
+        // per-entry presence tests run at all.
+        let key = (
+            Self::support_fingerprint(a_nonzero),
+            Self::support_fingerprint(b_nonzero),
+        );
+        let (active, tickets, total_entries) = match cache.get(key) {
+            Some((active, tickets, total)) => (active.clone(), tickets.clone(), *total),
             None => {
-                let entries = table.entries();
-                let mut active: Vec<ActiveSegment> = Vec::new();
-                let mut total_entries = 0usize;
-                for unit in table.units().iter() {
-                    let t = unit.target as usize;
-                    let (rs, re) = table.degree_range(unit.target);
-                    let mut run_start = unit.start;
-                    let mut cur_p = u8::MAX;
-                    let mut last_active = usize::MAX;
-                    // Real entries only: `unit.end` is the trailing
-                    // sentinel's slot (its decomp_start closes the last
-                    // run's last decomposition range via the +1 span).
-                    for ei in unit.start..unit.end {
-                        let p = table.degree_of(entries[ei as usize].i as usize) as u8;
-                        if p == cur_p {
-                            continue;
-                        }
-                        if cur_p != u8::MAX {
-                            total_entries += Self::push_run(
-                                &mut active,
-                                a_deg,
-                                b_deg,
-                                cur_p,
-                                t,
-                                rs,
-                                re,
-                                run_start,
-                                ei,
-                                &mut last_active,
-                            );
-                        }
-                        cur_p = p;
-                        run_start = ei;
-                    }
-                    if cur_p != u8::MAX {
-                        total_entries += Self::push_run(
-                            &mut active,
-                            a_deg,
-                            b_deg,
-                            cur_p,
-                            t,
-                            rs,
-                            re,
-                            run_start,
-                            unit.end,
-                            &mut last_active,
-                        );
-                    }
-                    if last_active != usize::MAX {
-                        active[last_active].last_of_unit = true;
-                    }
+                // Fresh gating: presence bitsets drive the per-entry ticket
+                // flags, degree-support masks the run-level gating. A
+                // unit's entries are grouped into contiguous p-runs
+                // (entries are sorted `(p, q, i, j)` within the unit and
+                // `q = target - p` is forced), and a run is kept only when
+                // its own `(p, target - p)` degree pair is supported —
+                // unit-level gating would drag every other p's entries
+                // through tests that always fail. Surviving runs carry
+                // their pre-packed spans, orientation flags, and resolved
+                // per-entry ticket list so neither sweep re-derives
+                // anything.
+                let words = a_series.basis.len().div_ceil(64);
+                let mut presence = vec![0u64; 2 * words];
+                let (a_present, b_present) = presence.split_at_mut(words);
+                let mut a_deg = [0u64; 2];
+                let mut b_deg = [0u64; 2];
+                for &i in a_nonzero {
+                    a_present[i / 64] |= 1u64 << (i % 64);
+                    let d = table.degree_of(i);
+                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
+                    a_deg[d / 64] |= 1u64 << (d % 64);
                 }
-                let value = (Arc::from(active), total_entries);
-                cache.insert((a_deg, b_deg), value.clone());
+                for &j in b_nonzero {
+                    b_present[j / 64] |= 1u64 << (j % 64);
+                    let d = table.degree_of(j);
+                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
+                    b_deg[d / 64] |= 1u64 << (d % 64);
+                }
+                let value = Self::build_gating(
+                    table,
+                    table.entries(),
+                    table.entries(),
+                    a_present,
+                    b_present,
+                    a_deg,
+                    b_deg,
+                );
+                cache.insert(key, value.clone());
                 value
             }
         };
 
         KernelGating {
-            presence,
-            words,
-            active: active.clone(),
+            active,
+            tickets,
             total_entries,
         }
+    }
+
+    /// 128-bit fingerprint of a support list, the gating cache's key half.
+    /// Content-addressed: an entry's baked per-entry presence results are
+    /// only valid for the exact supports they were resolved from, so two
+    /// calls may share a cache entry only when their support lists are
+    /// identical. Length is mixed in and both streams are avalanche-
+    /// finished (murmur3 fmix64), so lists of different lengths or content
+    /// collide with negligible probability.
+    #[inline]
+    fn support_fingerprint(list: &[usize]) -> [u64; 2] {
+        let mut h1 = 0xcbf2_9ce4_8422_2325u64 ^ (list.len() as u64).rotate_left(32);
+        let mut h2 = 0x9ae1_6a3b_2f90_404fu64 ^ (list.len() as u64);
+        for &x in list {
+            let v = x as u64;
+            h1 = (h1 ^ v).wrapping_mul(0x1000_0000_01b3);
+            h2 = (h2 ^ v).wrapping_mul(0x94d0_49bb_1331_11eb);
+        }
+        h1 ^= h1 >> 33;
+        h1 = h1.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h1 ^= h1 >> 33;
+        h2 ^= h2 >> 33;
+        h2 = h2.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h2 ^= h2 >> 33;
+        [h1, h2]
+    }
+
+    /// Walks the decomposition table's units once and resolves the gating
+    /// for the given presence bitsets and degree-support masks: the active
+    /// run list plus the flat per-entry ticket list. Shared by both
+    /// prologue variants. `entries` (public i/j) drives the p-run walk's
+    /// degree lookups — degrees are layout-independent — while
+    /// `presence_entries` must carry the i/j relabeling that matches the
+    /// presence bitsets' index space (public entries for the public
+    /// prologue, the class-order's relabeled table for the class one). The
+    /// two tables share order, index space, and `decomp_start`s, so the
+    /// ticket's entry index is layout-independent either way.
+    fn build_gating(
+        table: &FeasibleDecompositions<U>,
+        entries: &[Entry],
+        presence_entries: &[Entry],
+        a_present: &[u64],
+        b_present: &[u64],
+        a_deg: [u64; 2],
+        b_deg: [u64; 2],
+    ) -> (Arc<[ActiveSegment]>, Arc<[u32]>, usize) {
+        debug_assert!(
+            table.len() < (1 << 30),
+            "entry indices must fit a ticket's 30 bits"
+        );
+        let mut active: Vec<ActiveSegment> = Vec::new();
+        let mut tickets: Vec<u32> = Vec::new();
+        let mut total_entries = 0usize;
+        for unit in table.units().iter() {
+            let t = unit.target as usize;
+            let (rs, re) = table.degree_range(unit.target);
+            let mut run_start = unit.start;
+            let mut cur_p = u8::MAX;
+            let mut last_active = usize::MAX;
+            // Real entries only: `unit.end` is the trailing sentinel's
+            // slot (its decomp_start closes the last run's last
+            // decomposition range via the +1 span).
+            for ei in unit.start..unit.end {
+                let p = table.degree_of(entries[ei as usize].i as usize) as u8;
+                if p == cur_p {
+                    continue;
+                }
+                if cur_p != u8::MAX {
+                    total_entries += Self::push_run(
+                        entries,
+                        presence_entries,
+                        a_present,
+                        b_present,
+                        &mut active,
+                        &mut tickets,
+                        a_deg,
+                        b_deg,
+                        cur_p,
+                        t,
+                        rs,
+                        re,
+                        run_start,
+                        ei,
+                        &mut last_active,
+                    );
+                }
+                cur_p = p;
+                run_start = ei;
+            }
+            if cur_p != u8::MAX {
+                total_entries += Self::push_run(
+                    entries,
+                    presence_entries,
+                    a_present,
+                    b_present,
+                    &mut active,
+                    &mut tickets,
+                    a_deg,
+                    b_deg,
+                    cur_p,
+                    t,
+                    rs,
+                    re,
+                    run_start,
+                    unit.end,
+                    &mut last_active,
+                );
+            }
+            if last_active != usize::MAX {
+                active[last_active].last_of_unit = true;
+            }
+        }
+        (Arc::from(active), Arc::from(tickets), total_entries)
     }
     /// Class-space variant of [`Self::kernel_prologue_cached`]: the
     /// support lists are class-indexed, so the presence bitsets are
     /// class-positioned and the degree masks read through the ordering's
-    /// relabeled degree table. The memo key — the degree-support mask pair —
-    /// carries the same values as the public variant's, so the gating cache
-    /// is shared between both working modes and the active-segment lists
-    /// (layout-independent) are reused verbatim.
+    /// relabeled degree table. The memo key — the exact class-indexed
+    /// support lists — is the class-space image of the public variant's, so
+    /// each working mode resolves its own gating entries (the cached
+    /// active-segment spans and ticket indices are layout-independent and
+    /// would in fact be identical).
     fn kernel_prologue_cached_class(
         a_series: &LieSeries<T, U>,
         a_nonzero_cls: &[usize],
@@ -2773,104 +2843,81 @@ impl<
         order: &ClassOrder,
         cache: &mut GatingCache,
     ) -> KernelGating {
-        let words = a_series.basis.len().div_ceil(64);
         let table = &a_series.feasible_decompositions;
 
         let cutoff = table.degree_start(table.max_degree());
         if a_nonzero_cls.len() == cutoff && b_nonzero_cls.len() == cutoff {
+            let (active, tickets) = table.full_support_gating();
             return KernelGating {
-                presence: vec![!0u64; 2 * words],
-                words,
-                active: table.full_support_segments().clone(),
+                active,
+                tickets,
                 total_entries: table.len(),
             };
         }
 
-        let mut presence = vec![0u64; 2 * words];
-        let (a_present, b_present) = presence.split_at_mut(words);
-        let mut a_deg = [0u64; 2];
-        let mut b_deg = [0u64; 2];
-        for &i in a_nonzero_cls {
-            a_present[i / 64] |= 1u64 << (i % 64);
-            let d = order.degree_cls()[i] as usize;
-            debug_assert!(d < 128, "degree masks cover degrees 0..127");
-            a_deg[d / 64] |= 1u64 << (d % 64);
-        }
-        for &j in b_nonzero_cls {
-            b_present[j / 64] |= 1u64 << (j % 64);
-            let d = order.degree_cls()[j] as usize;
-            debug_assert!(d < 128, "degree masks cover degrees 0..127");
-            b_deg[d / 64] |= 1u64 << (d % 64);
-        }
-
-        let cached = cache.get((a_deg, b_deg));
-        let (active, total_entries) = match cached {
-            Some((active, total)) => (active.clone(), *total),
+        let key = (
+            Self::support_fingerprint(a_nonzero_cls),
+            Self::support_fingerprint(b_nonzero_cls),
+        );
+        let (active, tickets, total_entries) = match cache.get(key) {
+            Some((active, tickets, total)) => (active.clone(), tickets.clone(), *total),
             None => {
-                let entries = table.entries();
-                let mut active: Vec<ActiveSegment> = Vec::new();
-                let mut total_entries = 0usize;
-                for unit in table.units().iter() {
-                    let t = unit.target as usize;
-                    let (rs, re) = table.degree_range(unit.target);
-                    let mut run_start = unit.start;
-                    let mut cur_p = u8::MAX;
-                    let mut last_active = usize::MAX;
-                    for ei in unit.start..unit.end {
-                        let p = table.degree_of(entries[ei as usize].i as usize) as u8;
-                        if p == cur_p {
-                            continue;
-                        }
-                        if cur_p != u8::MAX {
-                            total_entries += Self::push_run(
-                                &mut active,
-                                a_deg,
-                                b_deg,
-                                cur_p,
-                                t,
-                                rs,
-                                re,
-                                run_start,
-                                ei,
-                                &mut last_active,
-                            );
-                        }
-                        cur_p = p;
-                        run_start = ei;
-                    }
-                    if cur_p != u8::MAX {
-                        total_entries += Self::push_run(
-                            &mut active,
-                            a_deg,
-                            b_deg,
-                            cur_p,
-                            t,
-                            rs,
-                            re,
-                            run_start,
-                            unit.end,
-                            &mut last_active,
-                        );
-                    }
-                    if last_active != usize::MAX {
-                        active[last_active].last_of_unit = true;
-                    }
+                // Class-positioned presence bitsets (indexed by class
+                // positions) and relabeled degrees; the rest of the gating
+                // walk is shared with the public prologue (see
+                // `build_gating`).
+                let words = a_series.basis.len().div_ceil(64);
+                let mut presence = vec![0u64; 2 * words];
+                let (a_present, b_present) = presence.split_at_mut(words);
+                let mut a_deg = [0u64; 2];
+                let mut b_deg = [0u64; 2];
+                for &i in a_nonzero_cls {
+                    a_present[i / 64] |= 1u64 << (i % 64);
+                    let d = order.degree_cls()[i] as usize;
+                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
+                    a_deg[d / 64] |= 1u64 << (d % 64);
                 }
-                let value = (Arc::from(active), total_entries);
-                cache.insert((a_deg, b_deg), value.clone());
+                for &j in b_nonzero_cls {
+                    b_present[j / 64] |= 1u64 << (j % 64);
+                    let d = order.degree_cls()[j] as usize;
+                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
+                    b_deg[d / 64] |= 1u64 << (d % 64);
+                }
+                let value = Self::build_gating(
+                    table,
+                    table.entries(),
+                    order.entries_cls(),
+                    a_present,
+                    b_present,
+                    a_deg,
+                    b_deg,
+                );
+                cache.insert(key, value.clone());
                 value
             }
         };
 
         KernelGating {
-            presence,
-            words,
-            active: active.clone(),
+            active,
+            tickets,
             total_entries,
         }
     }
+    /// Resolves one maximal p-run of a unit: run-level gating on the
+    /// degree-support masks, then the per-entry presence tests whose
+    /// results become the run's packed tickets. Tickets are built in table
+    /// order — the ticket list is a subsequence of the entry stream, so
+    /// per-word float summation order is provably unchanged. Returns the
+    /// run's table-entry count for the gating's visited-entry total (the
+    /// pack planner's balance weight).
+    #[allow(clippy::too_many_arguments)]
     fn push_run(
+        entries: &[Entry],
+        presence_entries: &[Entry],
+        a_present: &[u64],
+        b_present: &[u64],
         active: &mut Vec<ActiveSegment>,
+        tickets: &mut Vec<u32>,
         a_deg: [u64; 2],
         b_deg: [u64; 2],
         p: u8,
@@ -2888,14 +2935,37 @@ impl<
         if !o1 && !o2 {
             return 0;
         }
+        // The same bitmap expressions the sweeps used to re-evaluate per
+        // kernel call, resolved once here: `o1`/`o2` ANDed in identically,
+        // presence tested per index.
+        let ticket_start = tickets.len() as u32;
+        for ei in run_start..run_end {
+            // i/j in the presence bitsets' index space (public for the
+            // public prologue, class positions for the class one).
+            let entry = &presence_entries[ei as usize];
+            let (i, j) = (entry.i as usize, entry.j as usize);
+            let p_active = o1
+                && a_present[i / 64] & (1u64 << (i % 64)) != 0
+                && b_present[j / 64] & (1u64 << (j % 64)) != 0;
+            let q_active = o2
+                && a_present[j / 64] & (1u64 << (j % 64)) != 0
+                && b_present[i / 64] & (1u64 << (i % 64)) != 0;
+            if !p_active && !q_active {
+                continue;
+            }
+            tickets.push(
+                ei | if p_active { TICKET_P_ACTIVE } else { 0 }
+                    | if q_active { TICKET_Q_ACTIVE } else { 0 },
+            );
+        }
         *last_active = active.len();
         active.push(ActiveSegment {
             span_start: run_start,
             span_end: run_end + 1,
+            ticket_start,
+            ticket_end: tickets.len() as u32,
             rs: rs as u32,
             re: re as u32,
-            o1,
-            o2,
             last_of_unit: false,
             p,
             td: t as u8,
@@ -2913,22 +2983,28 @@ impl<
         sink: &mut S,
     ) {
         let table = &a_series.feasible_decompositions;
-        let (a_present, b_present) = gating.presence.split_at(gating.words);
         let decomp_coefficients = table.decomp_coeffs();
         for au in gating.active.iter() {
             let result = &mut result_coefficients[au.rs as usize..au.re as usize];
-            let span = &entries[au.span_start as usize..au.span_end as usize];
-            for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
+            // The gating's precomputed tickets: the span's entries that
+            // pass this job's presence tests, in table order, with the
+            // resolved orientation packed in the top two bits. Iterating
+            // the ticket list instead of re-testing every table entry
+            // removes the 4 bit tests + entry loads + branch from the hot
+            // loop; the visit order is a subsequence of the old one, and
+            // skipped entries scattered nothing, so per-word float
+            // summation order is unchanged.
+            for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize] {
+                let e = (ticket & TICKET_INDEX_MASK) as usize;
+                let entry = entries[e];
+                // The table's trailing sentinel backs the +1 successor:
+                // ticket indices are real entries, so `e + 1` is in bounds
+                // and closes the decomposition range exactly as the old
+                // span zip did.
+                let next = entries[e + 1];
+                let p_active = ticket & TICKET_P_ACTIVE != 0;
+                let q_active = ticket & TICKET_Q_ACTIVE != 0;
                 let (i, j) = (entry.i as usize, entry.j as usize);
-                let p_active = au.o1
-                    && a_present[i / 64] & (1u64 << (i % 64)) != 0
-                    && b_present[j / 64] & (1u64 << (j % 64)) != 0;
-                let q_active = au.o2
-                    && a_present[j / 64] & (1u64 << (j % 64)) != 0
-                    && b_present[i / 64] & (1u64 << (i % 64)) != 0;
-                if !p_active && !q_active {
-                    continue;
-                }
                 let term = if p_active {
                     let mut t = raw_mul(&a_coefficients[i], &b_coefficients[j]);
                     if q_active {

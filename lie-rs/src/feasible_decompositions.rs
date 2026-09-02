@@ -43,6 +43,15 @@ pub(crate) struct UnitMeta {
     pub(crate) end: u32,
 }
 
+/// Packed active-entry ticket (see [`ActiveSegment::ticket_start`]): bits
+/// 0..30 hold the entry's flat table index, bit 31 the `p_active`
+/// orientation (`a = i, b = j`) and bit 30 the mirrored `q_active`. Table
+/// sizes are debug-asserted below 2^30 entries at gating build time, so the
+/// index never reaches the flag bits.
+pub(crate) const TICKET_INDEX_MASK: u32 = 0x3fff_ffff;
+pub(crate) const TICKET_P_ACTIVE: u32 = 1 << 31;
+pub(crate) const TICKET_Q_ACTIVE: u32 = 1 << 30;
+
 /// One maximal active run of a unit's entries for the commutation kernel's
 /// sweep: a contiguous entry span gated on by degree support, scattering onto
 /// the degree-`target` result slice.
@@ -58,14 +67,22 @@ pub(crate) struct ActiveSegment {
     /// Decomposition indices are relative to `rs`.
     pub(crate) rs: u32,
     pub(crate) re: u32,
-    /// Orientation flags for this run's `p`: `o1` = `(a = i, b = j)` may
-    /// contribute, `o2` = the mirrored `(a = j, b = i)` may.
-    pub(crate) o1: bool,
-    pub(crate) o2: bool,
     /// Whether this is the last active segment of its unit. Segments of one
     /// unit scatter onto the same target words, so the parallel sweep must
     /// keep them in one bundle; it may only cut a bundle after this flag.
+    /// (Per-entry orientation now rides in the tickets' flag bits — the
+    /// segment-level `o1`/`o2` gating gates only which tickets exist.)
     pub(crate) last_of_unit: bool,
+    /// The run's ticket range in the gating's flat ticket list: only the
+    /// span's entries that passed the owning job's per-entry presence
+    /// tests, in table order, with the resolved orientation flags packed
+    /// in the top two bits ([`TICKET_INDEX_MASK`], [`TICKET_P_ACTIVE`],
+    /// [`TICKET_Q_ACTIVE`]). The sweeps iterate this range instead of
+    /// re-testing every table entry; built in entry order, the ticket list
+    /// is a subsequence of the span, so per-word float summation order is
+    /// unchanged.
+    pub(crate) ticket_start: u32,
+    pub(crate) ticket_end: u32,
     /// The left operand degree `p = deg(basis[i])` of this run — constant
     /// within the run (segments are maximal equal-`p` entry runs). The
     /// batch sweep hoists its compact-buffer address shifts per segment
@@ -107,6 +124,11 @@ pub(crate) struct FeasibleDecompositions<U> {
     /// call with `a_nonzero.len() == full-support cutoff` skips the gating
     /// walk entirely.
     full_support_segments: Arc<[ActiveSegment]>,
+    /// The full-support segments' flat ticket list: presence is all-ones,
+    /// so every table entry is active in both orientations and the ticket
+    /// list is the entry stream itself, in segment order (each segment's
+    /// ticket range mirrors its span minus the trailing successor).
+    full_support_tickets: Arc<[u32]>,
     /// Within-degree class-contiguous scatter layout, populated at build
     /// time only when a degree slice outgrows L1 (see
     /// [`CLASS_ORDER_MIN_SLICE_WORDS`]) and otherwise created on demand by
@@ -382,8 +404,15 @@ impl<U: Clone> Builder<U> {
         // orientations. Segments are maximal equal-`p` entry runs (the same
         // shape the degree-gated prologue produces), so a segment's left
         // operand degree — and with it the batch sweep's hoisted compact
-        // address shifts — is constant within the segment.
+        // address shifts — is constant within the segment. Presence is
+        // all-ones, so the flat ticket list is the entry stream itself
+        // (every entry active, both flag bits packed; see `TICKET_*`).
+        debug_assert!(
+            num_entries < (1 << 30),
+            "entry indices must fit a ticket's 30 bits"
+        );
         let mut full_support_segments: Vec<ActiveSegment> = Vec::new();
+        let mut full_support_tickets: Vec<u32> = Vec::new();
         for unit in units.iter() {
             let td = unit.target;
             let (rs, re) = (
@@ -398,13 +427,17 @@ impl<U: Clone> Builder<U> {
                     continue;
                 }
                 if cur_p != u8::MAX {
+                    let ticket_start = full_support_tickets.len() as u32;
+                    for e in run_start..ei {
+                        full_support_tickets.push(e | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
+                    }
                     full_support_segments.push(ActiveSegment {
                         span_start: run_start,
                         span_end: ei + 1,
+                        ticket_start,
+                        ticket_end: full_support_tickets.len() as u32,
                         rs,
                         re,
-                        o1: true,
-                        o2: true,
                         last_of_unit: false,
                         p: cur_p,
                         td,
@@ -414,13 +447,17 @@ impl<U: Clone> Builder<U> {
                 run_start = ei;
             }
             if cur_p != u8::MAX {
+                let ticket_start = full_support_tickets.len() as u32;
+                for e in run_start..unit.end {
+                    full_support_tickets.push(e | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
+                }
                 full_support_segments.push(ActiveSegment {
                     span_start: run_start,
                     span_end: unit.end + 1,
+                    ticket_start,
+                    ticket_end: full_support_tickets.len() as u32,
                     rs,
                     re,
-                    o1: true,
-                    o2: true,
                     last_of_unit: true,
                     p: cur_p,
                     td,
@@ -439,6 +476,7 @@ impl<U: Clone> Builder<U> {
             decomp_coefficients,
             num_entries,
             full_support_segments: Arc::from(full_support_segments),
+            full_support_tickets: Arc::from(full_support_tickets),
             class_order,
         }
     }
@@ -613,11 +651,17 @@ impl<U> FeasibleDecompositions<U> {
     }
 
     /// Active segments for full-support operands (every run of every unit
-    /// active, both orientations on). Shared by all full-support kernel
-    /// calls, so the gating walk is skipped entirely.
+    /// active, both orientations on) plus their flat ticket list: shared by
+    /// all full-support kernel calls, so the gating walk is skipped
+    /// entirely. Presence is all-ones, so the tickets cover every table
+    /// entry with both flag bits packed, and each segment's ticket range
+    /// mirrors its span minus the trailing successor.
     #[inline]
-    pub(crate) fn full_support_segments(&self) -> &Arc<[ActiveSegment]> {
-        &self.full_support_segments
+    pub(crate) fn full_support_gating(&self) -> (Arc<[ActiveSegment]>, Arc<[u32]>) {
+        (
+            Arc::clone(&self.full_support_segments),
+            Arc::clone(&self.full_support_tickets),
+        )
     }
 
     /// The flat relative decomposition index array (kernel scatter path).
