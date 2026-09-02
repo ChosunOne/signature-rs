@@ -466,7 +466,7 @@ mod test {
             .with_max_degree(m);
         let mut log_sig: LogSignature<u8, NotNan<f64>> = builder.build::<NotNan<f64>>();
 
-        // Dense accumulator, then several letter-displacement folds: the   Not Committed Yet
+        // Dense accumulator, then several letter-displacement folds: the
         // first fold goes through the collecting rebuild, later folds reuse
         // the fixed-point lists.
         let basis: Vec<LyndonWord<u8>> =
