@@ -1858,11 +1858,18 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
 /// from the (fixed) support lists, then balanced class-contiguous pack
 /// cuts. The stages borrow `levels`; a batched fold plans once and reuses
 /// the same stages for every fold in the batch.
+///
+/// `want_scatter_sets` gates the exact per-job batch scatter sets: the
+/// batch path sizes its compact buffers from them, but the per-fold path
+/// discards them — computing them there is pure overhead (a `seen` bitvec
+/// plus a full entry pass per job, O(jobs × (space + entries)) per level) —
+/// so it passes `false` and receives an empty vec.
 pub fn plan_class_sweep_stages<'a, T, U>(
     a_series: &LieSeries<T, U>,
     order: &ClassOrder,
     levels: &'a [Vec<KernelJob<'a, U>>],
     cache: &mut GatingCache,
+    want_scatter_sets: bool,
 ) -> (Vec<ClassBatchStage<'a, U>>, Vec<Vec<Vec<u32>>>)
 where
     T: Clone + Ord + Generator + Hash,
@@ -1893,7 +1900,8 @@ where
     let entries_tbl = order.entries_cls();
     let decomp_tbl = order.decomp_cls();
     let space = a_series.coefficients.len();
-    let mut scatter_sets: Vec<Vec<Vec<u32>>> = Vec::with_capacity(levels.len());
+    let mut scatter_sets: Vec<Vec<Vec<u32>>> =
+        Vec::with_capacity(if want_scatter_sets { levels.len() } else { 0 });
     for level in levels.iter() {
         // Gate every job up front: the support lists are fixed for the
         // whole fold (whole batch), so no stage's gating depends on kernel
@@ -1910,44 +1918,46 @@ where
                 )
             })
             .collect();
-        // Exact scatter sets for this level's jobs (same visit logic as
-        // `sweep_pack_range`: segment spans, orientation flags, per-entry
-        // presence tests, per-entry decomposition ranges).
-        let mut level_sets: Vec<Vec<u32>> = Vec::with_capacity(level.len());
-        for (ji, _) in level.iter().enumerate() {
-            let gateway = &gateways[ji];
-            let (a_present, b_present) = gateway.presences();
-            let mut seen = vec![false; space];
-            for au in gateway.active.iter() {
-                let rs = au.rs as usize;
-                let span = &entries_tbl[au.span_start as usize..au.span_end as usize];
-                for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
-                    let (i, j) = (entry.i as usize, entry.j as usize);
-                    let p_active = au.o1
-                        && a_present[i / 64] & (1u64 << (i % 64)) != 0
-                        && b_present[j / 64] & (1u64 << (j % 64)) != 0;
-                    let q_active = au.o2
-                        && a_present[j / 64] & (1u64 << (j % 64)) != 0
-                        && b_present[i / 64] & (1u64 << (i % 64)) != 0;
-                    if !p_active && !q_active {
-                        continue;
-                    }
-                    let from = entry.decomp_start as usize;
-                    let to = next.decomp_start as usize;
-                    for &rel in &decomp_tbl[from..to] {
-                        seen[rs + rel as usize] = true;
+        if want_scatter_sets {
+            // Exact scatter sets for this level's jobs (same visit logic as
+            // `sweep_pack_range`: segment spans, orientation flags, per-entry
+            // presence tests, per-entry decomposition ranges).
+            let mut level_sets: Vec<Vec<u32>> = Vec::with_capacity(level.len());
+            for (ji, _) in level.iter().enumerate() {
+                let gateway = &gateways[ji];
+                let (a_present, b_present) = gateway.presences();
+                let mut seen = vec![false; space];
+                for au in gateway.active.iter() {
+                    let rs = au.rs as usize;
+                    let span = &entries_tbl[au.span_start as usize..au.span_end as usize];
+                    for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
+                        let (i, j) = (entry.i as usize, entry.j as usize);
+                        let p_active = au.o1
+                            && a_present[i / 64] & (1u64 << (i % 64)) != 0
+                            && b_present[j / 64] & (1u64 << (j % 64)) != 0;
+                        let q_active = au.o2
+                            && a_present[j / 64] & (1u64 << (j % 64)) != 0
+                            && b_present[i / 64] & (1u64 << (i % 64)) != 0;
+                        if !p_active && !q_active {
+                            continue;
+                        }
+                        let from = entry.decomp_start as usize;
+                        let to = next.decomp_start as usize;
+                        for &rel in &decomp_tbl[from..to] {
+                            seen[rs + rel as usize] = true;
+                        }
                     }
                 }
+                level_sets.push(
+                    seen.into_iter()
+                        .enumerate()
+                        .filter(|(_, s)| *s)
+                        .map(|(p, _)| p as u32)
+                        .collect(),
+                );
             }
-            level_sets.push(
-                seen.into_iter()
-                    .enumerate()
-                    .filter(|(_, s)| *s)
-                    .map(|(p, _)| p as u32)
-                    .collect(),
-            );
+            scatter_sets.push(level_sets);
         }
-        scatter_sets.push(level_sets);
         // Flatten (job, unit) tasks by reference; each node is one anagram
         // class, so the node-ordered task list is class-contiguous already.
         let total: usize = gateways.iter().map(|g| g.total_entries).sum();
@@ -2205,7 +2215,11 @@ pub fn commutator_coefficients_class_fold_with_cache<T, U>(
         "class ordering does not describe this series' basis"
     );
 
-    let (stages, _scatter_sets) = plan_class_sweep_stages(a_series, order, levels, cache);
+    // The per-fold path discards the scatter sets (only the batch path
+    // sizes compact buffers from them): skip their exact-set computation —
+    // the gating and pack cuts the sweep actually reads are unchanged.
+    let (stages, _scatter_sets) =
+        plan_class_sweep_stages(a_series, order, levels, cache, false);
     let stage_refs: Vec<&ClassBatchStage<U>> = stages.iter().collect();
     run_class_batch(a_series, order, &stage_refs);
 }

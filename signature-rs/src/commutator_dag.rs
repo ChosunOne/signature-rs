@@ -645,8 +645,13 @@ where
         // are throwaway — they borrow the placeholder jobs and are dropped
         // before the jobs are rewired; the final plan below hits the
         // gating cache).
-        let (_, scatter_sets) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache);
+        let (_, scatter_sets) = plan_class_sweep_stages(
+            series,
+            order,
+            &levels_jobs,
+            &mut self.gating_cache,
+            true,
+        );
 
         // Record the true scatter sets as the node lists: they bound this
         // batch's sweeps exactly, keep the union-level eligibility fixed
@@ -750,8 +755,13 @@ where
         // Final plan with the wired jobs: the gating cache makes this cheap
         // (the support lists are unchanged); the stages reference the final
         // job table the sweeps read through.
-        let (sweep_stages, _) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache);
+        let (sweep_stages, _) = plan_class_sweep_stages(
+            series,
+            order,
+            &levels_jobs,
+            &mut self.gating_cache,
+            true,
+        );
 
         // Block ranges over class positions.
         let threads = rayon::current_num_threads().max(1);
