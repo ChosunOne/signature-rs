@@ -1965,11 +1965,12 @@ where
         // are conflict-free write regions, and each word's accumulation
         // sequence stays whole inside whichever pack owns its unit).
         //
-        // The balance weight is the unit's WORK, not its entry count: each
-        // entry's decomposition length varies by an order of magnitude
-        // across degrees, and entry-count balance lets the last pack's
-        // stagger hold every gate open behind it. A unit's decomposition
-        // total is O(1) from the entries' decomp range endpoints.
+        // The balance weight is the unit's entry count (its WORK proxy):
+        // the alternative — per-entry decomposition-row totals, O(1) per
+        // unit by telescoping the entries' consecutive `decomp_start`
+        // endpoints — measured no better (it traded small gains on narrow
+        // grids for 3-7% losses on the wide 2x12/3x8 ones), and entry
+        // count is the simpler, previously validated weight.
         // Packs may only cut AFTER a segment flagged `last_of_unit`: the
         // segments of one table unit scatter onto the same target words, so
         // splitting them across packs races the concurrent `+=`s (lost
@@ -1981,7 +1982,20 @@ where
             .iter()
             .map(|g| g.active.iter().filter(|au| au.last_of_unit).count())
             .sum::<usize>();
-        let p_count = (threads).min(bundle_count.max(1)).max(1);
+        // Smallest work worth splitting a stage's sweep across an extra
+        // pack: below ~8 entries per pack the per-pack claim/gate cost
+        // dominates the pack's compute.
+        const MIN_PACK_WORK: usize = 8;
+        let p_count = threads
+            .min(bundle_count.max(1))
+            // Work-scaled cap: a stage too small to give every slot a
+            // pack of at least `MIN_PACK_WORK` entries must not spawn
+            // `threads` micro-packs — the claim/gate churn outweighs the
+            // parallelism on narrow grids (e.g. 12x2, whose whole fold is
+            // ~66 entries per stage). Balanced bounds below keep the
+            // resulting packs even.
+            .min(total.div_ceil(MIN_PACK_WORK))
+            .max(1);
         let mut packs: Vec<(usize, usize)> = Vec::with_capacity(p_count);
         if p_count > 1 && !tasks.is_empty() {
             let mut start = 0usize;
@@ -1993,7 +2007,6 @@ where
                 if cur >= next_bound && ti + 1 < tasks.len() && au.last_of_unit {
                     packs.push((start, ti + 1));
                     start = ti + 1;
-                    cur = 0;
                 }
             }
             packs.push((start, tasks.len()));
