@@ -57,13 +57,47 @@ struct SendBufPtrs<U>(Vec<(*mut U, usize)>);
 unsafe impl<U> Send for SendBufPtrs<U> {}
 unsafe impl<U> Sync for SendBufPtrs<U> {}
 
-/// The compact per-node scratch buffers, shared by the batch's block
-/// closures through an `Arc` (same Send/Sync argument as [`SendBufPtrs`]:
-/// the pointers target stable scratch allocations ordered by the stage
-/// counters).
-struct SendCompactPtrs<U>(std::sync::Arc<Vec<(*mut U, usize)>>);
-unsafe impl<U> Send for SendCompactPtrs<U> {}
-unsafe impl<U> Sync for SendCompactPtrs<U> {}
+/// One accumulate run of a block's work list: a contiguous (class
+/// position, source slot) stretch of one BCH term whose positions fall in
+/// the block's range.
+struct AccumRun<U> {
+    /// Index into `DagStructure::terms` for the run's BCH weight.
+    term: u32,
+    /// First class position of the run.
+    g0: u32,
+    /// Number of class positions in the run.
+    len: u32,
+    /// Source pointer: the node's compact slot holding position `g0` (the
+    /// fold displacement at `g0` for the displacement term); advances with
+    /// `g0`.
+    src: *const U,
+}
+
+/// One zero run of a block's work list: a contiguous stretch of one
+/// compact node buffer's slots inside the block's class range.
+struct ZeroRun<U> {
+    /// Target compact buffer pointer.
+    ptr: *mut U,
+    /// First compact slot of the run.
+    s0: u32,
+    /// Number of compact slots in the run.
+    len: u32,
+}
+
+/// A block's per-batch work lists: the accumulate runs and zero runs
+/// intersecting the block's class-position range (see `fold_batch`).
+struct BlockWork<U> {
+    accum: Vec<AccumRun<U>>,
+    zero: Vec<ZeroRun<U>>,
+}
+
+/// The per-block work lists of one batch, shared by the batch's block
+/// closures through an `Arc` (raw-pointer bearing, same Send/Sync argument
+/// as [`SendBufPtrs`]: the pointers target stable frame-owned allocations
+/// whose cross-stage ordering the stage counters provide).
+struct SendBlockWork<U>(std::sync::Arc<Vec<BlockWork<U>>>);
+unsafe impl<U> Send for SendBlockWork<U> {}
+unsafe impl<U> Sync for SendBlockWork<U> {}
 
 pub(crate) struct DagStructure<U> {
     /// Topologically sorted: ids 0 and 1 are the atoms, every internal node's
@@ -605,17 +639,17 @@ where
                     DagNode::Binary { left, right } => (left, right),
                     DagNode::Atom(_) => continue,
                 };
-                let (a_ptr, a_len, a_sh, a_nz): (*const U, usize, *const u32, &[usize]) =
-                    match left {
-                        0 => (acc_data as *const U, d, zero_shifts_ptr, &a_nz_cls),
-                        1 => (b_data as *const U, d, zero_shifts_ptr, &b_nz_cls),
-                        id => (
-                            std::ptr::null(),
-                            0,
-                            zero_shifts_ptr,
-                            &lists_local[id as usize - 2],
-                        ),
-                    };
+                let (a_ptr, a_len, a_sh, a_nz): (*const U, usize, *const u32, &[usize]) = match left
+                {
+                    0 => (acc_data as *const U, d, zero_shifts_ptr, &a_nz_cls),
+                    1 => (b_data as *const U, d, zero_shifts_ptr, &b_nz_cls),
+                    id => (
+                        std::ptr::null(),
+                        0,
+                        zero_shifts_ptr,
+                        &lists_local[id as usize - 2],
+                    ),
+                };
                 let (b_ptr, b_len, b_sh, b_nz): (*const U, usize, *const u32, &[usize]) =
                     match right {
                         0 => (acc_data as *const U, d, zero_shifts_ptr, &a_nz_cls),
@@ -645,13 +679,8 @@ where
         // are throwaway — they borrow the placeholder jobs and are dropped
         // before the jobs are rewired; the final plan below hits the
         // gating cache).
-        let (_, scatter_sets) = plan_class_sweep_stages(
-            series,
-            order,
-            &levels_jobs,
-            &mut self.gating_cache,
-            true,
-        );
+        let (_, scatter_sets) =
+            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true);
 
         // Record the true scatter sets as the node lists: they bound this
         // batch's sweeps exactly, keep the union-level eligibility fixed
@@ -662,8 +691,10 @@ where
             for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
                 for (jj, &k) in level.iter().enumerate() {
                     if matches!(self.structure.nodes[k as usize], DagNode::Binary { .. }) {
-                        updated[k as usize - 2] =
-                            scatter_sets[li - 1][jj].iter().map(|&p| p as usize).collect();
+                        updated[k as usize - 2] = scatter_sets[li - 1][jj]
+                            .iter()
+                            .map(|&p| p as usize)
+                            .collect();
                     }
                 }
             }
@@ -694,12 +725,12 @@ where
         }
         for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
             for (jj, &k) in level.iter().enumerate() {
-                let set: &[u32] = if matches!(self.structure.nodes[k as usize], DagNode::Binary { .. })
-                {
-                    &scatter_sets[li - 1][jj]
-                } else {
-                    &[]
-                };
+                let set: &[u32] =
+                    if matches!(self.structure.nodes[k as usize], DagNode::Binary { .. }) {
+                        &scatter_sets[li - 1][jj]
+                    } else {
+                        &[]
+                    };
                 let ki = k as usize - 2;
                 let mut degs: Vec<u8> = set.iter().map(|&p| pos_degree[p as usize]).collect();
                 degs.sort_unstable();
@@ -755,13 +786,8 @@ where
         // Final plan with the wired jobs: the gating cache makes this cheap
         // (the support lists are unchanged); the stages reference the final
         // job table the sweeps read through.
-        let (sweep_stages, _) = plan_class_sweep_stages(
-            series,
-            order,
-            &levels_jobs,
-            &mut self.gating_cache,
-            true,
-        );
+        let (sweep_stages, _) =
+            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true);
 
         // Block ranges over class positions.
         let threads = rayon::current_num_threads().max(1);
@@ -779,40 +805,108 @@ where
         // slots for that range are, per active degree slice, the contiguous
         // run `[base + lo - rs, base + hi - rs)` for the slice's overlap
         // `[lo, hi) = [rs, re) ∩ [c0, c1)`.
-        let compact_shared = Arc::new(compact_ptrs);
-        let layouts_shared: Arc<Vec<Vec<(u32, u32, u32)>>> = Arc::new(
-            layouts
-                .into_iter()
-                .map(|v| v.into_iter().map(|cs| (cs.base, cs.rs, cs.re)).collect())
-                .collect(),
-        );
+        //
+        // Those runs are materialized once per batch, here at plan time:
+        // block `b` only accumulates the (term, slice) pairs whose class
+        // positions intersect its range and zeroes the compact slots inside
+        // it, so its work lists hold exactly those — not every term and
+        // every layout. The runs keep the full walk's order (ascending term
+        // index; within a term, ascending degree slice), so every position's
+        // add sequence — value, weight, term order — is bit-identical to the
+        // full-d walk's, and the zero runs partition the compact slots
+        // across blocks exactly as before.
+        let mut block_work: Vec<BlockWork<U>> = (0..blocks)
+            .map(|_| BlockWork {
+                accum: Vec::new(),
+                zero: Vec::new(),
+            })
+            .collect();
+        for (ti, (source, _)) in self.structure.terms.iter().enumerate() {
+            match source {
+                TermSource::Displacement => {
+                    // Every block owns a contiguous class range, so its
+                    // displacement run is exactly that range (same as the
+                    // old per-block `for g in c0..c1` sweep, which every
+                    // block ran unconditionally).
+                    for (b, &(c0, c1)) in ranges.iter().enumerate() {
+                        if c0 < c1 {
+                            block_work[b].accum.push(AccumRun {
+                                term: ti as u32,
+                                g0: c0,
+                                len: c1 - c0,
+                                src: unsafe { b_data.add(c0 as usize) } as *const U,
+                            });
+                        }
+                    }
+                }
+                TermSource::Node(k) => {
+                    let (ptr, _) = compact_ptrs[*k as usize - 2];
+                    for &CompactSlice { base, rs, re } in &layouts[*k as usize - 2] {
+                        // Position x belongs to block `x * blocks / d`, so
+                        // the slice's first and last positions bracket the
+                        // blocks it intersects; only their overlaps are
+                        // appended, in ascending block (and position) order.
+                        let b_first = rs as usize * blocks / d;
+                        let b_last = (re as usize - 1) * blocks / d;
+                        for b in b_first..=b_last {
+                            let (c0, c1) = ranges[b];
+                            let lo = rs.max(c0);
+                            let hi = re.min(c1);
+                            if lo < hi {
+                                block_work[b].accum.push(AccumRun {
+                                    term: ti as u32,
+                                    g0: lo,
+                                    len: hi - lo,
+                                    src: unsafe { ptr.add((base + lo - rs) as usize) } as *const U,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (ni, &(ptr, _)) in compact_ptrs.iter().enumerate() {
+            for &CompactSlice { base, rs, re } in &layouts[ni] {
+                let b_first = rs as usize * blocks / d;
+                let b_last = (re as usize - 1) * blocks / d;
+                for b in b_first..=b_last {
+                    let (c0, c1) = ranges[b];
+                    let lo = rs.max(c0);
+                    let hi = re.min(c1);
+                    if lo < hi {
+                        block_work[b].zero.push(ZeroRun {
+                            ptr,
+                            s0: base + lo - rs,
+                            len: hi - lo,
+                        });
+                    }
+                }
+            }
+        }
+        let work_shared = SendBlockWork(Arc::new(block_work));
         let mut block_closures: Vec<Box<dyn Fn(usize) + Send + Sync>> =
             Vec::with_capacity(2 * rhss.len() + 1);
         {
-            let bufs = SendCompactPtrs(Arc::clone(&compact_shared));
-            let compact_layouts_for_z = Arc::clone(&layouts_shared);
+            let work = SendBlockWork(Arc::clone(&work_shared.0));
             let rhs_len = rhss[0].len();
             let rhs = SendConst(rhss[0].as_ptr());
             let b = SendRaw(b_data);
             let ranges = ranges.clone();
             block_closures.push(Box::new(move |bi: usize| {
-                let (bufs, rhs, b) = (&bufs, &rhs, &b);
-                let ranges = &ranges;
-                let (c0, c1) = (ranges[bi].0 as usize, ranges[bi].1 as usize);
-                // zero this block's slot range of every compact buffer
-                for (ni, &(ptr, _)) in bufs.0.iter().enumerate() {
-                    for &(base, rs, re) in &compact_layouts_for_z[ni] {
-                        let lo = rs.max(c0 as u32);
-                        let hi = re.min(c1 as u32);
-                        if lo < hi {
-                            for si in (base + lo - rs) as usize..(base + hi - rs) as usize {
-                                unsafe {
-                                    *ptr.add(si) = U::default();
-                                }
-                            }
+                // Binding references first forces whole-value captures: a
+                // direct `rhs.0.add(..)` place access would let the precise
+                // capture split off the bare raw-pointer field, losing the
+                // Send/Sync wrapper's promise.
+                let (work, rhs, b, ranges) = (&work, &rhs, &b, &ranges);
+                // zero this block's slot runs of the compact buffers
+                for run in &work.0[bi].zero {
+                    unsafe {
+                        for si in run.s0 as usize..(run.s0 + run.len) as usize {
+                            *run.ptr.add(si) = U::default();
                         }
                     }
                 }
+                let (c0, c1) = (ranges[bi].0 as usize, ranges[bi].1 as usize);
                 #[allow(clippy::needless_range_loop)]
                 unsafe {
                     for g in c0..c1 {
@@ -853,58 +947,33 @@ where
                 let structure = Arc::clone(&self.structure);
                 let acc = SendRaw(acc_data);
                 let b = SendRaw(b_data);
-                let bufs = SendCompactPtrs(Arc::clone(&compact_shared));
-                let layouts = Arc::clone(&layouts_shared);
+                let work = SendBlockWork(Arc::clone(&work_shared.0));
                 let ranges = ranges.clone();
                 // DEBUG: lets the last task snapshot acc/b_cls after all
                 // ranges' accumulate+zero are complete.
                 let dbg_ctr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 block_closures.push(Box::new(move |bi: usize| {
-                    let (acc, b, bufs) = (&acc, &b, &bufs);
-                    let layouts = &layouts;
-                    let ranges = &ranges;
-                    let (c0, c1) = (ranges[bi].0 as usize, ranges[bi].1 as usize);
-                    for (source, weight) in &structure.terms {
-                        match source {
-                            TermSource::Displacement => unsafe {
-                                for g in c0..c1 {
-                                    *acc.0.add(g) += (*b.0.add(g)).clone() * weight.clone();
-                                }
-                            },
-                            TermSource::Node(k) => unsafe {
-                                let (ptr, _) = bufs.0[*k as usize - 2];
-                                // This block owns class positions [c0, c1);
-                                // accumulate the node's slots whose positions
-                                // fall inside, in ascending position order
-                                // (slices are degree-ordered and disjoint, so
-                                // the per-g term order matches full-d exactly).
-                                for &(base, rs, re) in &layouts[*k as usize - 2] {
-                                    let lo = rs.max(c0 as u32);
-                                    let hi = re.min(c1 as u32);
-                                    if lo < hi {
-                                        let s0 = (base + lo - rs) as usize;
-                                        for (g, si) in (lo as usize..hi as usize).zip(
-                                            s0..(base + hi - rs) as usize,
-                                        ) {
-                                            *acc.0.add(g) +=
-                                                (*ptr.add(si)).clone() * weight.clone();
-                                        }
-                                    }
-                                }
-                            },
+                    // Whole-value captures (see the lead closure above).
+                    let (work, acc, b, structure, ranges) = (&work, &acc, &b, &structure, &ranges);
+                    let terms = &structure.terms;
+                    unsafe {
+                        // This block's intersecting (term, slice) runs only,
+                        // in the original term order: each position's add
+                        // sequence matches the full walk bit for bit.
+                        for run in &work.0[bi].accum {
+                            let weight = &terms[run.term as usize].1;
+                            let g0 = run.g0 as usize;
+                            // SAFETY: the run's positions stay inside the
+                            // block's disjoint range of `acc` and inside the
+                            // source buffer's run of live slots.
+                            for (g, si) in (g0..g0 + run.len as usize).zip(0..run.len as usize) {
+                                *acc.0.add(g) += (*run.src.add(si)).clone() * weight.clone();
+                            }
                         }
-                    }
-                    // zero this block's slot range of every compact buffer
-                    for (ni, &(ptr, _)) in bufs.0.iter().enumerate() {
-                        for &(base, rs, re) in &layouts[ni] {
-                            let lo = rs.max(c0 as u32);
-                            let hi = re.min(c1 as u32);
-                            if lo < hi {
-                                for si in (base + lo - rs) as usize..(base + hi - rs) as usize {
-                                    unsafe {
-                                        *ptr.add(si) = U::default();
-                                    }
-                                }
+                        // zero this block's slot runs of the compact buffers
+                        for run in &work.0[bi].zero {
+                            for si in run.s0 as usize..(run.s0 + run.len) as usize {
+                                *run.ptr.add(si) = U::default();
                             }
                         }
                     }
