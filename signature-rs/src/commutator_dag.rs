@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use commutator_rs::CommutatorTerm;
 use lie_rs::{
     ClassBatchStage, ClassOrder, ClassOrderedCommutation, GatingCache, KernelJob, LieSeries,
-    plan_class_sweep_stages, run_class_batch,
+    plan_class_sweep_stages, planned_sweep_entries, run_class_batch, work_adaptive_slots,
 };
 use lyndon_rs::generators::Generator;
 use num_traits::{One, Zero};
@@ -835,9 +835,21 @@ where
         let (sweep_stages, _) =
             plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true);
 
-        // Block ranges over class positions.
+        // Block ranges over class positions. The block count derives from
+        // the SAME work-adaptive policy the walk will use (below): blocks
+        // exist to spread the gather/accumulate phases across slots, so
+        // cutting more blocks than the policy's slot count only multiplies
+        // the walk's per-pack claim/publish protocol (78 micro-blocks per
+        // stage × ~1000 folds of atomic RMWs dwarfed the gather itself and
+        // kept the tiny-grid e2e 2.3x above its 1t floor even at slots=1).
+        // The policy sees the per-fold sweep work; the two block stages a
+        // fold adds are counted at their post-cut element count, which for
+        // the slot decision changes nothing (both terms are « QUANTUM
+        // exactly when the sweep term is).
         let threads = rayon::current_num_threads().max(1);
-        let blocks = d.min(4 * threads).max(1);
+        let sweep_refs: Vec<&ClassBatchStage<U>> = sweep_stages.iter().collect();
+        let slots = work_adaptive_slots(threads, d.max(1), planned_sweep_entries(&sweep_refs));
+        let blocks = d.min(4 * slots).max(1);
         let ranges: Vec<(u32, u32)> = (0..blocks)
             .map(|b| ((d * b / blocks) as u32, (d * (b + 1) / blocks) as u32))
             .collect();
@@ -1184,7 +1196,11 @@ where
         lie_rs::DEBUG_AB_ACC.store(acc_data as usize, DbgO::Relaxed);
         lie_rs::DEBUG_AB_B.store(b_data as usize, DbgO::Relaxed);
         lie_rs::DEBUG_AB_D.store(d, DbgO::Relaxed);
-        run_class_batch(series, order, &stages);
+        // Fold units for the slot policy: the stage chain repeats its
+        // gather/sweep/accumulate sub-chain once per displacement (plus
+        // one leading zero stage), so each unit's barrier cost is paid
+        // per fold — the policy normalizes by the unit count.
+        run_class_batch(series, order, &stages, rhss.len().max(1));
         lie_rs::DEBUG_AB_ACC.store(0, DbgO::Relaxed);
         lie_rs::DEBUG_AB_B.store(0, DbgO::Relaxed);
         lie_rs::DEBUG_AB_D.store(0, DbgO::Relaxed);

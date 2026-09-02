@@ -2034,22 +2034,37 @@ where
     let space = a_series.coefficients.len();
     let mut scatter_sets: Vec<Vec<Vec<u32>>> =
         Vec::with_capacity(if want_scatter_sets { levels.len() } else { 0 });
-    for level in levels.iter() {
-        // Gate every job up front: the support lists are fixed for the
-        // whole fold (whole batch), so no stage's gating depends on kernel
-        // results.
-        let gateways: Vec<KernelGating> = level
-            .iter()
-            .map(|j| {
-                LieSeries::<T, U>::kernel_prologue_cached_class(
-                    a_series,
-                    j.a_nonzero,
-                    j.b_nonzero,
-                    order,
-                    cache,
-                )
-            })
-            .collect();
+    // Pass 1: gate every job up front (the support lists are fixed for the
+    // whole fold/batch, so no stage's gating depends on kernel results)
+    // and total the planned sweep work — the fold-level slot budget that
+    // every stage's pack cut below shares. A stage pack exists to give a
+    // walk slot work during that stage, so packs must never outnumber the
+    // slots the policy will actually run: with the budget derived from the
+    // whole fold's work, a tiny fold (12x2: ~66 entries) plans ONE pack per
+    // stage and the serial walk drains a single claim instead of nine.
+    let level_gateways: Vec<Vec<KernelGating>> = levels
+        .iter()
+        .map(|level| {
+            level
+                .iter()
+                .map(|j| {
+                    LieSeries::<T, U>::kernel_prologue_cached_class(
+                        a_series,
+                        j.a_nonzero,
+                        j.b_nonzero,
+                        order,
+                        cache,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let sweep_entries: usize = level_gateways
+        .iter()
+        .map(|gateways| gateways.iter().map(|g| g.tickets.len()).sum::<usize>())
+        .sum();
+    let slots = work_adaptive_slots(threads, usize::MAX, sweep_entries);
+    for (level, gateways) in levels.iter().zip(level_gateways) {
         if want_scatter_sets {
             // Exact scatter sets for this level's jobs (same visit logic as
             // `sweep_pack_range`: the gating's precomputed tickets — the
@@ -2120,14 +2135,16 @@ where
         // pack: below ~8 entries per pack the per-pack claim/gate cost
         // dominates the pack's compute.
         const MIN_PACK_WORK: usize = 8;
-        let p_count = threads
+        let p_count = slots
             .min(bundle_count.max(1))
             // Work-scaled cap: a stage too small to give every slot a
             // pack of at least `MIN_PACK_WORK` entries must not spawn
-            // `threads` micro-packs — the claim/gate churn outweighs the
+            // micro-packs — the claim/gate churn outweighs the
             // parallelism on narrow grids (e.g. 12x2, whose whole fold is
             // ~66 entries per stage). Balanced bounds below keep the
-            // resulting packs even.
+            // resulting packs even. The leading `slots` cap is the
+            // fold-level work budget (see pass 1): packs beyond the
+            // policy's slot count would only be drained serially.
             .min(total.div_ceil(MIN_PACK_WORK))
             .max(1);
         let mut packs: Vec<(usize, usize)> = Vec::with_capacity(p_count);
@@ -2158,8 +2175,80 @@ where
     (stages, scatter_sets)
 }
 
+/// The slot policy's work quantum, in planned active-entry tickets per
+/// fold unit per slot: one more coordinated slot must be funded by this
+/// much real sweep work. Calibration: a swept entry costs ~40 cycles
+/// (measured marginal on the class kernel) and a coordinated slot pays
+/// the per-stage claim/gate protocol (~2-5 µs across a stage boundary),
+/// so 3750 entries × 40 cy ≈ 150 Kcy ≈ 50 µs of sweep work per slot at
+/// ~3 GHz — the break-even where an extra slot stops paying for the
+/// barriers it joins. Tuned between the two candidates (1500 ≈ 20 µs and
+/// 3750 ≈ 50 µs equivalents): both fix the tiny regimes, 3750 also wins
+/// the one regime they disagree on (3x8 at a 32t pool: e2e 161 ms vs
+/// 171 ms). Measured regimes: 12x2 (66 entries/fold) and 8x3 (~700/fold)
+/// walk serially at every pool size (their e2e used to run 6.5x slower at
+/// 16t than 1t — barrier machinery dwarfing the work); 3x8 (~74K/fold)
+/// lands near its measured 8-16t sweet spot (19 slots at a 32t pool);
+/// 2x12 (~247K/fold) still fills the pool.
+const SLOT_WORK_QUANTUM: usize = 3750;
+
+/// SLOT_POLICY_DEBUG=1: one stderr line per walk dispatch with the
+/// policy's inputs and decision (tuning/ops diagnostics; off by default).
+fn slot_policy_debug() -> bool {
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("SLOT_POLICY_DEBUG").is_some())
+}
+
+/// The stage chain's planned SWEEP work in swept-entry units: sweep
+/// stages contribute their gateways' precomputed active-entry tickets (the
+/// exact per-entry work unit the sweeps iterate — presence-resolved, so
+/// canceled entries don't inflate the estimate); block stages contribute
+/// nothing (their element count depends on the caller's block cut, which
+/// is itself chosen from this estimate). Pure plan-time data: no kernel
+/// results are needed.
+pub fn planned_sweep_entries<U>(stages: &[&ClassBatchStage<'_, U>]) -> usize {
+    stages
+        .iter()
+        .map(|s| match s.block {
+            Some(_) => 0,
+            None => s.gateways.iter().map(|g| g.tickets.len()).sum::<usize>(),
+        })
+        .sum()
+}
+
+/// The stage chain's planned work in swept-entry units: sweep stages
+/// contribute their gateways' precomputed active-entry tickets, block
+/// stages their element count (one block = one disjoint class-position
+/// range per pack). Pure plan-time data: no kernel results are needed.
+fn planned_stage_entries<U>(stages: &[&ClassBatchStage<'_, U>]) -> usize {
+    stages
+        .iter()
+        .map(|s| match s.block {
+            Some(_) => s.packs.len(),
+            None => s.gateways.iter().map(|g| g.tickets.len()).sum::<usize>(),
+        })
+        .sum()
+}
+
+/// Work-adaptive slot count for the stage-chain walk: the walk's parallel
+/// width is chosen from the PLANNED work, not just the pool size. Every
+/// slot joins every stage boundary's counter/gate protocol, so a slot is
+/// worth spawning only when its share of the per-fold-unit work covers the
+/// coordination cost: `per_unit_work / QUANTUM` slots, capped by the pool
+/// and by the widest stage's pack count (a slot beyond every stage's packs
+/// only adds barrier arrivals, never runs work). Callers that cut their
+/// own stage structure (e.g. a batch's block count) should derive it from
+/// the same policy so packs never outnumber useful slots.
+pub fn work_adaptive_slots(threads: usize, max_packs: usize, per_unit_work: usize) -> usize {
+    threads
+        .min(max_packs)
+        .min((per_unit_work / SLOT_WORK_QUANTUM).max(1))
+        .max(1)
+}
+
 /// Runs a linear chain of fold stages as ONE parallel dispatch (a serial
-/// loop on a single-worker pool). Every slot walks the stages in order:
+/// loop on the calling thread whenever the planned work cannot fund more
+/// than one coordinated slot). Every slot walks the stages in order:
 /// before waiting on a stage's counter it drains that stage's claim cursor
 /// — a queued stage's packs are run by whoever is working, never waited
 /// for — so the walk stays live under any pool contention. The per-stage
@@ -2168,10 +2257,17 @@ where
 /// earlier stages, and the per-word accumulation order is exactly the
 /// serial schedule's (packs never split a unit; blocks never split a
 /// range).
+///
+/// `fold_units` is how many per-fold repetitions the stage chain contains
+/// (1 for the per-fold path; a batch of `rhss.len()` folds repeats its
+/// gather/sweep/accumulate sub-chain once per displacement) — the slot
+/// policy normalizes the planned work by it, because the barrier cost is
+/// paid per stage, i.e. per fold unit, not once per dispatch.
 pub fn run_class_batch<T, U>(
     a_series: &LieSeries<T, U>,
     order: &ClassOrder,
     stages: &[&ClassBatchStage<'_, U>],
+    fold_units: usize,
 ) where
     T: Clone + Ord + Generator + Hash,
     U: Clone
@@ -2230,9 +2326,16 @@ pub fn run_class_batch<T, U>(
         .collect();
     let gates: Vec<FutexGate> = stage_pack_counts.iter().map(|_| FutexGate::new()).collect();
     let threads = rayon::current_num_threads().max(1);
-    let slots = threads
-        .min(stage_pack_counts.iter().copied().max().unwrap_or(1))
-        .max(1);
+    let max_packs = stage_pack_counts.iter().copied().max().unwrap_or(1);
+    let planned_entries = planned_stage_entries(stages);
+    let per_unit_work = planned_entries / fold_units.max(1);
+    let slots = work_adaptive_slots(threads, max_packs, per_unit_work);
+    if slot_policy_debug() {
+        eprintln!(
+            "slot_policy: fold_units={fold_units} planned_entries={planned_entries} \
+             per_unit={per_unit_work} threads={threads} max_packs={max_packs} slots={slots}"
+        );
+    }
     let walk_for_slot = |_slot: usize| {
         for s in 0..stages.len() {
             if s > 0 {
@@ -2292,10 +2395,13 @@ pub fn run_class_batch<T, U>(
         }
     };
 
-    if threads <= 1 {
-        for slot in 0..slots {
-            walk_for_slot(slot);
-        }
+    // The serial walk is entered by the POLICY's slot count, not the pool
+    // size: `slots == 1` runs the identical walk on the calling thread —
+    // the claims/counters/gates are self-contained per slot, so the
+    // single-slot semantics are exactly the single-worker pool's long-
+    // standing serial path, minus the par_iter dispatch cost.
+    if slots <= 1 {
+        walk_for_slot(0);
     } else {
         use rayon::prelude::*;
         (0..slots).into_par_iter().for_each(walk_for_slot);
@@ -2353,7 +2459,9 @@ pub fn commutator_coefficients_class_fold_with_cache<T, U>(
     let (stages, _scatter_sets) =
         plan_class_sweep_stages(a_series, order, levels, cache, false);
     let stage_refs: Vec<&ClassBatchStage<U>> = stages.iter().collect();
-    run_class_batch(a_series, order, &stage_refs);
+    // One fold unit: the stage chain is a single fold's sweep stages, so
+    // the slot policy sees the fold's own planned work.
+    run_class_batch(a_series, order, &stage_refs, 1);
 }
 
 /// Receiver for the absolute basis indices a kernel call scatters onto.
@@ -3084,6 +3192,37 @@ impl<
 mod test {
     use ordered_float::NotNan;
     use rstest::rstest;
+
+    /// The work-adaptive slot policy must reproduce the measured regimes:
+    /// tiny folds walk serially at any pool size, mid folds land on their
+    /// measured sweet spot, wide folds fill the pool, and the pool/pack
+    /// caps still bind.
+    #[test]
+    fn work_adaptive_slots_matches_measured_regimes() {
+        use super::work_adaptive_slots;
+        // 12x2 per-fold (66 entries/fold): serial at every pool size.
+        assert_eq!(work_adaptive_slots(32, 32, 66), 1);
+        assert_eq!(work_adaptive_slots(2, 32, 66), 1);
+        // 8x3 (~700 entries/fold, + block elements in the batch path):
+        // 1-2 slots.
+        assert_eq!(work_adaptive_slots(32, 32, 700), 1);
+        assert!(work_adaptive_slots(32, 32, 2000) <= 2, "8x3 regime: 2000 entries must fund at most 2 slots");
+        // 3x8 (~74K planned entries/fold): the QUANTUM lands it near the
+        // measured 8-16t sweet spot — 19 slots at a 32t pool (74_000/3750).
+        assert_eq!(work_adaptive_slots(32, 32, 74_000), 19);
+        // ... and stays in that neighborhood across the regime's ticket
+        // variance (the real 3x8 fold's planned count wobbles around 74K).
+        let s = work_adaptive_slots(32, 32, 70_000);
+        assert!((16..=21).contains(&s), "3x8 regime: 70K entries must land in 16..=21 slots, got {s}");
+        // 2x12 (~257K entries/fold): the full pool.
+        assert_eq!(work_adaptive_slots(32, 32, 256_858), 32);
+        // Pool and pack caps bind before the work term.
+        assert_eq!(work_adaptive_slots(8, 3, 256_858), 3);
+        assert_eq!(work_adaptive_slots(1, 32, 256_858), 1);
+        assert_eq!(work_adaptive_slots(32, 1, 256_858), 1);
+        // Degenerate: no planned work → serial.
+        assert_eq!(work_adaptive_slots(32, 32, 0), 1);
+    }
 
     /// INVARIANT CHECK on the real tables: within one degree-target slice,
     /// two different units must never scatter onto the same basis word (the

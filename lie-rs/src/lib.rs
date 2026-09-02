@@ -43,7 +43,8 @@ pub use lie_series::{
     DEBUG_AB_D, DEBUG_WRITES, GatingCache, KernelJob, LieSeries, raw_add_assign,
     raw_add_assign_ptr, raw_mul, commutator_coefficients_batch,
     commutator_coefficients_batch_with_cache, commutator_coefficients_class_batch_with_cache,
-    commutator_coefficients_class_fold_with_cache, plan_class_sweep_stages, run_class_batch, IDENTITY_SHIFTS,
+    commutator_coefficients_class_fold_with_cache, plan_class_sweep_stages, run_class_batch,
+    planned_sweep_entries, work_adaptive_slots, IDENTITY_SHIFTS,
 };
 pub use rooted_tree::{EdgePartitions, GraphPartitionTable, RootedTree};
 
