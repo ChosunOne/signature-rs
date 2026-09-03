@@ -38,25 +38,23 @@ A log signature of a path is built by folding the displacements of consecutive p
 )
 
 #align(center)[
-  #block(width: 98%)[
-    #grid(columns: (30pt, 50pt, 4pt, 60pt, 4pt, 1fr), column-gutter: 3pt, align: horizon,
-      cap(6.5pt)[path], boxc(50pt, 13pt, rs, "d₁ ⋈ d₂ ⋈ … serial", white),
-      sym.arrow.r, boxc(60pt, 13pt, gv.darken(10%), "fold k: BCH DAG", white),
-      sym.arrow.r, stack(dir: ltr, spacing: 2pt,
-        boxc(42pt, 13pt, sw, "level ℓ", white),
-        boxc(42pt, 13pt, sw.lighten(20%), "level ℓ+1", white),
-        boxc(42pt, 13pt, sw.lighten(40%), "level ℓ+2", black)),
+  #block(width: 98%, inset: 4pt)[
+    #stack(dir: ltr, spacing: 3pt,
+      cap(6.5pt)[path~~], boxc(56pt, 13pt, rs, "d₁ ⋈ d₂ ⋈ …", white),
+      sym.arrow.r, boxc(62pt, 13pt, gv.darken(10%), "fold k: BCH DAG", white),
+      sym.arrow.r,
+      boxc(42pt, 13pt, sw, "level ℓ", white),
+      boxc(44pt, 13pt, sw.lighten(20%), "level ℓ+1", white),
+      boxc(44pt, 13pt, sw.lighten(40%), "level ℓ+2", black),
     )
-    #v(2pt)
-    #grid(columns: (30pt, 1fr), column-gutter: 3pt,
-      [], grid(columns: 1fr,
-        stack(dir: ltr, spacing: 1.5pt,
-          boxc(30pt, 9pt, sw.lighten(35%), "unit", black), boxc(30pt, 9pt, sw.lighten(50%), "unit", black),
-          boxc(30pt, 9pt, sw.lighten(35%), "unit", black), boxc(30pt, 9pt, sw.lighten(50%), "unit", black),
-          boxc(30pt, 9pt, sw.lighten(35%), "unit", black), boxc(30pt, 9pt, sw.lighten(50%), "unit", black),
-          cap(6pt)[… hundreds of anagram units per node]),
-      ),
-    )
+    #v(4pt)
+    #stack(dir: ltr, spacing: 1.5pt,
+      cap(6.5pt)[units~~],
+      boxc(30pt, 9pt, sw.lighten(35%), "unit", black), boxc(30pt, 9pt, sw.lighten(50%), "unit", black),
+      boxc(30pt, 9pt, sw.lighten(35%), "unit", black), boxc(30pt, 9pt, sw.lighten(50%), "unit", black),
+      boxc(30pt, 9pt, sw.lighten(35%), "unit", black), boxc(30pt, 9pt, sw.lighten(50%), "unit", black),
+      cap(6pt)[~~… hundreds of anagram units per node])
+    #v(3pt)
     #cap(6.5pt)[Nesting: a serial chain of folds; each fold a level-ordered DAG of commutations; each commutation a bag of anagram units. Parallelism exists at the two inner scales; the outermost scale is a data dependency, not a scheduling choice.]
   ]
 ]
@@ -90,17 +88,22 @@ A *feasible decomposition* of a basis word $w$ is a canonical pair $(u, v)$ such
 ]
 
 #align(center)[
-  #block(width: 96%)[
-    #grid(columns: (34pt, 46pt, 30pt, 46pt, 30pt, 46pt, 30pt, 1fr), column-gutter: 2pt, align: horizon,
-      cap(6.5pt)[target $w$], boxc(46pt, 12pt, sw, "w", white),
-      cap(6.5pt)[pairs], boxc(46pt, 12pt, sw.lighten(25%), "(u,v)₁", white), boxc(30pt, 12pt, white, "·", luma(80)), boxc(46pt, 12pt, sw.lighten(25%), "(u,v)₂", white), boxc(30pt, 12pt, white, "·", luma(80)), boxc(46pt, 12pt, sw.lighten(25%), "(u,v)₃", white),
-      cap(6pt)[… few, usually 1–3],
+  #block(width: 96%, inset: 4pt)[
+    #stack(dir: ltr, spacing: 2.5pt,
+      boxc(46pt, 12pt, sw, "w", white),
+      cap(6.5pt)[~~←~], boxc(46pt, 12pt, sw.lighten(25%), "(u,v)₁", white),
+      boxc(14pt, 12pt, white, "·", luma(80)), boxc(46pt, 12pt, sw.lighten(25%), "(u,v)₂", white),
+      boxc(14pt, 12pt, white, "·", luma(80)), boxc(46pt, 12pt, sw.lighten(25%), "(u,v)₃", white),
+      cap(6.5pt)[~~(few: usually 1–3 pairs feed one word)],
     )
-    #v(2pt)
-    #grid(columns: (34pt, 46pt, 30pt, 46pt, 30pt, 46pt, 30pt, 1fr), column-gutter: 2pt, align: horizon,
-      cap(6.5pt)[coeffs], boxc(46pt, 12pt, white, "c₁", luma(60)), boxc(30pt, 12pt, white, "", white), boxc(46pt, 12pt, white, "c₂", luma(60)), boxc(30pt, 12pt, white, "", white), boxc(46pt, 12pt, white, "c₃", luma(60)), [],
+    #v(3pt)
+    #stack(dir: ltr, spacing: 2.5pt,
+      boxc(46pt, 12pt, white, " ", luma(60)),
+      cap(6.5pt)[~~~~], boxc(46pt, 12pt, white, "c₁", luma(60)),
+      boxc(14pt, 12pt, white, " ", white), boxc(46pt, 12pt, white, "c₂", luma(60)),
+      boxc(14pt, 12pt, white, " ", white), boxc(46pt, 12pt, white, "c₃", luma(60)),
     )
-    #cap(6.5pt)[One word's coefficient = a short inner product: its (pair, rational) decomposition row dotted with the antisymmetric pair-terms. Both the pair table and the rational rows are *structure constants*: they depend only on the basis, never on the data.]
+    #cap(6.5pt)[One word $w$'s coefficient = a short inner product: its (pair, rational) decomposition row dotted with the antisymmetric pair-terms. Both the pair table and the rational rows are *structure constants*: they depend only on the basis, never on the data.]
   ]
 ]
 
@@ -274,13 +277,14 @@ A path of 1000 segments is 1000 folds. Running them through the per-fold machine
 
 #align(center)[
   #block(width: 100%)[
-    #grid(columns: (34pt, 34pt, 15pt, 90pt, 15pt, 46pt, 15pt, 90pt, 15pt, 1fr), column-gutter: 1.5pt, align: horizon,
-      cap(6.2pt)[lead], boxc(34pt, 13pt, gv.lighten(30%), "zero", black),
-      [], boxc(34pt, 13pt, gv, "gather₁", white), boxc(15pt, 13pt, white, "→", luma(80)),
-      stack(dir: ltr, spacing: 1pt, ..range(5).map(i => boxc(90pt / 5 - 1pt, 13pt, sw.lighten(i * 8%), "L" + str(i+1), white))),
-      boxc(15pt, 13pt, white, "→", luma(80)), boxc(46pt, 13pt, ac, "accumulate₁", white),
-      boxc(15pt, 13pt, white, "→", luma(80)), boxc(34pt, 13pt, gv, "gather₂", white), boxc(15pt, 13pt, white, "→", luma(80)),
-      cap(6pt)[…],
+    #stack(dir: ltr, spacing: 1.5pt,
+      cap(6.2pt)[lead~], boxc(28pt, 13pt, gv.lighten(30%), "zero", black),
+      cap(6.2pt)[~fold 1:~], boxc(38pt, 13pt, gv, "gather₁", white),
+      boxc(11pt, 13pt, white, "→", luma(80)),
+      ..range(5).map(i => boxc(17pt, 13pt, sw.lighten(i * 8%), "L" + str(i+1), white)),
+      boxc(11pt, 13pt, white, "→", luma(80)), boxc(48pt, 13pt, ac, "accumulate₁", white),
+      cap(6.2pt)[~fold 2:~], boxc(38pt, 13pt, gv, "gather₂", white),
+      cap(6.2pt)[~…],
     )
     #v(2.5pt)
     #cap(6.3pt)[The batch as one stage chain (5 of $L$ sweep levels shown). Parallel work exists *inside* every stage; between stages, barrier counters; between the last accumulate of fold $k$ and the first sweep of fold $k+1$, a true data dependency — the accumulator. The chain is long and thin by design: the planning and allocation it replaces cost far more than the barrier hops when a fold's sweep work is large, and far less (§7) when it is small.]
@@ -296,9 +300,9 @@ The one structural number that decides whether parallelism helps is *planned swe
 
 #align(center)[
   #block(width: 97%)[
-    #grid(columns: (64pt, 1fr, 88pt, 78pt), column-gutter: 5pt, row-gutter: 3pt,
+    #grid(columns: (96pt, 92pt, 96pt, 1fr), column-gutter: 5pt, row-gutter: 3pt,
       [], align(center, cap(6.6pt)[*planned entries per fold*]), align(center, cap(6.6pt)[*chosen slots (32-thread pool)*]), align(center, cap(6.6pt)[*e2e at 32t vs 1t*]),
-      [12×2 (high-dim, low-degree)], [66], [1 (serial walk)], cap(6.6pt)[2.55 → 1.25 ms ✓ (was 16.4 ms!)],
+      [12×2 (high-dim, low-degree)], [66], [1 (serial walk)], cap(6.6pt)[2.55 → 1.25 ms ✓ \ (was 16.4 ms!)],
       [8×3], [700], [1], cap(6.6pt)[28.6 → 7.7 ms ✓],
       [3×8], [≈74,000], [19], cap(6.6pt)[338 → 161 ms ✓],
       [2×12 (low-dim, high-degree)], [≈257,000], [32], cap(6.6pt)[1393 → 549 ms ✓],
@@ -345,11 +349,11 @@ Two caveats keep it out of the current engine: floating-point results would no l
 == Regime map: what was measured
 
 #text(size: 8pt)[
-  #grid(columns: (56pt, 74pt, 74pt, 86pt, 1fr), column-gutter: 5pt, row-gutter: 2.5pt,
+  #grid(columns: (52pt, 84pt, 78pt, 74pt, 1fr), column-gutter: 5pt, row-gutter: 2.5pt,
     [*grid*], [*stock, best config*], [*today, best config*], [*gain*], [*why*],
-    [2×12 (low-d, high-m)], [1393 ms \@32t], [533 ms \@16t], [2.61×], [All layers engaged: tickets, balanced packs, 16–19 slots of real work, adaptive accumulate.],
+    [2×12], [1393 ms \@32t], [533 ms \@16t], [2.61×], [All layers engaged: tickets, balanced packs, 16–19 slots of real work, adaptive accumulate. #h(0.5em)_(low-d, high-m)_],
     [3×8], [331 ms \@8t], [155 ms \@16t], [2.13×], [Same, moderately narrower fold.],
-    [12×2 (high-d, low-m)], [2.55 ms \@1t (16t: 16.7 ms!)], [1.25 ms — flat 1t…32t], [2.04×, pathology gone], [66 entries/fold: adaptivity runs it serial-inside-parallel; batch amortization + allocation elimination.],
+    [12×2], [2.55 ms \@1t (16t: 16.7 ms!)], [1.25 ms — flat at 1t…32t], [2.04×, pathology gone], [66 entries/fold: adaptivity runs it serial-inside-parallel; batch amortization + allocation elimination. #h(0.5em)_(high-d, low-m)_],
     [8×3], [8.02 ms \@2t (32t: 28.6 ms)], [7.6 ms — flat], [1.06×, pathology gone], [700 entries/fold: right on the serial/parallel boundary.],
   )
 ]
