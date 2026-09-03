@@ -123,6 +123,313 @@ mod raw_ops {
     }
 }
 
+/// SIMD-across-folds ("cohort") fast path for the commutation kernel.
+///
+/// A cohort executes FOUR independent folds' sweeps as one walk of the
+/// shared plan, carrying the folds' coefficient values as `[f64; 4]` (or
+/// `[f32; 4]`) lane vectors over SoA-interleaved buffers: the four lanes'
+/// value of buffer slot `s` lives at elements `[s*4 .. s*4+4]`, lane `l` at
+/// `s*4 + l`. Decompositions, scatter indices, gating and BCH weights are
+/// lane-invariant plan data (a fold plan is a pure function of the basis
+/// and degree — the folds differ only in coefficient VALUES), so one walk
+/// serves all four lanes and every position access is a single 4-lane
+/// vector load/store.
+///
+/// The lane arithmetic replicates the scalar kernel's per-lane operation
+/// order exactly (plain mul + add, no FMA — Rust does not contract by
+/// default), so cohort results are bit-identical to the scalar kernel's
+/// per-fold results (0 ulp; verified by the spike and by the log-signature
+/// fold's cohort-vs-scalar oracle test).
+///
+/// The kernel is gated to the repr-transparent raw-float coefficient types
+/// ([`cohort_supported`]): the lane vectors reinterpret the coefficient
+/// slots through the primitive type exactly like the [raw-float fast path]
+/// (see `raw_ops`' NaN policy — overflowing inputs may produce NaN/Inf in
+/// the slots; callers audit).
+///
+/// [raw-float fast path]: raw_ops
+pub mod cohort {
+    use super::*;
+    use ordered_float::NotNan;
+    use std::any::TypeId;
+
+    /// The four lanes of one cohort sweep.
+    pub const LANES: usize = 4;
+
+    /// True exactly for the coefficient types the cohort kernel supports:
+    /// `f32`/`f64` and their `NotNan` wrappers (repr-transparent over the
+    /// primitive — same set as the raw-float fast path). Every other
+    /// coefficient type keeps the scalar kernel.
+    pub fn supported<U: 'static>() -> bool {
+        TypeId::of::<U>() == TypeId::of::<f64>()
+            || TypeId::of::<U>() == TypeId::of::<NotNan<f64>>()
+            || TypeId::of::<U>() == TypeId::of::<f32>()
+            || TypeId::of::<U>() == TypeId::of::<NotNan<f32>>()
+    }
+
+    #[inline(always)]
+    fn is_f64_lane<U: 'static>() -> bool {
+        TypeId::of::<U>() == TypeId::of::<f64>()
+            || TypeId::of::<U>() == TypeId::of::<NotNan<f64>>()
+    }
+
+    #[inline(always)]
+    fn is_f32_lane<U: 'static>() -> bool {
+        TypeId::of::<U>() == TypeId::of::<f32>()
+            || TypeId::of::<U>() == TypeId::of::<NotNan<f32>>()
+    }
+
+    /// Reads the four lane values of one SoA buffer slot.
+    ///
+    /// # Safety
+    /// `src` must be valid for [`LANES`] contiguous `U` elements, and `U`
+    /// must be a repr-transparent form of the lane primitive `L` — the
+    /// caller's TypeId dispatch guarantees both.
+    #[inline(always)]
+    unsafe fn load4<U, L>(src: *const U) -> [L; 4]
+    where
+        L: Copy + Default + Add<Output = L> + Mul<Output = L> + Neg<Output = L> + 'static,
+    {
+        // SAFETY: see the doc; the slots are 4-element-strided so an
+        // unaligned read covers every layout the engine can produce.
+        unsafe { (src as *const [L; LANES]).read_unaligned() }
+    }
+
+    /// Writes the four lane values of one SoA buffer slot.
+    ///
+    /// # Safety
+    /// `dst` must be valid for [`LANES`] contiguous `U` elements, and `U`
+    /// must be a repr-transparent form of `L` (see [`load4`]). Written
+    /// values may be NaN for overflowing float inputs — the raw-float NaN
+    /// policy (callers audit).
+    #[inline(always)]
+    unsafe fn store4<U, L>(dst: *mut U, v: [L; LANES])
+    where
+        L: Copy + Default + Add<Output = L> + Mul<Output = L> + Neg<Output = L> + 'static,
+    {
+        // SAFETY: see the doc.
+        unsafe { (dst as *mut [L; LANES]).write_unaligned(v) }
+    }
+
+    /// Broadcasts one coefficient value to all four lanes.
+    #[inline(always)]
+    fn splat4<U, L>(value: &U) -> [L; LANES]
+    where
+        L: Copy + Default + Add<Output = L> + Mul<Output = L> + Neg<Output = L> + 'static,
+    {
+        // SAFETY: a single live `U` element, repr-transparent over `L`.
+        let s = unsafe { (value as *const U).cast::<L>().read() };
+        [s; LANES]
+    }
+
+    #[inline(always)]
+    fn mul4<L: Copy + Mul<Output = L>>(a: [L; LANES], b: [L; LANES]) -> [L; LANES] {
+        [
+            a[0] * b[0],
+            a[1] * b[1],
+            a[2] * b[2],
+            a[3] * b[3],
+        ]
+    }
+
+    #[inline(always)]
+    fn add4<L: Copy + Add<Output = L>>(a: [L; LANES], b: [L; LANES]) -> [L; LANES] {
+        [
+            a[0] + b[0],
+            a[1] + b[1],
+            a[2] + b[2],
+            a[3] + b[3],
+        ]
+    }
+
+    #[inline(always)]
+    fn neg4<L: Copy + Neg<Output = L>>(a: [L; LANES]) -> [L; LANES] {
+        [-a[0], -a[1], -a[2], -a[3]]
+    }
+
+    /// Cohort multiply-accumulate for the fold's accumulate phase:
+    /// `dst4 += weight × src4` for all four lanes, where `weight` is the
+    /// (shared) BCH weight of the term being accumulated and `src`/`dst`
+    /// are SoA slots. The per-lane operation order matches the scalar
+    /// engine's `raw_add_assign(dst, &raw_mul(src, weight))` exactly, so
+    /// cohort accumulation is bit-identical to the scalar kernel's.
+    ///
+    /// # Safety
+    /// `dst`/`src` must each be valid for [`LANES`] contiguous `U`
+    /// elements, and the cohort capability ([`supported`]) must hold for
+    /// `U` (the caller's gate; other types panic).
+    pub unsafe fn add_mul4<U>(dst: *mut U, src: *const U, weight: &U)
+    where
+        U: 'static,
+    {
+        if is_f64_lane::<U>() {
+            // SAFETY: the caller's contract; `U` is an f64 form.
+            unsafe {
+                let w = splat4::<U, f64>(weight);
+                let v = load4::<U, f64>(src);
+                let d = load4::<U, f64>(dst);
+                store4::<U, f64>(dst, add4(d, mul4(v, w)));
+            }
+        } else if is_f32_lane::<U>() {
+            // SAFETY: as the f64 branch, with f32 lanes.
+            unsafe {
+                let w = splat4::<U, f32>(weight);
+                let v = load4::<U, f32>(src);
+                let d = load4::<U, f32>(dst);
+                store4::<U, f32>(dst, add4(d, mul4(v, w)));
+            }
+        } else {
+            panic!(
+                "cohort accumulate requires a raw repr-transparent float \
+                 coefficient type (f32/f64 or NotNan)"
+            );
+        }
+    }
+
+    /// The cohort (4-lane SoA) sweep of one pack: the exact
+    /// `sweep_pack_range` visit order, gating and per-lane arithmetic, with
+    /// the four folds' values carried as lane vectors over SoA-interleaved
+    /// buffers (the jobs' operand/result pointers point at SoA bases; lane
+    /// `l` of slot `s` lives at element `s*LANES + l`).
+    ///
+    /// Callers must have verified [`supported`] for `U`; the dispatch below
+    /// selects the lane width from the coefficient type and panics
+    /// otherwise (the cohort engine never forms for other types).
+    pub(super) fn sweep_pack_range<U>(
+        entries: &[Entry],
+        decomp: &[u32],
+        coeffs: &[U],
+        stage: &ClassBatchStage<'_, U>,
+        pack: usize,
+    ) where
+        U: 'static,
+    {
+        if is_f64_lane::<U>() {
+            sweep_pack_impl::<U, f64>(entries, decomp, coeffs, stage, pack);
+        } else if is_f32_lane::<U>() {
+            sweep_pack_impl::<U, f32>(entries, decomp, coeffs, stage, pack);
+        } else {
+            panic!(
+                "cohort sweep requires a raw repr-transparent float \
+                 coefficient type (f32/f64 or NotNan)"
+            );
+        }
+    }
+
+    /// The typed cohort sweep kernel. The visit order, unit/pack structure,
+    /// shift arithmetic and per-lane operation order replicate
+    /// `sweep_pack_range` exactly; the only difference is that every
+    /// position access loads/stores [`LANES`] lanes at once.
+    fn sweep_pack_impl<U, L>(
+        entries: &[Entry],
+        decomp: &[u32],
+        coeffs: &[U],
+        stage: &ClassBatchStage<'_, U>,
+        pack: usize,
+    ) where
+        L: Copy
+            + Default
+            + Add<Output = L>
+            + Mul<Output = L>
+            + Neg<Output = L>
+            + Send
+            + Sync
+            + 'static,
+        U: 'static,
+    {
+        let (start, end) = stage.packs[pack];
+        let jobs = stage.jobs;
+        let mut t = start;
+        while t < end {
+            let ji = stage.tasks[t].0 as usize;
+            let mut e = t + 1;
+            while e < end && stage.tasks[e].0 == stage.tasks[t].0 {
+                e += 1;
+            }
+            let job = &jobs[ji];
+            let gating = &stage.gateways[ji];
+            let a_shift = job.a_shift;
+            let b_shift = job.b_shift;
+            let r_shift = job.r_shift;
+            // The job's tasks are consecutive unit indices in its gating —
+            // one run is one contiguous slice of the hot `active` list.
+            let ui_start = stage.tasks[t].1 as usize;
+            let ui_end = stage.tasks[e - 1].1 as usize + 1;
+            for au in &gating.active[ui_start..ui_end] {
+                let rs = au.rs as usize;
+                // SAFETY: the shift tables have >= max_degree+1 entries and
+                // `au.p`/`au.td` are degrees of the table (see the plan).
+                let p = au.p as usize;
+                let td = au.td as usize;
+                let q = td - p;
+                let a_sh_p = unsafe { *a_shift.add(p) } as usize;
+                let a_sh_q = unsafe { *a_shift.add(q) } as usize;
+                let b_sh_p = unsafe { *b_shift.add(p) } as usize;
+                let b_sh_q = unsafe { *b_shift.add(q) } as usize;
+                // Scatter targets `rs + rel` of degree `td` live at
+                // `(rs + rel - r_shift[td]) * LANES` in the SoA result
+                // buffer; hoist the constant part so the inner loop is one
+                // scaled add.
+                let r_base = (rs - unsafe { *r_shift.add(td) } as usize) * LANES;
+                // Precomputed tickets: the presence-resolved visit stream,
+                // orientation flags packed in the top bits.
+                for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize]
+                {
+                    let e = (ticket & TICKET_INDEX_MASK) as usize;
+                    let entry = entries[e];
+                    // The table's trailing sentinel backs the +1 successor.
+                    let next = entries[e + 1];
+                    let p_active = ticket & TICKET_P_ACTIVE != 0;
+                    let q_active = ticket & TICKET_Q_ACTIVE != 0;
+                    let (i, j) = (entry.i as usize, entry.j as usize);
+                    // SAFETY: i and j are class positions of degrees p and
+                    // q; the presence tests guarantee they are in the
+                    // operands' supports, whose shift tables map them into
+                    // the SoA buffers at slots `(position - shift) * LANES`.
+                    let term: [L; LANES] = unsafe {
+                        if p_active {
+                            let mut t = mul4(
+                                load4::<U, L>(job.a.add((i - a_sh_p) * LANES)),
+                                load4::<U, L>(job.b.add((j - b_sh_q) * LANES)),
+                            );
+                            if q_active {
+                                t = add4(
+                                    t,
+                                    neg4(mul4(
+                                        load4::<U, L>(job.a.add((j - a_sh_q) * LANES)),
+                                        load4::<U, L>(job.b.add((i - b_sh_p) * LANES)),
+                                    )),
+                                );
+                            }
+                            t
+                        } else {
+                            neg4(mul4(
+                                load4::<U, L>(job.a.add((j - a_sh_q) * LANES)),
+                                load4::<U, L>(job.b.add((i - b_sh_p) * LANES)),
+                            ))
+                        }
+                    };
+                    let from = entry.decomp_start as usize;
+                    let to = next.decomp_start as usize;
+                    for (&rel, c) in decomp[from..to].iter().zip(&coeffs[from..to]) {
+                        // SAFETY: rel < re - rs (decomposition rows stay
+                        // inside the unit's target degree slice), so the SoA
+                        // slot `r_base + rel*LANES` is inside the job's
+                        // result buffer.
+                        unsafe {
+                            let off = r_base + rel as usize * LANES;
+                            let rp = job.result.add(off);
+                            let cur = load4::<U, L>(rp);
+                            store4::<U, L>(rp, add4(cur, mul4(splat4::<U, L>(c), term)));
+                        }
+                    }
+                }
+            }
+            t = e;
+        }
+    }
+}
+
 #[cfg(feature = "progress")]
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -566,6 +873,10 @@ const MIN_BUNDLE_ENTRIES: usize = 16;
 /// The kernel prologue's output: the active anagram units (shared through a
 /// [`GatingCache`]), their precomputed active-entry tickets, and the total
 /// visited-entry count.
+///
+/// Cloning is cheap (both hot fields are `Arc` slices) — the cohort sweep
+/// stages clone their planned stage's gateways.
+#[derive(Clone)]
 struct KernelGating {
     active: Arc<[ActiveSegment]>,
     /// Flat list of packed active-entry tickets (see the `TICKET_*`
@@ -1610,6 +1921,13 @@ pub struct ClassBatchStage<'a, U> {
     /// Block stages: which fold of the batch this stage serves (the
     /// block task reads the fold's inputs through it). Sweep stages: 0.
     fold: usize,
+    /// Sweep stages: run the 4-lane SoA cohort sweep instead of the scalar
+    /// one. A cohort stage's jobs carry SoA-interleaved operand/result
+    /// pointers (the four lanes' values of class position `p` live at
+    /// `[p*4 .. p*4+4]`, lane `l` at `p*4 + l`), and every other plan input
+    /// (tasks, packs, gateways, support lists) is lane-invariant — see
+    /// `CommutatorDag::fold_batch_cohort` for how such a plan is built.
+    cohort: bool,
 }
 
 /// The per-block task/pack shape shared by every block stage of one
@@ -1646,6 +1964,25 @@ impl<'a, U> ClassBatchStage<'a, U> {
             jobs: &[],
             block: Some(task),
             fold,
+            cohort: false,
+        }
+    }
+
+    /// The cohort (SoA) sweep variant of a planned sweep stage: identical
+    /// tasks, packs, gateways and job views (all lane-invariant — see the
+    /// `cohort` field), dispatched to the 4-lane SoA kernel instead of the
+    /// scalar sweep. The stage's jobs' operand/result pointers must be
+    /// SoA-interleaved with lane stride 4 (the cohort engine's job tables
+    /// are built that way); the support lists are the shared plan's.
+    pub fn cohort_variant(stage: &Self) -> Self {
+        Self {
+            tasks: Arc::clone(&stage.tasks),
+            packs: Arc::clone(&stage.packs),
+            gateways: stage.gateways.clone(),
+            jobs: stage.jobs,
+            block: None,
+            fold: 0,
+            cohort: true,
         }
     }
 }
@@ -1888,6 +2225,7 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
         match stage.block {
             // Block stage: pack `p` runs block `p` (one task per pack).
             Some(task) => task(stage.tasks[pack].0 as usize, stage.fold),
+            None if stage.cohort => self.cohort_sweep_pack_range(s, stage, pack),
             None => self.sweep_pack_range(s, stage, pack),
         }
         true
@@ -2009,6 +2347,18 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
             }
             t = e;
         }
+    }
+
+    /// The cohort (4-lane SoA) sweep for one pack — dispatched to the
+    /// lane-typed kernel in [`cohort`] (the stage's `cohort` flag routes
+    /// here; the engine that built the stage verified the cohort
+    /// capability for `U`). The stage's jobs carry SoA-interleaved
+    /// operand/result pointers; every other plan input (tasks, packs,
+    /// gateways, support lists) is lane-invariant — see the `cohort`
+    /// module's docs for the layout and the bit-exactness argument.
+    #[inline]
+    fn cohort_sweep_pack_range(&self, _s: usize, stage: &ClassBatchStage<'a, U>, pack: usize) {
+        cohort::sweep_pack_range(self.entries, self.decomp, self.coeffs, stage, pack);
     }
 }
 
@@ -2198,6 +2548,7 @@ where
             jobs: level.as_slice(),
             block: None,
             fold: 0,
+            cohort: false,
         });
     }
     (stages, scatter_sets)
@@ -2307,6 +2658,37 @@ pub fn run_class_batch<T, U>(
         + Sync
         + 'static,
 {
+    run_class_batch_with_work(
+        a_series,
+        order,
+        stages,
+        fold_units,
+        planned_stage_entries(stages),
+    );
+}
+
+/// [`run_class_batch`] with the caller's planned-work estimate: a cohort
+/// chain's sweep stages carry the 4-lane work that the plain stage-based
+/// estimate (entry tickets, lane-agnostic plan data) cannot see, so the
+/// cohort engine supplies `planned_work = scalar_tickets × lanes` and the
+/// slot policy funds the walk from the true per-unit work.
+pub fn run_class_batch_with_work<T, U>(
+    a_series: &LieSeries<T, U>,
+    order: &ClassOrder,
+    stages: &[&ClassBatchStage<'_, U>],
+    fold_units: usize,
+    planned_work: usize,
+) where
+    T: Clone + Ord + Generator + Hash,
+    U: Clone
+        + Neg<Output = U>
+        + Mul<Output = U>
+        + AddAssign
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static,
+{
     // The walk is fully internal for sweep stages: relabeled entries gate
     // the presence tests and index the class-ordered operands. Results are
     // written per job through the job's own buffer (see `sweep_pack_range`).
@@ -2355,7 +2737,7 @@ pub fn run_class_batch<T, U>(
     let gates: Vec<FutexGate> = stage_pack_counts.iter().map(|_| FutexGate::new()).collect();
     let threads = rayon::current_num_threads().max(1);
     let max_packs = stage_pack_counts.iter().copied().max().unwrap_or(1);
-    let planned_entries = planned_stage_entries(stages);
+    let planned_entries = planned_work;
     let per_unit_work = planned_entries / fold_units.max(1);
     let slots = work_adaptive_slots(threads, max_packs, per_unit_work);
     if slot_policy_debug() {
@@ -3016,7 +3398,6 @@ impl<
                 total_entries: table.len(),
             };
         }
-
         let key = (
             Self::support_fingerprint(a_nonzero_cls),
             Self::support_fingerprint(b_nonzero_cls),

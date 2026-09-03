@@ -44,8 +44,9 @@ pub use lie_series::{
     raw_add_assign_ptr, raw_mul, commutator_coefficients_batch,
     commutator_coefficients_batch_with_cache, commutator_coefficients_class_batch_with_cache,
     commutator_coefficients_class_fold_with_cache, plan_class_sweep_stages, run_class_batch,
-    planned_sweep_entries, work_adaptive_slots, IDENTITY_SHIFTS,
+    run_class_batch_with_work, planned_sweep_entries, work_adaptive_slots, IDENTITY_SHIFTS,
 };
+pub use lie_series::cohort::{add_mul4, supported as cohort_supported, LANES as COHORT_LANES};
 pub use rooted_tree::{EdgePartitions, GraphPartitionTable, RootedTree};
 
 use num_traits::{FromPrimitive, One, Zero};
