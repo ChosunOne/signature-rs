@@ -34,15 +34,33 @@ fn is_nan_value<U: PartialEq>(c: &U) -> bool {
 /// overhead (extra DAG warm-ups, pool coordination, one final merge fold).
 const TOURNAMENT_MIN_DISPLACEMENTS: usize = 16;
 
-/// Displacements per tournament leaf chunk. Leaves fold
-/// `TOURNAMENT_LEAF_CHUNK` displacements each, so a batch of `n`
-/// displacements runs `n / TOURNAMENT_LEAF_CHUNK` independent leaf folds in
-/// parallel and only `n / TOURNAMENT_LEAF_CHUNK - 1` full-dense merge folds
-/// afterwards, versus `n` mostly-dense folds in the sequential chain. 8
-/// keeps leaf parallelism high (≥2 leaves at the 16-displacement threshold,
-/// ≫ thread count for real path sizes) while capping the merge rounds' dense
-/// work at ~12% extra folds over the sequential count.
+/// Minimum displacements per tournament leaf chunk. Leaves fold a
+/// contiguous chunk of at least this many displacements through the
+/// SEQUENTIAL batch driver (`fold_batch_sequential`), so a leaf's
+/// support-growth warm-up folds and node-list rebuilds amortize over its
+/// chunk exactly as they do for the sequential engine, instead of being
+/// paid once per displacement. The floor (rather than a larger minimum)
+/// keeps the leaf shape — and with it every fold's association order —
+/// identical to the historical fixed 8-displacement-chunk tree for
+/// batches of up to
+/// `TOURNAMENT_MAX_LEAVES * TOURNAMENT_LEAF_CHUNK` displacements, which
+/// is the regime the bit-level tournament tests pin.
 const TOURNAMENT_LEAF_CHUNK: usize = 8;
+
+/// Upper bound on the tournament's leaf count: the adaptive chunk is
+/// `rhss.len().div_ceil(TOURNAMENT_MAX_LEAVES)` raised to
+/// [`TOURNAMENT_LEAF_CHUNK`], so a batch of `n` displacements runs at
+/// most `TOURNAMENT_MAX_LEAVES` leaves. Each leaf now folds through the
+/// warm-up + steady-batch sequential engine, so fewer-but-larger leaves
+/// strictly amortize better: at 1000 displacements (the 2x12/3x8 e2e
+/// path length) this is 32 warm-batched leaves instead of ~125
+/// 8-displacement leaves that each paid cold support-growth rebuilds,
+/// plus 31 merge folds instead of 124. ~32 in-flight leaves also keeps
+/// oversubscription modest on the 16–32-thread pools the e2e workload
+/// targets. The chunk is a pure function of `rhss.len()` — never of the
+/// thread count — so the tree shape (and therefore results, bit for
+/// bit) stays reproducible at any pool size.
+const TOURNAMENT_MAX_LEAVES: usize = 32;
 
 /// NaN audit for an arbitrary coefficient slice — the
 /// `LogSignature::audit_no_nan` check factored off `&self` so the
@@ -63,7 +81,9 @@ fn audit_coefficients_no_nan<U: PartialEq>(coefficients: &[U]) {
 /// tournament fold semantically identical to the public per-fold path:
 /// same support computation (with the degree cutoff), same DAG evaluation
 /// (including the collecting rebuild whenever the atom supports differ from
-/// the dag's stored ones), same term accumulation, same NaN audit.
+/// the dag's stored ones), same term accumulation, same NaN audit. The
+/// tournament's merge folds call this directly; a leaf's fold chain calls
+/// it through [`fold_batch_sequential`]'s warm-up phase.
 fn fold_one_displacement<T, U>(
     series: &mut LieSeries<T, U>,
     dag: &mut CommutatorDag<U>,
@@ -102,6 +122,110 @@ fn fold_one_displacement<T, U>(
     // public basis order.
     dag.accumulate_terms(&mut series.coefficients, rhs_coefficients);
     audit_coefficients_no_nan(&series.coefficients);
+}
+
+/// Attempts to batch ALL of `rhss` in one dispatch on the (`series`,
+/// `dag`) pair; `false` means the batch contract does not hold yet
+/// (sparse accumulator, displacements with differing supports, or lists
+/// not steady) and the caller folds one displacement per-fold instead.
+///
+/// The body of `LogSignature`'s former `try_fold_batch_rest` method,
+/// factored off `&self` onto a bare (`series`, `dag`) pair so the
+/// tournament's leaf accumulators (plain `LieSeries` values with pooled
+/// DAGs, not `LogSignature`s) can run the exact sequential batch driver
+/// the public path runs. Keeping them in lockstep is what makes a leaf's
+/// association order bit-identical to the sequential engine's on the
+/// same chunk.
+fn try_fold_batch_rest<T, U>(
+    series: &mut LieSeries<T, U>,
+    dag: &mut CommutatorDag<U>,
+    rhss: &[&[U]],
+) -> bool
+where
+    T: Clone + Ord + Generator + Hash,
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + Send
+        + Sync
+        + 'static,
+{
+    if rhss.is_empty() {
+        return true;
+    }
+    let a_nonzero = series.nonzero_coefficient_indices(&series.coefficients);
+    // All displacements must share one support — compared allocless
+    // (the per-candidate `nonzero_coefficient_indices` Vec this
+    // replaces allocated once per displacement, dominating the batch
+    // attempt's cost on long batches).
+    let b_nonzero = series.nonzero_coefficient_indices(rhss[0]);
+    if rhss[1..].iter().any(|r| !series.has_support(r, &b_nonzero)) {
+        return false;
+    }
+    // Eligibility: the node lists are the built fixed point for these
+    // supports and the accumulator's support already equals the
+    // reachable set — level-0 gating then uses masks that cover every
+    // position any later fold can touch, which stays sound even if
+    // mid-batch accumulation cancels values to zero (the node lists
+    // are scatter-target supersets).
+    if !dag.batch_eligible(&a_nonzero, &b_nonzero) {
+        return false;
+    }
+    dag.fold_batch(series, rhss, &a_nonzero, &b_nonzero);
+    audit_coefficients_no_nan(&series.coefficients);
+    true
+}
+
+/// The strictly sequential fold chain on a bare (`series`, `dag`) pair:
+/// folds one-by-one until the accumulator's support is the full basis
+/// and the node lists are steady for it, then dispatches the remaining
+/// folds as ONE continuous batch.
+///
+/// This is the historical body of
+/// `LogSignature::concatenate_batch_sequential`, factored off `&self`
+/// for the tournament's leaves: each leaf folds its displacement chunk
+/// from a zeroed accumulator through this exact engine, so the leaf
+/// gets the same warm-up + steady-batch treatment (and the same
+/// association order) as the public sequential path, with the chunk's
+/// support-growth rebuilds amortized over the whole chunk instead of
+/// paid per displacement.
+fn fold_batch_sequential<T, U>(
+    series: &mut LieSeries<T, U>,
+    dag: &mut CommutatorDag<U>,
+    rhss: &[&[U]],
+) where
+    T: Clone + Ord + Generator + Hash,
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + Send
+        + Sync
+        + 'static,
+{
+    let mut i = 0usize;
+    while i < rhss.len() {
+        // Batch the remaining folds when eligible; otherwise fold one
+        // — growing support or rebuilding lists exactly as the
+        // per-fold path does — and re-check.
+        if !try_fold_batch_rest(series, dag, &rhss[i..]) {
+            fold_one_displacement(series, dag, rhss[i]);
+            i += 1;
+        } else {
+            return;
+        }
+    }
 }
 
 /// A `LieSeries` template shared read-only into rayon tasks regardless of
@@ -530,11 +654,12 @@ impl<
     ///   tournament over contiguous leaf chunks (`Self::tournament_reduce`)
     ///   makes each round's folds independent — leaf chunks fold disjoint
     ///   displacement ranges, merge rounds fold adjacent chunk results — so
-    ///   whole rounds run in parallel, and only ~`n/TOURNAMENT_LEAF_CHUNK`
-    ///   of the folds touch a full-dense accumulator instead of all `n`.
-    ///   The tree shape depends ONLY on `rhss.len()` — never on the thread
-    ///   count — so a given input always reduces along the same tree and
-    ///   results are reproducible at any pool size.
+    ///   whole rounds run in parallel, and only the merge rounds' folds
+    ///   (at most `TOURNAMENT_MAX_LEAVES - 1` of them) fold a fully dense
+    ///   accumulator instead of all `n` folds in one chain. The tree shape
+    ///   depends ONLY on `rhss.len()` — never on the thread count — so a
+    ///   given input always reduces along the same tree and results are
+    ///   reproducible at any pool size.
     ///
     /// Rounding caveat: f32/f64 accumulation is not associative, so the
     /// tournament's reassociated tree is NOT bit-identical to the
@@ -548,8 +673,11 @@ impl<
     /// (e.g. `Ratio<i128>`) are insensitive to association order and
     /// produce identical results on every path.
     ///
-    /// No nested-recursion guard is needed: neither the tournament's folds
-    /// nor `concatenate_assign_coefficients` re-enters this driver.
+    /// No nested-recursion guard is needed: the tournament's leaves call
+    /// the free [`fold_batch_sequential`] engine directly — the engine
+    /// contains no driver-selection logic, so it cannot re-enter this
+    /// method — and neither it nor `concatenate_assign_coefficients`
+    /// re-enters this driver.
     pub fn concatenate_batch_coefficients(&mut self, rhss: &[&[U]])
     where
         U: Send + Sync,
@@ -565,82 +693,56 @@ impl<
     /// The strictly sequential fold chain — the historical body of
     /// [`Self::concatenate_batch_coefficients`], kept verbatim as the
     /// low-displacement path and as the bit-identical reference the
-    /// tournament's rounding caveat is stated against.
+    /// tournament's rounding caveat is stated against. The walk itself
+    /// lives on the free function [`fold_batch_sequential`] (a bare
+    /// (`series`, `dag`) pair) so the tournament's leaves can run the
+    /// identical engine — warm-up folds plus one steady batch dispatch —
+    /// on their private accumulators.
     fn concatenate_batch_sequential(&mut self, rhss: &[&[U]])
     where
         U: Send + Sync,
     {
-        let mut i = 0usize;
-        while i < rhss.len() {
-            // Batch the remaining folds when eligible; otherwise fold one
-            // — growing support or rebuilding lists exactly as the
-            // per-fold path does — and re-check.
-            if !self.try_fold_batch_rest(&rhss[i..]) {
-                self.concatenate_assign_coefficients(rhss[i]);
-                i += 1;
-            } else {
-                return;
-            }
-        }
-    }
-
-    /// Attempts to batch ALL of `rhss` in one dispatch; `false` means the
-    /// batch contract does not hold yet (sparse accumulator, displacements
-    /// with differing supports, or lists not steady) and the caller folds
-    /// one displacement per-fold instead.
-    fn try_fold_batch_rest(&mut self, rhss: &[&[U]]) -> bool
-    where
-        U: Send + Sync,
-    {
-        if rhss.is_empty() {
-            return true;
-        }
-        let a_nonzero = self
-            .series
-            .nonzero_coefficient_indices(&self.series.coefficients);
-        // All displacements must share one support — compared allocless
-        // (the per-candidate `nonzero_coefficient_indices` Vec this
-        // replaces allocated once per displacement, dominating the batch
-        // attempt's cost on long batches).
-        let b_nonzero = self.series.nonzero_coefficient_indices(rhss[0]);
-        if rhss[1..]
-            .iter()
-            .any(|r| !self.series.has_support(r, &b_nonzero))
-        {
-            return false;
-        }
-        // Eligibility: the node lists are the built fixed point for these
-        // supports and the accumulator's support already equals the
-        // reachable set — level-0 gating then uses masks that cover every
-        // position any later fold can touch, which stays sound even if
-        // mid-batch accumulation cancels values to zero (the node lists
-        // are scatter-target supersets).
-        if !self.dag.batch_eligible(&a_nonzero, &b_nonzero) {
-            return false;
-        }
-        self.dag
-            .fold_batch(&mut self.series, rhss, &a_nonzero, &b_nonzero);
-        self.audit_no_nan();
-        true
+        fold_batch_sequential(&mut self.series, &mut self.dag, rhss);
     }
 
     /// Balanced-binary-tournament reduction of `rhss` to the coefficient
     /// array of the concatenated sub-path.
     ///
-    /// Leaves are contiguous chunks of [`TOURNAMENT_LEAF_CHUNK`]
-    /// displacements, each folded from a zeroed accumulator with a private
-    /// DAG, using the exact per-fold call sequence of
-    /// [`Self::concatenate_assign_coefficients`] (via
-    /// [`fold_one_displacement`]). Each merge round folds the right chunk
-    /// result into the left one — adjacent halves only — so the reduction is
-    /// exactly the balanced binary tree over the input order: chunk
-    /// boundaries are positional (`chunk * TOURNAMENT_LEAF_CHUNK`), a short
-    /// tail chunk and an odd pass-through are determined by
-    /// `rhss.len()` alone, and no part of the shape is chosen by the
-    /// scheduler. A raw single-displacement chunk needs no special case: it
-    /// is folded from a zeroed full-length accumulator like any other leaf,
-    /// which keeps every leaf result in the same full-length
-    /// representation regardless of the displacement slices' length.
+    /// Leaves are contiguous chunks of at least [`TOURNAMENT_LEAF_CHUNK`]
+    /// displacements — adaptively
+    /// `max(TOURNAMENT_LEAF_CHUNK, rhss.len().div_ceil(TOURNAMENT_MAX_LEAVES))`,
+    /// a pure function of `rhss.len()` — each folded from a zeroed
+    /// accumulator with a private DAG through the SEQUENTIAL batch driver
+    /// ([`fold_batch_sequential`], the exact engine of
+    /// [`Self::concatenate_batch_sequential`]). A leaf therefore pays the
+    /// same warm-up + steady-batch treatment as the public sequential path:
+    /// its support-growth folds and node-list rebuilds run once at the
+    /// chunk's start and then amortize over the whole chunk, instead of
+    /// being paid per displacement (the failure mode of the historical
+    /// fixed 8-displacement leaf, whose chunks never outgrew the batch
+    /// warm-up). Within a leaf the association order is bit-identical to
+    /// the sequential engine's on the same chunk, so the tournament's
+    /// reassociation dust enters ONLY at merge boundaries, and the leaf
+    /// shape matches the historical fixed-8 tree for batches of up to
+    /// `TOURNAMENT_MAX_LEAVES * TOURNAMENT_LEAF_CHUNK` displacements.
+    ///
+    /// Each merge round folds the right chunk result into the left one —
+    /// adjacent halves only — so the reduction is exactly the balanced
+    /// binary tree over the input order: chunk boundaries are positional
+    /// (`leaf * chunk`), a short tail chunk and an odd pass-through are
+    /// determined by `rhss.len()` alone, and no part of the shape is chosen
+    /// by the scheduler (the chunk formula involves no thread count, so
+    /// results are bit-reproducible across pool sizes). A raw
+    /// single-displacement chunk needs no special case: it is folded from
+    /// a zeroed full-length accumulator like any other leaf, which keeps
+    /// every leaf result in the same full-length representation regardless
+    /// of the displacement slices' length.
+    ///
+    /// Recursion: leaves call [`fold_batch_sequential`] — the engine
+    /// itself, which contains no driver-selection logic — so the
+    /// tournament cannot re-engage inside a leaf by construction; the
+    /// selection exists only in
+    /// [`Self::concatenate_batch_coefficients`].
     ///
     /// DAG pooling: one `Mutex<Vec<CommutatorDag<U>>>` serves leaves and
     /// merges alike. A pooled dag is a `clone_shallow` copy — it shares the
@@ -681,19 +783,25 @@ impl<
         // with the tournament.
         let dag_pool: Mutex<Vec<CommutatorDag<U>>> = Mutex::new(Vec::new());
 
+        // Adaptive leaf chunk: large enough that each leaf's sequential
+        // warm-up amortizes over its chunk, capped at ~32 leaves to keep
+        // in-flight oversubscription modest — see `TOURNAMENT_MAX_LEAVES`.
+        let chunk =
+            TOURNAMENT_LEAF_CHUNK.max(rhss.len().div_ceil(TOURNAMENT_MAX_LEAVES));
+
         // Leaf round: chunks fold their disjoint displacement ranges
-        // independently (the tree's bottom level).
-        let mut level: Vec<Vec<U>> = (0..rhss.len().div_ceil(TOURNAMENT_LEAF_CHUNK))
+        // independently (the tree's bottom level), each through the
+        // sequential batch engine so the chunk's support-growth rebuilds
+        // amortize inside the leaf.
+        let mut level: Vec<Vec<U>> = (0..rhss.len().div_ceil(chunk))
             .into_par_iter()
-            .map(|chunk| {
-                let start = chunk * TOURNAMENT_LEAF_CHUNK;
-                let end = (start + TOURNAMENT_LEAF_CHUNK).min(rhss.len());
+            .map(|leaf| {
+                let start = leaf * chunk;
+                let end = (start + chunk).min(rhss.len());
                 let mut series = template.0.clone();
                 series.coefficients = vec![U::default(); basis_len];
                 let mut dag = take_pooled_dag(&dag_pool, source_dag);
-                for rhs in &rhss[start..end] {
-                    fold_one_displacement(&mut series, &mut dag, rhs);
-                }
+                fold_batch_sequential(&mut series, &mut dag, &rhss[start..end]);
                 return_pooled_dag(&dag_pool, dag);
                 series.coefficients
             })
