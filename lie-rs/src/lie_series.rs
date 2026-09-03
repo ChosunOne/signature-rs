@@ -1595,30 +1595,57 @@ where
 pub struct ClassBatchStage<'a, U> {
     /// Sweep stages: `(job index within the stage, unit index in that
     /// job's gating)` tasks in sweep order. Block stages: unused.
-    tasks: Vec<(u32, u32)>,
+    tasks: Arc<[(u32, u32)]>,
     /// Balanced pack ranges into `tasks` (sweep stages) or one block per
     /// pack (block stages).
-    packs: Vec<(usize, usize)>,
+    packs: Arc<[(usize, usize)]>,
     /// Sweep stages: per-job gating.
     gateways: Vec<KernelGating>,
     /// Sweep stages: the stage's jobs, indexed by the tasks' job ids.
     jobs: &'a [KernelJob<'a, U>],
-    /// Block stages: `block(block_index)` per claimed task. Blocks write
-    /// disjoint ranges (the caller's contract); the stage counters order
-    /// all cross-stage dependencies.
-    block: Option<&'a (dyn Fn(usize) + Send + Sync)>,
+    /// Block stages: `block(block_index, fold_index)` per claimed task.
+    /// Blocks write disjoint ranges (the caller's contract); the stage
+    /// counters order all cross-stage dependencies.
+    block: Option<&'a (dyn Fn(usize, usize) + Send + Sync)>,
+    /// Block stages: which fold of the batch this stage serves (the
+    /// block task reads the fold's inputs through it). Sweep stages: 0.
+    fold: usize,
 }
 
-impl<'a, U> ClassBatchStage<'a, U> {
-    /// A block stage over `blocks` disjoint-range tasks: pack `p` runs
-    /// `task(p)` exactly once.
-    pub fn blocks(blocks: usize, task: &'a (dyn Fn(usize) + Send + Sync)) -> Self {
+/// The per-block task/pack shape shared by every block stage of one
+/// batch: `blocks` disjoint-range tasks, one pack per task. Built once
+/// per batch, then each block stage clones the `Arc`s (refcount bump —
+/// no per-stage allocation).
+pub struct BlockShape {
+    tasks: Arc<[(u32, u32)]>,
+    packs: Arc<[(usize, usize)]>,
+}
+
+impl BlockShape {
+    /// The block shape over `blocks` disjoint-range tasks.
+    pub fn new(blocks: usize) -> Self {
         Self {
             tasks: (0..blocks as u32).map(|i| (i, 0)).collect(),
             packs: (0..blocks).map(|i| (i, i + 1)).collect(),
+        }
+    }
+}
+
+impl<'a, U> ClassBatchStage<'a, U> {
+    /// A block stage over `shape`'s disjoint-range tasks: pack `p` runs
+    /// `task(p, fold)` exactly once.
+    pub fn block_stage(
+        shape: &BlockShape,
+        task: &'a (dyn Fn(usize, usize) + Send + Sync),
+        fold: usize,
+    ) -> Self {
+        Self {
+            tasks: Arc::clone(&shape.tasks),
+            packs: Arc::clone(&shape.packs),
             gateways: Vec::new(),
             jobs: &[],
             block: Some(task),
+            fold,
         }
     }
 }
@@ -1860,7 +1887,7 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
         }
         match stage.block {
             // Block stage: pack `p` runs block `p` (one task per pack).
-            Some(task) => task(stage.tasks[pack].0 as usize),
+            Some(task) => task(stage.tasks[pack].0 as usize, stage.fold),
             None => self.sweep_pack_range(s, stage, pack),
         }
         true
@@ -2165,11 +2192,12 @@ where
             packs.push((0, tasks.len()));
         }
         stages.push(ClassBatchStage {
-            tasks,
-            packs,
+            tasks: tasks.into(),
+            packs: packs.into(),
             gateways,
             jobs: level.as_slice(),
             block: None,
+            fold: 0,
         });
     }
     (stages, scatter_sets)
@@ -2560,6 +2588,32 @@ impl<
             .filter(|(_, c)| !c.is_zero())
             .map(|x| x.0)
             .collect()
+    }
+
+    /// Allocless [`Self::nonzero_coefficient_indices`] equality test:
+    /// `true` iff `coefficients`' kernel-visible nonzero support equals
+    /// `support` (both understood over `[0, cutoff)`, `support` sorted
+    /// ascending — exactly what the reference call returns). Walks the
+    /// coefficients once, matching nonzero positions against `support`
+    /// in order; early-exits on the first mismatch. Same result as
+    /// `self.nonzero_coefficient_indices(coefficients) == support`
+    /// without the per-candidate `Vec` allocation.
+    pub fn has_support(&self, coefficients: &[U], support: &[usize]) -> bool {
+        let cutoff = self
+            .feasible_decompositions
+            .degree_start(self.max_degree)
+            .min(coefficients.len());
+        let mut remaining = support.iter().copied();
+        let mut expected = remaining.next();
+        for (i, c) in coefficients[..cutoff].iter().enumerate() {
+            if !c.is_zero() {
+                match expected {
+                    Some(j) if j == i => expected = remaining.next(),
+                    _ => return false,
+                }
+            }
+        }
+        expected.is_none()
     }
 
     #[cfg_attr(

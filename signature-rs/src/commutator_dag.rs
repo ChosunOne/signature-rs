@@ -11,8 +11,9 @@ use std::sync::{Arc, OnceLock};
 
 use commutator_rs::CommutatorTerm;
 use lie_rs::{
-    ClassBatchStage, ClassOrder, ClassOrderedCommutation, GatingCache, KernelJob, LieSeries,
-    plan_class_sweep_stages, planned_sweep_entries, run_class_batch, work_adaptive_slots,
+    BlockShape, ClassBatchStage, ClassOrder, ClassOrderedCommutation, GatingCache, KernelJob,
+    LieSeries, plan_class_sweep_stages, planned_sweep_entries, run_class_batch,
+    work_adaptive_slots,
 };
 use lyndon_rs::generators::Generator;
 use num_traits::{One, Zero};
@@ -44,18 +45,21 @@ struct SendRaw<T>(*mut T);
 unsafe impl<T> Send for SendRaw<T> {}
 unsafe impl<T> Sync for SendRaw<T> {}
 
-/// Raw-pointer wrapper for read-only cross-stage inputs (the per-fold
-/// displacement slices).
-struct SendConst<T>(*const T);
-unsafe impl<T> Send for SendConst<T> {}
-unsafe impl<T> Sync for SendConst<T> {}
-
 /// The node buffers' `(pointer, length)` table for the batch's block
 /// closures: the pointers are raw, so the table itself needs the Send/Sync
 /// promise (same argument as [`SendRaw`]).
 struct SendBufPtrs<U>(Vec<(*mut U, usize)>);
 unsafe impl<U> Send for SendBufPtrs<U> {}
 unsafe impl<U> Sync for SendBufPtrs<U> {}
+
+/// The per-fold displacement `(pointer, length)` table for the batch's
+/// gather task: the task reads fold `f`'s slice through it (raw-pointer
+/// bearing, same Send/Sync argument as [`SendBufPtrs`]: the pointers
+/// target the caller's displacement storage, read-only for the whole
+/// dispatch).
+struct SendRhsTable<U>(Vec<(*const U, usize)>);
+unsafe impl<U> Send for SendRhsTable<U> {}
+unsafe impl<U> Sync for SendRhsTable<U> {}
 
 /// One accumulate run of a block's work list: a contiguous (class
 /// position, source slot) stretch of one BCH term whose positions fall in
@@ -1014,168 +1018,168 @@ where
             );
         }
         let work_shared = SendBlockWork(Arc::new(block_work));
-        let mut block_closures: Vec<Box<dyn Fn(usize) + Send + Sync>> =
-            Vec::with_capacity(2 * rhss.len() + 1);
-        {
+        // The batch's TWO block tasks (gather and accumulate), created once
+        // per batch and shared by every fold's stages: each stage binds its
+        // fold via `ClassBatchStage::block_stage`'s fold index, and the
+        // tasks read that fold's inputs through the shared tables. This
+        // keeps the per-fold stage setup allocation-free — the per-fold
+        // closures (one Box + a ranges clone + a debug Arc each, plus the
+        // per-stage task/pack vectors) this replaces dominated the
+        // small-grid allocator traffic.
+        let ranges: Arc<[(u32, u32)]> = ranges.into();
+        let rhs_table = SendRhsTable(
+            rhss.iter()
+                .map(|r| (r.as_ptr() as *const U, r.len()))
+                .collect(),
+        );
+        // Per-fold snapshot counters (BATCH_CKS): one per fold, shared by
+        // that fold's accumulate blocks (the last to finish snapshots).
+        // One small allocation per batch, debug-only readers.
+        let dbg_ctrs: Arc<[std::sync::atomic::AtomicUsize]> = (0..rhss.len())
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+            .collect();
+        let gather_task: Box<dyn Fn(usize, usize) + Send + Sync> = {
             let work = SendBlockWork(Arc::clone(&work_shared.0));
-            let rhs_len = rhss[0].len();
-            let rhs = SendConst(rhss[0].as_ptr());
             let b = SendRaw(b_data);
-            let ranges = ranges.clone();
-            block_closures.push(Box::new(move |bi: usize| {
+            let ranges = Arc::clone(&ranges);
+            let rhs_table = rhs_table;
+            Box::new(move |bi: usize, fold: usize| {
                 // Binding references first forces whole-value captures: a
-                // direct `rhs.0.add(..)` place access would let the precise
+                // direct `rhs.add(..)` place access would let the precise
                 // capture split off the bare raw-pointer field, losing the
                 // Send/Sync wrapper's promise.
-                let (work, rhs, b, ranges) = (&work, &rhs, &b, &ranges);
-                // zero this block's slot runs of the compact buffers
-                for run in &work.0[bi].zero {
-                    unsafe {
-                        for si in run.s0 as usize..(run.s0 + run.len) as usize {
-                            *run.ptr.add(si) = U::default();
+                let (work, b, ranges, rhs_table) = (&work, &b, &ranges, &rhs_table);
+                // The lead stage (fold 0) also zeroes this block's slot
+                // runs of the compact buffers — the accumulate stages
+                // maintain the zeroing from there on (see the stage-chain
+                // comment above).
+                if fold == 0 {
+                    for run in &work.0[bi].zero {
+                        unsafe {
+                            for si in run.s0 as usize..(run.s0 + run.len) as usize {
+                                *run.ptr.add(si) = U::default();
+                            }
                         }
                     }
                 }
+                let (rhs, rhs_len) = rhs_table.0[fold];
                 let (c0, c1) = (ranges[bi].0 as usize, ranges[bi].1 as usize);
                 #[allow(clippy::needless_range_loop)]
                 unsafe {
                     for g in c0..c1 {
                         let pw = perm[g] as usize;
                         *b.0.add(g) = if pw < rhs_len {
-                            (*rhs.0.add(pw)).clone()
+                            (*rhs.add(pw)).clone()
                         } else {
                             U::default()
                         };
                     }
                 }
-            }));
-        }
-        for (fold_idx, rhs) in rhss.iter().enumerate() {
-            {
-                let rhs_len = rhs.len();
-                let rhs = SendConst(rhs.as_ptr());
-                let b = SendRaw(b_data);
-                let ranges = ranges.clone();
-                block_closures.push(Box::new(move |bi: usize| {
-                    let (rhs, b) = (&rhs, &b);
-                    let ranges = &ranges;
-                    let (c0, c1) = (ranges[bi].0 as usize, ranges[bi].1 as usize);
-                    #[allow(clippy::needless_range_loop)]
-                    unsafe {
-                        for g in c0..c1 {
-                            let pw = perm[g] as usize;
-                            *b.0.add(g) = if pw < rhs_len {
-                                (*rhs.0.add(pw)).clone()
-                            } else {
-                                U::default()
-                            };
-                        }
-                    }
-                }));
-            }
-            {
-                let structure = Arc::clone(&self.structure);
-                let acc = SendRaw(acc_data);
-                let b = SendRaw(b_data);
-                let work = SendBlockWork(Arc::clone(&work_shared.0));
-                let ranges = ranges.clone();
-                // DEBUG: lets the last task snapshot acc/b_cls after all
-                // ranges' accumulate+zero are complete.
-                let dbg_ctr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                block_closures.push(Box::new(move |bi: usize| {
-                    // Whole-value captures (see the lead closure above).
-                    let (work, acc, b, structure, ranges) = (&work, &acc, &b, &structure, &ranges);
-                    let terms = &structure.terms;
-                    unsafe {
-                        // This block's intersecting runs only, in the
-                        // original term order: each position's add sequence
-                        // matches the full walk bit for bit. Fused runs
-                        // zero their source slot right after consuming it
-                        // — the node's slots are dead once its single
-                        // referencing term has read them — so the fold's
-                        // zeroing touches the same cache lines the adds
-                        // already do.
-                        for run in &work.0[bi].accum {
-                            let weight = &terms[run.term as usize].1;
-                            let g0 = run.g0 as usize;
-                            // SAFETY: the run's positions stay inside the
-                            // block's disjoint range of `acc` and inside the
-                            // source buffer's run of live slots; the fused
-                            // zero-back writes only slots this run just read
-                            // (owned by this block, dead afterwards).
-                            if run.zero {
-                                for (g, si) in
-                                    (g0..g0 + run.len as usize).zip(0..run.len as usize)
-                                {
-                                    // `raw_mul`/`raw_add_assign_ptr` skip the
-                                    // float wrappers' per-op NaN checks
-                                    // (raw-float fast path, see lie-rs
-                                    // `raw_mul`'s NaN policy).
-                                    lie_rs::raw_add_assign_ptr(
-                                        acc.0.add(g),
-                                        &lie_rs::raw_mul(&*run.src.add(si), weight),
-                                    );
-                                    *run.src.add(si) = U::default();
-                                }
-                            } else {
-                                for (g, si) in
-                                    (g0..g0 + run.len as usize).zip(0..run.len as usize)
-                                {
-                                    lie_rs::raw_add_assign_ptr(
-                                        acc.0.add(g),
-                                        &lie_rs::raw_mul(&*run.src.add(si), weight),
-                                    );
-                                }
+            })
+        };
+        let accum_task: Box<dyn Fn(usize, usize) + Send + Sync> = {
+            let structure = Arc::clone(&self.structure);
+            let acc = SendRaw(acc_data);
+            let b = SendRaw(b_data);
+            let work = SendBlockWork(Arc::clone(&work_shared.0));
+            let ranges = Arc::clone(&ranges);
+            Box::new(move |bi: usize, fold: usize| {
+                // Whole-value captures (see the gather task above).
+                let (work, acc, b, structure, ranges) = (&work, &acc, &b, &structure, &ranges);
+                let terms = &structure.terms;
+                unsafe {
+                    // This block's intersecting runs only, in the
+                    // original term order: each position's add sequence
+                    // matches the full walk bit for bit. Fused runs
+                    // zero their source slot right after consuming it
+                    // — the node's slots are dead once its single
+                    // referencing term has read them — so the fold's
+                    // zeroing touches the same cache lines the adds
+                    // already do.
+                    for run in &work.0[bi].accum {
+                        let weight = &terms[run.term as usize].1;
+                        let g0 = run.g0 as usize;
+                        // SAFETY: the run's positions stay inside the
+                        // block's disjoint range of `acc` and inside the
+                        // source buffer's run of live slots; the fused
+                        // zero-back writes only slots this run just read
+                        // (owned by this block, dead afterwards).
+                        if run.zero {
+                            for (g, si) in
+                                (g0..g0 + run.len as usize).zip(0..run.len as usize)
+                            {
+                                // `raw_mul`/`raw_add_assign_ptr` skip the
+                                // float wrappers' per-op NaN checks
+                                // (raw-float fast path, see lie-rs
+                                // `raw_mul`'s NaN policy).
+                                lie_rs::raw_add_assign_ptr(
+                                    acc.0.add(g),
+                                    &lie_rs::raw_mul(&*run.src.add(si), weight),
+                                );
+                                *run.src.add(si) = U::default();
                             }
-                        }
-                        // zero this block's slot runs of the compact buffers
-                        for run in &work.0[bi].zero {
-                            for si in run.s0 as usize..(run.s0 + run.len) as usize {
-                                *run.ptr.add(si) = U::default();
+                        } else {
+                            for (g, si) in
+                                (g0..g0 + run.len as usize).zip(0..run.len as usize)
+                            {
+                                lie_rs::raw_add_assign_ptr(
+                                    acc.0.add(g),
+                                    &lie_rs::raw_mul(&*run.src.add(si), weight),
+                                );
                             }
                         }
                     }
-                    // DEBUG (BATCH_CKS): the last task of this stage
-                    // snapshots acc+b_cls (all ranges' accumulate/zero/gather
-                    // are ordered by the AcqRel counter RMWs; the snapshot
-                    // runs before this task's publish, so the waiters — who
-                    // proceed on the counter — cannot overtake it).
-                    if lie_rs::CKS_ON.get().copied().unwrap_or(false)
-                        && let Some(sink) = lie_rs::DEBUG_WRITES.get()
-                    {
-                        use std::sync::atomic::Ordering as O;
-                        let n = dbg_ctr.fetch_add(1, O::AcqRel) + 1;
-                        if n == ranges.len() {
-                            let hh = |ptr: *const U, len: usize| {
-                                let mut h: u64 = 0xcbf29ce484222325;
-                                for k in 0..len {
-                                    // SAFETY: debug read of the live
-                                    // buffers, ordered by the AcqRel
-                                    // counter above.
-                                    let bits =
-                                        unsafe { (*(ptr.add(k) as *const u64)).to_ne_bytes() };
-                                    h ^= bits.iter().fold(0u64, |a, b| (a << 8) | *b as u64);
-                                    h = h.wrapping_mul(0x100000001b3);
-                                }
-                                h
-                            };
-                            let fold = fold_idx;
-                            let ha = hh(acc.0, ranges.last().map(|r| r.1 as usize).unwrap_or(0));
-                            let hb = hh(b.0, ranges.last().map(|r| r.1 as usize).unwrap_or(0));
-                            sink.lock()
-                                .unwrap()
-                                .push(format!("CKC fold={fold} acc={ha:016x} b={hb:016x}"));
+                    // zero this block's slot runs of the compact buffers
+                    for run in &work.0[bi].zero {
+                        for si in run.s0 as usize..(run.s0 + run.len) as usize {
+                            *run.ptr.add(si) = U::default();
                         }
                     }
-                }));
-            }
-        }
+                }
+                // DEBUG (BATCH_CKS): the last task of this stage
+                // snapshots acc+b_cls (all ranges' accumulate/zero/gather
+                // are ordered by the AcqRel counter RMWs; the snapshot
+                // runs before this task's publish, so the waiters — who
+                // proceed on the counter — cannot overtake it).
+                if lie_rs::CKS_ON.get().copied().unwrap_or(false)
+                    && let Some(sink) = lie_rs::DEBUG_WRITES.get()
+                {
+                    use std::sync::atomic::Ordering as O;
+                    let n = dbg_ctrs[fold].fetch_add(1, O::AcqRel) + 1;
+                    if n == ranges.len() {
+                        let hh = |ptr: *const U, len: usize| {
+                            let mut h: u64 = 0xcbf29ce484222325;
+                            for k in 0..len {
+                                // SAFETY: debug read of the live
+                                // buffers, ordered by the AcqRel
+                                // counter above.
+                                let bits =
+                                    unsafe { (*(ptr.add(k) as *const u64)).to_ne_bytes() };
+                                h ^= bits.iter().fold(0u64, |a, b| (a << 8) | *b as u64);
+                                h = h.wrapping_mul(0x100000001b3);
+                            }
+                            h
+                        };
+                        let ha = hh(acc.0, ranges.last().map(|r| r.1 as usize).unwrap_or(0));
+                        let hb = hh(b.0, ranges.last().map(|r| r.1 as usize).unwrap_or(0));
+                        sink.lock()
+                            .unwrap()
+                            .push(format!("CKC fold={fold} acc={ha:016x} b={hb:016x}"));
+                    }
+                }
+            })
+        };
 
+        let shape = BlockShape::new(blocks);
         let mut block_stages: Vec<ClassBatchStage<U>> = Vec::with_capacity(2 * rhss.len() + 1);
-        block_stages.push(ClassBatchStage::blocks(blocks, &*block_closures[0]));
+        // Lead stage: fold 0's gather carries the compact buffers'
+        // initial zeroing (the gather task zeroes when fold == 0); fold
+        // 0's own gather stage then re-runs idempotently, exactly as the
+        // per-fold lead closure it replaces.
+        block_stages.push(ClassBatchStage::block_stage(&shape, &*gather_task, 0));
         for f in 0..rhss.len() {
-            block_stages.push(ClassBatchStage::blocks(blocks, &*block_closures[1 + 2 * f]));
-            block_stages.push(ClassBatchStage::blocks(blocks, &*block_closures[2 + 2 * f]));
+            block_stages.push(ClassBatchStage::block_stage(&shape, &*gather_task, f));
+            block_stages.push(ClassBatchStage::block_stage(&shape, &*accum_task, f));
         }
         let mut stages: Vec<&ClassBatchStage<U>> =
             Vec::with_capacity(block_stages.len() + sweep_stages.len() * rhss.len());

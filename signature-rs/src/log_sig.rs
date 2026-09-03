@@ -175,16 +175,28 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
     ) -> LogSignature<T, U> {
         let mut log_sig = self.build();
 
-        let displacements: Vec<Vec<U>> = path
-            .axis_windows(Axis(0), 2)
-            .into_iter()
-            .map(|window| {
-                let start = window.index_axis(Axis(0), 0);
-                let end = window.index_axis(Axis(0), 1);
-                (&end - &start).iter().cloned().collect::<Vec<_>>()
-            })
+        // One flat displacement buffer (each row is the elementwise
+        // difference of two consecutive path points); the batch's
+        // displacement slices borrow it. The per-window `Vec`s this
+        // replaces (an owned difference array plus a `Vec` per segment)
+        // were a measurable slice of the small-grid e2e's allocator
+        // traffic.
+        let rows = path.len_of(Axis(0));
+        let n_displacements = rows.saturating_sub(1);
+        let row_len = if rows > 0 { path.len() / rows } else { 0 };
+        let mut displacements = vec![U::default(); n_displacements * row_len];
+        for (wi, window) in path.axis_windows(Axis(0), 2).into_iter().enumerate() {
+            let start = window.index_axis(Axis(0), 0);
+            let end = window.index_axis(Axis(0), 1);
+            let dst = &mut displacements[wi * row_len..(wi + 1) * row_len];
+            for (c, (e, s)) in dst.iter_mut().zip(end.iter().zip(start.iter())) {
+                *c = e.clone() - s.clone();
+            }
+        }
+        let slices: Vec<&[U]> = displacements
+            .chunks(row_len.max(1))
+            .take(n_displacements)
             .collect();
-        let slices: Vec<&[U]> = displacements.iter().map(|v| v.as_slice()).collect();
         log_sig.concatenate_batch_coefficients(&slices);
 
         log_sig
@@ -409,11 +421,14 @@ impl<
         let a_nonzero = self
             .series
             .nonzero_coefficient_indices(&self.series.coefficients);
-        // All displacements must share one support.
+        // All displacements must share one support — compared allocless
+        // (the per-candidate `nonzero_coefficient_indices` Vec this
+        // replaces allocated once per displacement, dominating the batch
+        // attempt's cost on long batches).
         let b_nonzero = self.series.nonzero_coefficient_indices(rhss[0]);
         if rhss[1..]
             .iter()
-            .any(|r| self.series.nonzero_coefficient_indices(r) != b_nonzero)
+            .any(|r| !self.series.has_support(r, &b_nonzero))
         {
             return false;
         }
