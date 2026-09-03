@@ -13,6 +13,7 @@ use std::{
     fmt::Debug,
     hash::Hash,
     ops::{AddAssign, Div, Index, IndexMut, MulAssign, Neg, SubAssign},
+    sync::Mutex,
 };
 
 use crate::commutator_dag::CommutatorDag;
@@ -24,6 +25,130 @@ use crate::commutator_dag::CommutatorDag;
 #[allow(clippy::eq_op)]
 fn is_nan_value<U: PartialEq>(c: &U) -> bool {
     c != c
+}
+
+/// Minimum number of displacement slices for
+/// [`LogSignature::concatenate_batch_coefficients`] to prefer the parallel
+/// tournament reduction over the sequential fold chain. Below this the
+/// per-fold/batch sequential path is cheaper than the tournament's tree
+/// overhead (extra DAG warm-ups, pool coordination, one final merge fold).
+const TOURNAMENT_MIN_DISPLACEMENTS: usize = 16;
+
+/// Displacements per tournament leaf chunk. Leaves fold
+/// `TOURNAMENT_LEAF_CHUNK` displacements each, so a batch of `n`
+/// displacements runs `n / TOURNAMENT_LEAF_CHUNK` independent leaf folds in
+/// parallel and only `n / TOURNAMENT_LEAF_CHUNK - 1` full-dense merge folds
+/// afterwards, versus `n` mostly-dense folds in the sequential chain. 8
+/// keeps leaf parallelism high (≥2 leaves at the 16-displacement threshold,
+/// ≫ thread count for real path sizes) while capping the merge rounds' dense
+/// work at ~12% extra folds over the sequential count.
+const TOURNAMENT_LEAF_CHUNK: usize = 8;
+
+/// NaN audit for an arbitrary coefficient slice — the
+/// `LogSignature::audit_no_nan` check factored off `&self` so the
+/// tournament's locally owned accumulators (plain `LieSeries` values, not
+/// `LogSignature`s) can run the same per-fold audit.
+#[inline]
+fn audit_coefficients_no_nan<U: PartialEq>(coefficients: &[U]) {
+    if coefficients.iter().any(|c| is_nan_value(c)) {
+        panic!("log-signature coefficients overflowed to NaN");
+    }
+}
+
+/// One BCH fold of `rhs_coefficients` into `series` using `dag`: the exact
+/// call sequence of `LogSignature::concatenate_assign_coefficients`,
+/// factored out for the tournament runner, whose leaf and merge folds own
+/// their accumulator/dag pair locally instead of going through a
+/// `LogSignature`. Keeping the two in lockstep is what makes every
+/// tournament fold semantically identical to the public per-fold path:
+/// same support computation (with the degree cutoff), same DAG evaluation
+/// (including the collecting rebuild whenever the atom supports differ from
+/// the dag's stored ones), same term accumulation, same NaN audit.
+fn fold_one_displacement<T, U>(
+    series: &mut LieSeries<T, U>,
+    dag: &mut CommutatorDag<U>,
+    rhs_coefficients: &[U],
+) where
+    T: Clone + Ord + Generator + Hash,
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + Send
+        + Sync
+        + 'static,
+{
+    let original_coefficients = series.coefficients.clone();
+
+    let a_nonzero = series
+        .nonzero_coefficient_indices(&original_coefficients);
+    let b_nonzero = series.nonzero_coefficient_indices(rhs_coefficients);
+
+    dag.evaluate(
+        series,
+        &original_coefficients,
+        &a_nonzero,
+        rhs_coefficients,
+        &b_nonzero,
+    );
+
+    // The DAG accumulated every term in class-contiguous order; this
+    // single call applies the BCH weights and the one epilogue back to
+    // public basis order.
+    dag.accumulate_terms(&mut series.coefficients, rhs_coefficients);
+    audit_coefficients_no_nan(&series.coefficients);
+}
+
+/// A `LieSeries` template shared read-only into rayon tasks regardless of
+/// `T`'s auto traits (the public batch driver carries no `T: Send + Sync`
+/// bound, so `T`-bearing references cannot cross into tasks directly).
+///
+/// # Safety contract
+///
+/// The `unsafe Send`/`Sync` impls rely on the tournament never touching
+/// `T` data off the calling thread:
+///
+/// 1. `LieSeries::clone` — the only operation tasks perform on the
+///    template — is three `Arc` refcount bumps plus a `Vec<U>` copy; it
+///    never reads `T` data.
+/// 2. The fold path (`nonzero_coefficient_indices`, `evaluate`,
+///    `accumulate_terms`) reads only the `U` coefficients, `basis.len()`
+///    and the `U`/`u8` decomposition tables; the `T`-bearing basis and
+///    commutator-term arrays are never dereferenced, let alone mutated.
+/// 3. The template outlives the whole parallel region (rayon joins before
+///    `tournament_reduce` returns) and `self.series` outlives the
+///    template, so a task's series clone dropped on a worker thread never
+///    releases the last `Arc` reference of a `T`-bearing allocation — no
+///    `T` destructor ever runs off-thread.
+struct SeriesTemplate<U, T>(LieSeries<T, U>);
+
+// SAFETY: see the struct-level safety contract.
+unsafe impl<U: Send + Sync, T> Send for SeriesTemplate<U, T> {}
+// SAFETY: see the struct-level safety contract.
+unsafe impl<U: Send + Sync, T> Sync for SeriesTemplate<U, T> {}
+
+/// Pops a pooled DAG, falling back to a fresh shallow clone of `source`
+/// (the caller's compiled plan) when the pool is empty.
+fn take_pooled_dag<U>(
+    pool: &Mutex<Vec<CommutatorDag<U>>>,
+    source: &CommutatorDag<U>,
+) -> CommutatorDag<U> {
+    pool.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop()
+        .unwrap_or_else(|| source.clone_shallow())
+}
+
+/// Returns a finished DAG to the pool for the next fold.
+fn return_pooled_dag<U>(pool: &Mutex<Vec<CommutatorDag<U>>>, dag: CommutatorDag<U>) {
+    pool.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(dag);
 }
 
 /// Builder for constructing log signatures from path data.
@@ -150,6 +275,13 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
     /// The path should be provided as a 2D array where each row represents a point
     /// and each column represents a coordinate dimension. The log signature is
     /// computed incrementally over consecutive path segments.
+    ///
+    /// For paths long enough to qualify for the batch driver's tournament
+    /// reduction (see [`LogSignature::concatenate_batch_coefficients`]), the
+    /// folds are reassociated along a balanced tree — a shape that depends
+    /// only on the number of displacements, never on the thread count — so
+    /// f32/f64 rounding may differ in the last ulp from strictly sequential
+    /// folding, while exact coefficient types remain bit-identical.
     #[must_use]
     pub fn build_from_path<
         D: Dimension + RemoveAxis,
@@ -373,23 +505,62 @@ impl<
     /// stays loud instead of silently persisting a NaN through the `NotNan`
     /// invariant.
     fn audit_no_nan(&self) {
-        if self.series.coefficients.iter().any(|c| is_nan_value(c)) {
-            panic!("log-signature coefficients overflowed to NaN");
-        }
+        audit_coefficients_no_nan(&self.series.coefficients);
     }
 
-    /// Folds every displacement in `rhss` into `self`, in order. Results
-    /// are bit-identical to folding each with
-    /// [`Self::concatenate_assign_coefficients`].
+    /// Folds every displacement in `rhss` into `self`, in order.
     ///
-    /// Folds run one-by-one until the accumulator's support is the full
-    /// basis and the node lists are steady for it; the remaining folds —
-    /// which must share one displacement support — then run as ONE
-    /// continuous batch dispatch (see `CommutatorDag::fold_batch`), which
-    /// keeps the accumulator class-ordered and reuses one plan and one job
-    /// table for the whole batch, turning the per-fold gather/accumulate
-    /// phases into parallel in-graph stages.
+    /// Two strategies, selected per call:
+    ///
+    /// - **Sequential** (fewer than `TOURNAMENT_MIN_DISPLACEMENTS`
+    ///   displacements, or a single-worker pool): the folds run one-by-one
+    ///   until the accumulator's support is the full basis and the node
+    ///   lists are steady for it; the remaining folds — which must share
+    ///   one displacement support — then run as ONE continuous batch
+    ///   dispatch (see `CommutatorDag::fold_batch`), which keeps the
+    ///   accumulator class-ordered and reuses one plan and one job table
+    ///   for the whole batch, turning the per-fold gather/accumulate
+    ///   phases into parallel in-graph stages. This path is bit-identical
+    ///   to folding each displacement with
+    ///   [`Self::concatenate_assign_coefficients`].
+    /// - **Tournament** (at least `TOURNAMENT_MIN_DISPLACEMENTS`
+    ///   displacements and `rayon::current_num_threads() > 1`): BCH
+    ///   concatenation is associative, so the folds over `rhss` form a
+    ///   reduction whose tree shape is free to choose. A balanced binary
+    ///   tournament over contiguous leaf chunks (`Self::tournament_reduce`)
+    ///   makes each round's folds independent — leaf chunks fold disjoint
+    ///   displacement ranges, merge rounds fold adjacent chunk results — so
+    ///   whole rounds run in parallel, and only ~`n/TOURNAMENT_LEAF_CHUNK`
+    ///   of the folds touch a full-dense accumulator instead of all `n`.
+    ///   The tree shape depends ONLY on `rhss.len()` — never on the thread
+    ///   count — so a given input always reduces along the same tree and
+    ///   results are reproducible at any pool size.
+    ///
+    /// Rounding caveat: f32/f64 accumulation is not associative, so the
+    /// tournament's reassociation may change last-ulp rounding relative to
+    /// strictly sequential folding. Exact coefficient types (e.g.
+    /// `Ratio<i128>`) are insensitive to association order and produce
+    /// identical results on every path.
+    ///
+    /// No nested-recursion guard is needed: neither the tournament's folds
+    /// nor `concatenate_assign_coefficients` re-enters this driver.
     pub fn concatenate_batch_coefficients(&mut self, rhss: &[&[U]])
+    where
+        U: Send + Sync,
+    {
+        if rhss.len() >= TOURNAMENT_MIN_DISPLACEMENTS && rayon::current_num_threads() > 1 {
+            let reduced = self.tournament_reduce(rhss);
+            self.concatenate_assign_coefficients(&reduced);
+            return;
+        }
+        self.concatenate_batch_sequential(rhss);
+    }
+
+    /// The strictly sequential fold chain — the historical body of
+    /// [`Self::concatenate_batch_coefficients`], kept verbatim as the
+    /// low-displacement path and as the bit-identical reference the
+    /// tournament's rounding caveat is stated against.
+    fn concatenate_batch_sequential(&mut self, rhss: &[&[U]])
     where
         U: Send + Sync,
     {
@@ -447,9 +618,111 @@ impl<
         true
     }
 
+    /// Balanced-binary-tournament reduction of `rhss` to the coefficient
+    /// array of the concatenated sub-path.
+    ///
+    /// Leaves are contiguous chunks of [`TOURNAMENT_LEAF_CHUNK`]
+    /// displacements, each folded from a zeroed accumulator with a private
+    /// DAG, using the exact per-fold call sequence of
+    /// [`Self::concatenate_assign_coefficients`] (via
+    /// [`fold_one_displacement`]). Each merge round folds the right chunk
+    /// result into the left one — adjacent halves only — so the reduction is
+    /// exactly the balanced binary tree over the input order: chunk
+    /// boundaries are positional (`chunk * TOURNAMENT_LEAF_CHUNK`), a short
+    /// tail chunk and an odd pass-through are determined by
+    /// `rhss.len()` alone, and no part of the shape is chosen by the
+    /// scheduler. A raw single-displacement chunk needs no special case: it
+    /// is folded from a zeroed full-length accumulator like any other leaf,
+    /// which keeps every leaf result in the same full-length
+    /// representation regardless of the displacement slices' length.
+    ///
+    /// DAG pooling: one `Mutex<Vec<CommutatorDag<U>>>` serves leaves and
+    /// merges alike. A pooled dag is a `clone_shallow` copy — it shares the
+    /// immutable compiled plan (`Arc<DagStructure>`) and carries private
+    /// scratch. `evaluate` re-derives the node lists through a collecting
+    /// pass whenever a fold's atom supports differ from the dag's stored
+    /// ones, so a pooled dag is immediately usable for arbitrary supports:
+    /// reuse can only save that rebuild, never skip it. The per-dag
+    /// `GatingCache` is keyed by support fingerprints and valid for this
+    /// series' (`Arc`-shared) decomposition table, which every tournament
+    /// accumulator shares with `self.series` — a stale entry can therefore
+    /// never be hit under different supports. Pooling bounds the deep
+    /// copies of node lists/dirty bitsets at one per concurrently running
+    /// fold instead of one per fold.
+    fn tournament_reduce(&self, rhss: &[&[U]]) -> Vec<U>
+    where
+        U: Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        // Template accumulator: shares the basis and tables with
+        // `self.series` (Arc bumps only — see `SeriesTemplate`'s safety
+        // contract); every task installs its own zeroed or chunk-result
+        // coefficients before folding. The closure captures the wrapper
+        // through this shared reference (precise capture would otherwise
+        // reach past the wrapper to `&LieSeries`, whose `Send`/`Sync`
+        // depend on `T`).
+        let template = SeriesTemplate(self.series.clone());
+        let template = &template;
+        // Captured by the tasks instead of `self` itself: a closure using
+        // `self.dag` captures the whole `&LogSignature` (reference derefs
+        // defeat precise capture), which drags the `T`-bearing series into
+        // the auto-trait requirements.
+        let source_dag = &self.dag;
+        let basis_len = self.series.coefficients.len();
+        // One private-dag pool for leaves and merges alike; it grows to at
+        // most the peak number of concurrently running folds and is dropped
+        // with the tournament.
+        let dag_pool: Mutex<Vec<CommutatorDag<U>>> = Mutex::new(Vec::new());
+
+        // Leaf round: chunks fold their disjoint displacement ranges
+        // independently (the tree's bottom level).
+        let mut level: Vec<Vec<U>> = (0..rhss.len().div_ceil(TOURNAMENT_LEAF_CHUNK))
+            .into_par_iter()
+            .map(|chunk| {
+                let start = chunk * TOURNAMENT_LEAF_CHUNK;
+                let end = (start + TOURNAMENT_LEAF_CHUNK).min(rhss.len());
+                let mut series = template.0.clone();
+                series.coefficients = vec![U::default(); basis_len];
+                let mut dag = take_pooled_dag(&dag_pool, source_dag);
+                for rhs in &rhss[start..end] {
+                    fold_one_displacement(&mut series, &mut dag, rhs);
+                }
+                return_pooled_dag(&dag_pool, dag);
+                series.coefficients
+            })
+            .collect();
+
+        // Merge rounds: pairwise folds over adjacent results. A single
+        // left-over result passes through to the next round; the clone
+        // (at most one basis-length copy per round) keeps the parallel map
+        // borrow-free and changes nothing about the tree shape.
+        while level.len() > 1 {
+            level = level
+                .par_chunks(2)
+                .map(|pair| match pair {
+                    [left, right] => {
+                        let mut series = template.0.clone();
+                        series.coefficients = left.clone();
+                        let mut dag = take_pooled_dag(&dag_pool, source_dag);
+                        fold_one_displacement(&mut series, &mut dag, right);
+                        return_pooled_dag(&dag_pool, dag);
+                        series.coefficients
+                    }
+                    [single] => single.clone(),
+                    _ => unreachable!("par_chunks(2) yields chunks of length 1 or 2"),
+                })
+                .collect();
+        }
+
+        level.pop().expect("at least one leaf chunk")
+    }
+
     /// Folds every log signature in `rhss` into `self`, in order — the
     /// batch form of [`Self::concatenate_assign`]. Same batching behavior
-    /// and guarantees as [`Self::concatenate_batch_coefficients`].
+    /// and guarantees as [`Self::concatenate_batch_coefficients`], including
+    /// the adaptive tournament reduction and its rounding caveat for
+    /// non-exact coefficient types.
     pub fn concatenate_batch(&mut self, rhss: &[Self])
     where
         U: Send + Sync,
@@ -1151,6 +1424,110 @@ mod test {
         let slices: Vec<&[R]> = rhss.iter().map(|r| r.as_slice()).collect();
         bat.concatenate_batch_coefficients(&slices);
         assert_eq!(seq.series.coefficients, bat.series.coefficients);
+    }
+
+    /// The tournament reduction must be EXACTLY equal to sequential folding
+    /// for exact coefficient types: rational arithmetic is insensitive to
+    /// association order, so the reassociated tree may not change any
+    /// coefficient. Runs in an explicit multi-thread pool so the tournament
+    /// path is taken regardless of the host's core count.
+    #[test]
+    fn tournament_reduction_exact_rationals_match_sequential() {
+        let (d, m) = (3usize, 4usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        type R = num_rational::Ratio<i128>;
+
+        let mut seed = 0x70da_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 19) as i128 - 9
+        };
+        // Letter displacements, with every fifth one missing a letter — the
+        // support changes force collecting rebuilds mid-leaf and across
+        // pooled-dag reuse, exercising the pool's arbitrary-support soundness.
+        let rhss: Vec<Vec<R>> = (0..24)
+            .map(|i| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d && !(i % 5 == 4 && k == d - 1) {
+                            R::from_integer(lcg(&mut seed))
+                        } else {
+                            R::from_integer(0)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        pool.install(|| {
+            let mut seq = builder.build::<R>();
+            for r in &rhss {
+                seq.concatenate_assign_coefficients(r);
+            }
+            let mut bat = builder.build::<R>();
+            let slices: Vec<&[R]> = rhss.iter().map(|r| r.as_slice()).collect();
+            bat.concatenate_batch_coefficients(&slices);
+            assert_eq!(seq.series.coefficients, bat.series.coefficients);
+        });
+    }
+
+    /// The tournament's tree shape depends only on the displacement count,
+    /// never on the thread count: the same input reduced in pools of
+    /// different sizes must produce bit-identical f64 coefficients (the
+    /// fold engine preserves the serial per-position accumulation order at
+    /// any slot count, and the tree is positional).
+    #[test]
+    fn tournament_reduction_independent_of_thread_count() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (2usize, 5usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mut seed = 0x71ee_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 7) as i128 - 3
+        };
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..24)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+
+        let run = |threads: usize| -> Vec<NotNan<f64>> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            pool.install(|| {
+                let mut bat = builder.build::<NotNan<f64>>();
+                bat.concatenate_batch_coefficients(&slices);
+                bat.series.coefficients.clone()
+            })
+        };
+        assert_eq!(run(4), run(9));
     }
 
     /// Folding from a ZERO accumulator (the build_from_path shape): the
