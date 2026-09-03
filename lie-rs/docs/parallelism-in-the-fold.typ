@@ -1,6 +1,6 @@
 #set page(paper: "a4", margin: 1.1cm)
-#set text(size: 9pt)
-#set par(justify: true, leading: 0.48em, spacing: 0.6em)
+#set text(size: 9.8pt)
+#set par(justify: true, leading: 0.58em, spacing: 0.75em)
 #show heading.where(level: 1): set text(size: 13pt)
 #show heading.where(level: 2): set block(above: 10pt, below: 5pt)
 #show heading.where(level: 3): set block(above: 7pt, below: 3.5pt)
@@ -59,7 +59,6 @@ A log signature of a path is built by folding the displacements of consecutive p
   ]
 ]
 
-#pagebreak()
 == The algebra: what one commutation computes
 
 === Brackets over the Lyndon basis
@@ -119,7 +118,6 @@ Because every ingredient except the $a_u$ and $b_v$ is data-independent, the ent
   )
 ]
 
-#pagebreak()
 == Anagram classes and units: the partition that makes parallelism safe
 
 === Grouping by content
@@ -164,7 +162,6 @@ Inside a unit, several canonical pairs feed the *same* result word (the word's d
   ]
 ]
 
-#pagebreak()
 == One commutation, parallelized end to end
 
 A single evaluation of $[X,Y]$ has four phases; two are parallel, two are serial-but-amortized. The architecture's recurring theme is: *anything whose value depends only on the operand supports (which words are nonzero), not on their values, can be precomputed and cached — supports change rarely, values change every fold.*
@@ -208,7 +205,6 @@ Two numbers characterize why these phases are arranged this way:
 
 Per ticket the arithmetic is minimal: one or two multiplies for the term, then one fused multiply-add per decomposition-row element. What surrounds it is memory: the entry record, the operand words it indexes, the decomposed coefficients, and the scattered result words. Measured on real hardware, the per-entry time is *uniform* (~11 ns/entry at 1 thread, ≈44 cycles) regardless of the pair's degree or row length — which is why balancing packs by entry count balances time (a fancier work metric was implemented, measured slower, and reverted) — and why the sweep parallelizes cleanly until *cache-coherence and streaming bandwidth*, not dependencies, set the limit (per-entry cost rises ≈13% merely because two cores stream the same tables; ≈9× at 32 threads in the worst place — the accumulate traffic of §6).
 
-#pagebreak()
 == The fold: a DAG of commutations with level barriers
 
 === From the BCH series to a DAG
@@ -261,7 +257,6 @@ Naively, a fold with $L$ levels pays $L$ separate fork/join dispatches — measu
   ]
 ]
 
-#pagebreak()
 == The batch: amortizing everything except the serial dependence
 
 A path of 1000 segments is 1000 folds. Running them through the per-fold machinery would re-plan, re-gate, re-gather, and re-allocate 1000 times. The batched driver instead recognizes what is invariant *across* folds and pays it once:
@@ -293,13 +288,12 @@ A path of 1000 segments is 1000 folds. Running them through the per-fold machine
 
 The accumulate stage deserves one sentence of its own, because it is the batch's second-largest cost: each fold's terms must be added (with BCH weights) into the accumulator, and every node buffer re-zeroed, per fold. It runs block-parallel over class-position ranges — but measured element volume is large (≈575,000 slot-touches per fold at 2×12, ≈85% of the sweep's own multiply count) because node buffers store whole degree slices while only support positions are live. Trimming the walk to live slots and fusing read-and-zero into one pass made this $-63\%$ smaller; what remains is *coherence-limited*: per-element cost grows ~9× from 4 to 32 threads as the shared accumulator region crosses many cores — the one remaining place where more threads actively hurt inside a stage.
 
-#pagebreak()
 == Scheduling to the shape of the work
 
 The one structural number that decides whether parallelism helps is *planned sweep work per fold* — visible exactly, for free, inside the plan. The engine therefore sizes its own parallelism:
 
 #align(center)[
-  #block(width: 97%)[
+  #block(width: 97%, breakable: false)[
     #grid(columns: (96pt, 92pt, 96pt, 1fr), column-gutter: 5pt, row-gutter: 3pt,
       [], align(center, cap(6.6pt)[*planned entries per fold*]), align(center, cap(6.6pt)[*chosen slots (32-thread pool)*]), align(center, cap(6.6pt)[*e2e at 32t vs 1t*]),
       [12×2 (high-dim, low-degree)], [66], [1 (serial walk)], cap(6.6pt)[2.55 → 1.25 ms ✓ \ (was 16.4 ms!)],
