@@ -23,9 +23,34 @@ pub(crate) struct Entry {
     pub(crate) decomp_start: u32,
 }
 
+/// One target word's active contributions: the kernel's atomic scheduling
+/// unit under the write-access division. All decompositions writing basis
+/// word `pos` form one class; two classes never write the same word, so
+/// concurrent sweeps of different classes are race-free by construction,
+/// and one class's contributions accumulate sequentially in table-entry
+/// order — exactly the serial sweep's per-word float summation order.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WordClass {
+    /// The target word's position in the working layout (public basis index
+    /// for the public prologue's gating, class-contiguous position for the
+    /// class one). Classes are emitted sorted by this field, so a sweep's
+    /// stores walk the result space sequentially.
+    pub(crate) pos: u32,
+    /// The target word's Lyndon degree (the compact-buffer shift index).
+    pub(crate) td: u8,
+    /// The class's contribution range in the gating's flat
+    /// `(ticket, decomp position)` list: `contribs[start .. end]`, in
+    /// table-entry order.
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+}
+
 /// A contiguous run of canonical pairs whose brackets land in the same
 /// letter multiset: the unit's decompositions only hit degree-`target`
 /// words of that content, so two units never write the same basis word.
+/// Units organize the table for the gating walk and the `get` lookup; the
+/// kernel's parallel work is divided one level finer, per target word
+/// (see [`WordClass`]).
 #[derive(Clone, Debug)]
 pub(crate) struct UnitMeta {
     /// Bracket degree `p + q` (equal to `|gamma|`).
@@ -43,55 +68,28 @@ pub(crate) struct UnitMeta {
     pub(crate) end: u32,
 }
 
-/// Packed active-entry ticket (see [`ActiveSegment::ticket_start`]): bits
+/// The full-support gating's transposed per-word form: active word
+/// classes, their `(ticket position, decomp position)` contributions, and
+/// the flat ticket list (every entry active, both orientations). Built
+/// lazily once per table (public space) / per class order (class space)
+/// and shared by every dense-support kernel call, so the steady state's
+/// gating is an Arc clone — no walk, no transposition.
+pub(crate) type FullSupportGating = (
+    std::sync::Arc<[WordClass]>,
+    std::sync::Arc<[(u32, u32)]>,
+    std::sync::Arc<[u32]>,
+);
+
+/// Packed active-entry ticket (the gating's per-entry resolution product): bits
 /// 0..30 hold the entry's flat table index, bit 31 the `p_active`
 /// orientation (`a = i, b = j`) and bit 30 the mirrored `q_active`. Table
 /// sizes are debug-asserted below 2^30 entries at gating build time, so the
-/// index never reaches the flag bits.
+/// index never reaches the flag bits. Tickets ride inside the gating's
+/// `(ticket, decomp position)` contributions — the sweeps read them, never
+/// re-test presence.
 pub(crate) const TICKET_INDEX_MASK: u32 = 0x3fff_ffff;
 pub(crate) const TICKET_P_ACTIVE: u32 = 1 << 31;
 pub(crate) const TICKET_Q_ACTIVE: u32 = 1 << 30;
-
-/// One maximal active run of a unit's entries for the commutation kernel's
-/// sweep: a contiguous entry span gated on by degree support, scattering onto
-/// the degree-`target` result slice.
-#[derive(Clone, Copy)]
-pub(crate) struct ActiveSegment {
-    /// The run's entry span in the flat entry array, *including* each
-    /// entry's flat successor: `entries[span_start .. span_end]` zipped with
-    /// itself shifted by one gives entry `k`'s decomposition range
-    /// `entries[k].decomp_start .. entries[k + 1].decomp_start`.
-    pub(crate) span_start: u32,
-    pub(crate) span_end: u32,
-    /// The result scatter region `[rs, re)` — the degree-`target` slice.
-    /// Decomposition indices are relative to `rs`.
-    pub(crate) rs: u32,
-    pub(crate) re: u32,
-    /// Whether this is the last active segment of its unit. Segments of one
-    /// unit scatter onto the same target words, so the parallel sweep must
-    /// keep them in one bundle; it may only cut a bundle after this flag.
-    /// (Per-entry orientation now rides in the tickets' flag bits — the
-    /// segment-level `o1`/`o2` gating gates only which tickets exist.)
-    pub(crate) last_of_unit: bool,
-    /// The run's ticket range in the gating's flat ticket list: only the
-    /// span's entries that passed the owning job's per-entry presence
-    /// tests, in table order, with the resolved orientation flags packed
-    /// in the top two bits ([`TICKET_INDEX_MASK`], [`TICKET_P_ACTIVE`],
-    /// [`TICKET_Q_ACTIVE`]). The sweeps iterate this range instead of
-    /// re-testing every table entry; built in entry order, the ticket list
-    /// is a subsequence of the span, so per-word float summation order is
-    /// unchanged.
-    pub(crate) ticket_start: u32,
-    pub(crate) ticket_end: u32,
-    /// The left operand degree `p = deg(basis[i])` of this run — constant
-    /// within the run (segments are maximal equal-`p` entry runs). The
-    /// batch sweep hoists its compact-buffer address shifts per segment
-    /// from this and [`Self::td`].
-    pub(crate) p: u8,
-    /// The unit's target (bracket) degree: the scatter words of this
-    /// segment's decompositions all live in `degree_range(td)`.
-    pub(crate) td: u8,
-}
 
 /// Coefficient type is generic; decomposition indices are stored as `u32`.
 #[derive(Clone)]
@@ -119,16 +117,6 @@ pub(crate) struct FeasibleDecompositions<U> {
     decomp_coefficients: Vec<U>,
     /// Number of real entries (the trailing sentinel entry is excluded).
     num_entries: usize,
-    /// Gating for full-support operands: one active segment per unit (every
-    /// p-run of every unit is active, both orientations on), so a kernel
-    /// call with `a_nonzero.len() == full-support cutoff` skips the gating
-    /// walk entirely.
-    full_support_segments: Arc<[ActiveSegment]>,
-    /// The full-support segments' flat ticket list: presence is all-ones,
-    /// so every table entry is active in both orientations and the ticket
-    /// list is the entry stream itself, in segment order (each segment's
-    /// ticket range mirrors its span minus the trailing successor).
-    full_support_tickets: Arc<[u32]>,
     /// Within-degree class-contiguous scatter layout, populated at build
     /// time only when a degree slice outgrows L1 (see
     /// [`CLASS_ORDER_MIN_SLICE_WORDS`]) and otherwise created on demand by
@@ -136,6 +124,57 @@ pub(crate) struct FeasibleDecompositions<U> {
     /// `Arc`: every kernel call and every series over the same basis
     /// reuses one ordering.
     class_order: OnceLock<Arc<ClassOrder>>,
+    /// The full-support gating's PUBLIC-space transposition (see
+    /// [`FullSupportGating`]), built lazily on the first dense call.
+    full_support_public: OnceLock<FullSupportGating>,
+}
+
+/// Stable counting sort of full-support contributions by target position
+/// (the write-access classes of the all-active gating). Same shape as the
+/// gating walk's transposition; the degrees come from the caller's
+/// position→degree map.
+fn transpose_full_support(
+    items: Vec<(u32, u32, u32)>,
+    tickets: Vec<u32>,
+    pos_degree: &[u8],
+) -> (
+    std::sync::Arc<[WordClass]>,
+    std::sync::Arc<[(u32, u32)]>,
+    std::sync::Arc<[u32]>,
+) {
+    let space = pos_degree.len();
+    let mut counts = vec![0u32; space + 1];
+    for &(pos, _, _) in &items {
+        debug_assert!((pos as usize) < space, "contribution target outside the result space");
+        counts[pos as usize + 1] += 1;
+    }
+    for k in 1..=space {
+        counts[k] += counts[k - 1];
+    }
+    let mut contribs = vec![(0u32, 0u32); items.len()];
+    let mut cursor = counts.clone();
+    for &(pos, ticket_idx, decomp_pos) in &items {
+        let slot = cursor[pos as usize] as usize;
+        contribs[slot] = (ticket_idx, decomp_pos);
+        cursor[pos as usize] += 1;
+    }
+    let mut words: Vec<WordClass> = Vec::new();
+    for p in 0..space {
+        let (start, end) = (counts[p], counts[p + 1]);
+        if end > start {
+            words.push(WordClass {
+                pos: p as u32,
+                td: pos_degree[p],
+                start,
+                end,
+            });
+        }
+    }
+    (
+        std::sync::Arc::from(words),
+        std::sync::Arc::from(contribs),
+        std::sync::Arc::from(tickets),
+    )
 }
 
 /// Degree-slice size above which the commutation kernel's scatter writes
@@ -174,6 +213,11 @@ pub struct ClassOrder {
     entries_cls: Vec<Entry>,
     /// Lyndon degrees indexed by internal position.
     degree_cls: Vec<u8>,
+    /// The full-support gating's CLASS-space transposition (see
+    /// [`FullSupportGating`]), built lazily on the first dense class-mode
+    /// call. The builder needs the owning table's degree starts, passed
+    /// at first use.
+    full_support_class: OnceLock<FullSupportGating>,
 }
 
 impl ClassOrder {
@@ -210,6 +254,43 @@ impl ClassOrder {
     #[inline]
     pub fn degree_cls(&self) -> &[u8] {
         &self.degree_cls
+    }
+
+    /// The full-support gating's per-word transposition in CLASS space:
+    /// every entry active with both orientations, transposed once against
+    /// this ordering and cached. `table` must be the series' table this
+    /// ordering was built from (degree starts and entry order).
+    pub(crate) fn full_support_gating_class(
+        &self,
+        table: &FeasibleDecompositions<impl Clone>,
+    ) -> FullSupportGating {
+        self.full_support_class
+            .get_or_init(|| {
+                let degrees = &table.index_degrees;
+                let degree_cls = &self.degree_cls;
+                let mut tickets: Vec<u32> = Vec::with_capacity(table.num_entries);
+                let mut items: Vec<(u32, u32, u32)> = Vec::new();
+                for (ei, entry) in
+                    self.entries_cls[..self.entries_cls.len() - 1].iter().enumerate()
+                {
+                    let ticket_idx = tickets.len() as u32;
+                    tickets.push(ei as u32 | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
+                    let from = entry.decomp_start as usize;
+                    let to = self.entries_cls[ei + 1].decomp_start as usize;
+                    // Degree-slice starts are identical in both layouts.
+                    let rs = table.degree_start(
+                        degrees[entry.i as usize] as usize
+                            + degrees[entry.j as usize] as usize,
+                    );
+                    for (k, &rel) in self.decomp_cls[from..to].iter().enumerate() {
+                        items.push((rs as u32 + rel, ticket_idx, (from + k) as u32));
+                    }
+                }
+                let (words, contribs, tickets) =
+                    transpose_full_support(items, tickets, degree_cls);
+                (words, contribs, tickets)
+            })
+            .clone()
     }
 }
 
@@ -400,70 +481,17 @@ impl<U: Clone> Builder<U> {
             )));
         }
 
-        // Full-support gating: every run of every unit is active with both
-        // orientations. Segments are maximal equal-`p` entry runs (the same
-        // shape the degree-gated prologue produces), so a segment's left
-        // operand degree — and with it the batch sweep's hoisted compact
-        // address shifts — is constant within the segment. Presence is
-        // all-ones, so the flat ticket list is the entry stream itself
-        // (every entry active, both flag bits packed; see `TICKET_*`).
+        // Full-support gating flows through the same gating walk as every
+        // other support (presence bitsets all-ones, every run active): the
+        // walk's per-entry resolution runs once per distinct support pair,
+        // then the [`GatingCache`] serves it for the fold's remaining
+        // calls. The old precomputed full-support segment/ticket lists are
+        // superseded by the per-word transposition, which is cheap to
+        // rebuild and cache in the same memo.
         debug_assert!(
             num_entries < (1 << 30),
             "entry indices must fit a ticket's 30 bits"
         );
-        let mut full_support_segments: Vec<ActiveSegment> = Vec::new();
-        let mut full_support_tickets: Vec<u32> = Vec::new();
-        for unit in units.iter() {
-            let td = unit.target;
-            let (rs, re) = (
-                degree_starts[td as usize],
-                degree_starts[td as usize + 1],
-            );
-            let mut run_start = unit.start;
-            let mut cur_p = u8::MAX;
-            for ei in unit.start..unit.end {
-                let p = degrees[entries[ei as usize].i as usize];
-                if p == cur_p {
-                    continue;
-                }
-                if cur_p != u8::MAX {
-                    let ticket_start = full_support_tickets.len() as u32;
-                    for e in run_start..ei {
-                        full_support_tickets.push(e | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
-                    }
-                    full_support_segments.push(ActiveSegment {
-                        span_start: run_start,
-                        span_end: ei + 1,
-                        ticket_start,
-                        ticket_end: full_support_tickets.len() as u32,
-                        rs,
-                        re,
-                        last_of_unit: false,
-                        p: cur_p,
-                        td,
-                    });
-                }
-                cur_p = p;
-                run_start = ei;
-            }
-            if cur_p != u8::MAX {
-                let ticket_start = full_support_tickets.len() as u32;
-                for e in run_start..unit.end {
-                    full_support_tickets.push(e | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
-                }
-                full_support_segments.push(ActiveSegment {
-                    span_start: run_start,
-                    span_end: unit.end + 1,
-                    ticket_start,
-                    ticket_end: full_support_tickets.len() as u32,
-                    rs,
-                    re,
-                    last_of_unit: true,
-                    p: cur_p,
-                    td,
-                });
-            }
-        }
 
         FeasibleDecompositions {
             index_degrees: degrees.clone(),
@@ -475,9 +503,8 @@ impl<U: Clone> Builder<U> {
             decomp_indices_abs,
             decomp_coefficients,
             num_entries,
-            full_support_segments: Arc::from(full_support_segments),
-            full_support_tickets: Arc::from(full_support_tickets),
             class_order,
+            full_support_public: OnceLock::new(),
         }
     }
 }
@@ -552,6 +579,7 @@ fn build_class_order(
         decomp_cls,
         entries_cls,
         degree_cls,
+        full_support_class: OnceLock::new(),
     }
 }
 
@@ -563,7 +591,10 @@ impl<U> FeasibleDecompositions<U> {
 
     /// The class-contiguous layout when it was prebuilt at table
     /// construction (degree slice above the L1 threshold); `None` means
-    /// the default kernel paths run direct.
+    /// the default kernel paths run direct. (Test/telemetry accessor —
+    /// the write-access kernel paths read the gating's per-word classes
+    /// and no longer branch on the layout.)
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) fn cached_class_order(&self) -> Option<&Arc<ClassOrder>> {
         self.class_order.get()
@@ -629,6 +660,13 @@ impl<U> FeasibleDecompositions<U> {
         self.index_degrees[i] as usize
     }
 
+    /// Per-word Lyndon degrees in basis order (the public layout's
+    /// position→degree map for the gating's per-word transposition).
+    #[inline]
+    pub(crate) fn index_degrees(&self) -> &[u8] {
+        &self.index_degrees
+    }
+
     /// Anagram units in kernel iteration order.
     #[inline]
     pub(crate) fn units(&self) -> &[UnitMeta] {
@@ -650,18 +688,37 @@ impl<U> FeasibleDecompositions<U> {
         &self.entries[unit.start as usize..=unit.end as usize]
     }
 
-    /// Active segments for full-support operands (every run of every unit
-    /// active, both orientations on) plus their flat ticket list: shared by
-    /// all full-support kernel calls, so the gating walk is skipped
-    /// entirely. Presence is all-ones, so the tickets cover every table
-    /// entry with both flag bits packed, and each segment's ticket range
-    /// mirrors its span minus the trailing successor.
-    #[inline]
-    pub(crate) fn full_support_gating(&self) -> (Arc<[ActiveSegment]>, Arc<[u32]>) {
-        (
-            Arc::clone(&self.full_support_segments),
-            Arc::clone(&self.full_support_tickets),
-        )
+    /// The full-support gating's per-word transposition in PUBLIC space:
+    /// every entry active with both orientations, transposed once and
+    /// cached. The dense-support prologues short-circuit here — the
+    /// steady state's gating is this Arc clone, not a walk.
+    pub(crate) fn full_support_gating_public(&self) -> FullSupportGating {
+        self.full_support_public
+            .get_or_init(|| {
+                let degrees = &self.index_degrees;
+                // Every entry active, both orientations: tickets are the
+                // entry stream with both flag bits packed, items every row
+                // element (see the gating walk's same-shaped loops).
+                let mut tickets: Vec<u32> = Vec::with_capacity(self.num_entries);
+                let mut items: Vec<(u32, u32, u32)> = Vec::new();
+                for (ei, entry) in self.entries[..self.entries.len() - 1].iter().enumerate() {
+                    let ticket_idx = tickets.len() as u32;
+                    tickets.push(ei as u32 | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
+                    let from = entry.decomp_start as usize;
+                    let to = self.entries[ei + 1].decomp_start as usize;
+                    let rs = self.degree_start(
+                        degrees[entry.i as usize] as usize
+                            + degrees[entry.j as usize] as usize,
+                    );
+                    for (k, &rel) in self.decomp_indices[from..to].iter().enumerate() {
+                        items.push((rs as u32 + rel, ticket_idx, (from + k) as u32));
+                    }
+                }
+                let (words, contribs, tickets) =
+                    transpose_full_support(items, tickets, degrees);
+                (words, contribs, tickets)
+            })
+            .clone()
     }
 
     /// The flat relative decomposition index array (kernel scatter path).
@@ -708,6 +765,7 @@ impl<U> FeasibleDecompositions<U> {
 
     /// The result-vector range `[start, end)` holding the degree-`target`
     /// basis words.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     /// DEBUG/telemetry: per-position Lyndon degree + degree-slice starts.
     #[doc(hidden)]
@@ -715,6 +773,7 @@ impl<U> FeasibleDecompositions<U> {
         (self.index_degrees.clone(), self.degree_starts.clone())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn degree_range(&self, target: u8) -> (usize, usize) {
         let t = target as usize;
         (

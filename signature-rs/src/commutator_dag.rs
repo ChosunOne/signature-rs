@@ -815,7 +815,7 @@ where
         // before the jobs are rewired; the final plan below hits the
         // gating cache).
         let (_, scatter_sets) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true);
+            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, false);
 
         // Record the true scatter sets as the node lists: they bound this
         // batch's sweeps exactly, keep the union-level eligibility fixed
@@ -922,7 +922,7 @@ where
         // (the support lists are unchanged); the stages reference the final
         // job table the sweeps read through.
         let (sweep_stages, _) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true);
+            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, false);
 
         // Block ranges over class positions. The block count derives from
         // the SAME work-adaptive policy the walk will use (below): blocks
@@ -1623,7 +1623,7 @@ where
         // them as the node lists (same fixed-point bookkeeping as
         // `fold_batch`).
         let (_, scatter_sets) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true);
+            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, true);
         {
             let mut updated = std::mem::take(&mut self.nonzeros);
             for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
@@ -1726,7 +1726,7 @@ where
         // unchanged), then the SoA sweep stages over it: identical tasks,
         // packs and gateways, dispatched to the 4-lane kernel.
         let (sweep_stages, _) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true);
+            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, true);
         let sweep_stages_soa: Vec<ClassBatchStage<U>> = sweep_stages
             .iter()
             .map(ClassBatchStage::cohort_variant)

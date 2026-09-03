@@ -2822,9 +2822,11 @@ mod test {
 
     /// Fold structure analysis for class-partitioned scheduling: per level,
     /// the node count, distinct anagram classes, and how sweep work
-    /// (support sizes) distributes across classes — including the balance a
-    /// static class->thread partition could achieve. Run explicitly with
-    /// --ignored --nocapture.
+    /// (support sizes) distributes across classes — plus the WRITE-ACCESS
+    /// view: each node's scatter-target list is the exact set of word
+    /// classes its sweep owns, so the report shows the write-class count
+    /// per level and the balance a static word-class partition could
+    /// achieve. Run explicitly with --ignored --nocapture.
     #[test]
     #[ignore = "structure stats: run explicitly with --ignored --nocapture"]
     fn dump_fold_class_structure() {
@@ -2879,6 +2881,7 @@ mod test {
             let dag: &CommutatorDag<NotNan<f64>> = &log_sig.dag;
             let levels = &dag.structure.levels;
             let mut total_work = 0usize;
+            let mut total_word_classes = 0usize;
             let mut report = String::new();
             let mut all_class_work: std::collections::HashMap<(u8, Vec<u8>), usize> =
                 std::collections::HashMap::new();
@@ -2886,6 +2889,8 @@ mod test {
                 let mut class_work: std::collections::HashMap<(u8, Vec<u8>), usize> =
                     std::collections::HashMap::new();
                 let mut level_work = 0usize;
+                let mut level_word_classes = 0usize;
+                let mut max_node_words = 0usize;
                 for &k in level {
                     let sup = &dag.nonzeros[k as usize - 2];
                     let mut key = (0u8, vec![0u8; d]);
@@ -2897,18 +2902,26 @@ mod test {
                         .and_modify(|x| *x += sup.len())
                         .or_insert(sup.len());
                     level_work += sup.len();
+                    // Write-access view: the node's exact scatter-target set
+                    // is the set of word classes its sweep owns (one class
+                    // per target word; the list was recorded from the
+                    // planner's per-word gating).
+                    level_word_classes += sup.len();
+                    max_node_words = max_node_words.max(sup.len());
                 }
                 for (k, v) in &class_work {
                     *all_class_work.entry(k.clone()).or_insert(0) += v;
                 }
                 total_work += level_work;
+                total_word_classes += level_word_classes;
                 let mut sizes: Vec<usize> = class_work.values().copied().collect();
                 sizes.sort_unstable_by(|a, b| b.cmp(a));
                 report.push_str(&format!(
-                    "  level {li}: nodes={} classes={} work={}",
+                    "  level {li}: nodes={} classes={} work={} word_classes={max_node_words}->{level_word_classes} max_node_words_share={}%(of level)",
                     level.len(),
                     class_work.len(),
-                    level_work
+                    level_work,
+                    100 * max_node_words / level_word_classes.max(1),
                 ));
                 if !sizes.is_empty() {
                     report.push_str(&format!(
@@ -2930,7 +2943,7 @@ mod test {
             let max_share =
                 all_class_work.values().copied().max().unwrap_or(0) * 100 / total_work.max(1);
             println!(
-                "d={d} m={m}: levels={} total_work={total_work} classes={} max_class_share={max_share}% packs8_max_min_ratio={:.2}",
+                "d={d} m={m}: levels={} total_work={total_work} classes={} max_class_share={max_share}% packs8_max_min_ratio={:.2} word_classes={total_word_classes}",
                 levels.len().saturating_sub(1),
                 all_class_work.len(),
                 packs[0] as f64 / packs[7].max(1) as f64,

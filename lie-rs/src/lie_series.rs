@@ -13,8 +13,8 @@ use lyndon_rs::lyndon::LyndonWord;
 use num_traits::{One, Zero};
 
 use crate::feasible_decompositions::{
-    self, ActiveSegment, Entry, FeasibleDecompositions, TICKET_INDEX_MASK, TICKET_P_ACTIVE,
-    TICKET_Q_ACTIVE,
+    self, Entry, FeasibleDecompositions, TICKET_INDEX_MASK, TICKET_P_ACTIVE, TICKET_Q_ACTIVE,
+    WordClass,
 };
 
 // Re-exported: the class-contiguous ordering handle behind
@@ -287,17 +287,20 @@ pub mod cohort {
     }
 
     /// The cohort (4-lane SoA) sweep of one pack: the exact
-    /// `sweep_pack_range` visit order, gating and per-lane arithmetic, with
-    /// the four folds' values carried as lane vectors over SoA-interleaved
-    /// buffers (the jobs' operand/result pointers point at SoA bases; lane
-    /// `l` of slot `s` lives at element `s*LANES + l`).
+    /// `FoldWalk::sweep_pack_range` two-phase visit order — the term phase
+    /// (one 4-lane term per active entry, streamed in table order) and the
+    /// write-access fan-in (each word class sums its contributions and
+    /// stores once) — with the four folds' values carried as lane vectors
+    /// over SoA-interleaved buffers (the jobs' operand/result/term pointers
+    /// point at SoA bases; lane `l` of slot `s` lives at element
+    /// `s*LANES + l`).
     ///
     /// Callers must have verified [`supported`] for `U`; the dispatch below
     /// selects the lane width from the coefficient type and panics
     /// otherwise (the cohort engine never forms for other types).
     pub(super) fn sweep_pack_range<U>(
         entries: &[Entry],
-        decomp: &[u32],
+        degrees: &[u8],
         coeffs: &[U],
         stage: &ClassBatchStage<'_, U>,
         pack: usize,
@@ -305,9 +308,9 @@ pub mod cohort {
         U: 'static,
     {
         if is_f64_lane::<U>() {
-            sweep_pack_impl::<U, f64>(entries, decomp, coeffs, stage, pack);
+            sweep_pack_impl::<U, f64>(entries, degrees, coeffs, stage, pack);
         } else if is_f32_lane::<U>() {
-            sweep_pack_impl::<U, f32>(entries, decomp, coeffs, stage, pack);
+            sweep_pack_impl::<U, f32>(entries, degrees, coeffs, stage, pack);
         } else {
             panic!(
                 "cohort sweep requires a raw repr-transparent float \
@@ -316,13 +319,14 @@ pub mod cohort {
         }
     }
 
-    /// The typed cohort sweep kernel. The visit order, unit/pack structure,
-    /// shift arithmetic and per-lane operation order replicate
-    /// `sweep_pack_range` exactly; the only difference is that every
-    /// position access loads/stores [`LANES`] lanes at once.
+    /// The typed cohort sweep kernel. The visit order, word-class/pack
+    /// structure, shift arithmetic and per-lane operation order replicate
+    /// `FoldWalk::sweep_term_pack`/`sweep_fanin_pack` exactly; the only
+    /// difference is that every position access loads/stores [`LANES`]
+    /// lanes at once.
     fn sweep_pack_impl<U, L>(
         entries: &[Entry],
-        decomp: &[u32],
+        degrees: &[u8],
         coeffs: &[U],
         stage: &ClassBatchStage<'_, U>,
         pack: usize,
@@ -339,6 +343,8 @@ pub mod cohort {
     {
         let (start, end) = stage.packs[pack];
         let jobs = stage.jobs;
+        let terms = stage.terms.as_ref().expect("cohort sweep without term buffers");
+        let terms_ptr = terms.data_ptr();
         let mut t = start;
         while t < end {
             let ji = stage.tasks[t].0 as usize;
@@ -351,78 +357,98 @@ pub mod cohort {
             let a_shift = job.a_shift;
             let b_shift = job.b_shift;
             let r_shift = job.r_shift;
-            // The job's tasks are consecutive unit indices in its gating —
-            // one run is one contiguous slice of the hot `active` list.
-            let ui_start = stage.tasks[t].1 as usize;
-            let ui_end = stage.tasks[e - 1].1 as usize + 1;
-            for au in &gating.active[ui_start..ui_end] {
-                let rs = au.rs as usize;
-                // SAFETY: the shift tables have >= max_degree+1 entries and
-                // `au.p`/`au.td` are degrees of the table (see the plan).
-                let p = au.p as usize;
-                let td = au.td as usize;
-                let q = td - p;
-                let a_sh_p = unsafe { *a_shift.add(p) } as usize;
-                let a_sh_q = unsafe { *a_shift.add(q) } as usize;
-                let b_sh_p = unsafe { *b_shift.add(p) } as usize;
-                let b_sh_q = unsafe { *b_shift.add(q) } as usize;
-                // Scatter targets `rs + rel` of degree `td` live at
-                // `(rs + rel - r_shift[td]) * LANES` in the SoA result
-                // buffer; hoist the constant part so the inner loop is one
-                // scaled add.
-                let r_base = (rs - unsafe { *r_shift.add(td) } as usize) * LANES;
-                // Precomputed tickets: the presence-resolved visit stream,
-                // orientation flags packed in the top bits.
-                for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize]
-                {
-                    let e = (ticket & TICKET_INDEX_MASK) as usize;
-                    let entry = entries[e];
-                    // The table's trailing sentinel backs the +1 successor.
-                    let next = entries[e + 1];
-                    let p_active = ticket & TICKET_P_ACTIVE != 0;
-                    let q_active = ticket & TICKET_Q_ACTIVE != 0;
-                    let (i, j) = (entry.i as usize, entry.j as usize);
-                    // SAFETY: i and j are class positions of degrees p and
-                    // q; the presence tests guarantee they are in the
-                    // operands' supports, whose shift tables map them into
-                    // the SoA buffers at slots `(position - shift) * LANES`.
-                    let term: [L; LANES] = unsafe {
-                        if p_active {
-                            let mut t = mul4(
-                                load4::<U, L>(job.a.add((i - a_sh_p) * LANES)),
-                                load4::<U, L>(job.b.add((j - b_sh_q) * LANES)),
-                            );
-                            if q_active {
-                                t = add4(
-                                    t,
-                                    neg4(mul4(
-                                        load4::<U, L>(job.a.add((j - a_sh_q) * LANES)),
-                                        load4::<U, L>(job.b.add((i - b_sh_p) * LANES)),
-                                    )),
+            // SAFETY: the term buffers are valid for the whole dispatch;
+            // the term phase's chunks write disjoint SoA ranges, the
+            // fan-in phase reads (ordered by the stage counters), and the
+            // fan-in's word classes are single-writer result regions.
+            let (t_off, t_len) = terms.job_range(ji);
+            if stage.phase == StagePhase::Terms {
+                // TERM phase: one 4-lane term per active entry, in table
+                // order.
+                let mut task = t;
+                while task < e {
+                    let tp0 = stage.tasks[task].1 as usize;
+                    let tp1 = (tp0 + TERM_CHUNK).min(t_len / LANES);
+                    for tp in tp0..tp1 {
+                        let ticket = gating.tickets[tp];
+                        let e_idx = (ticket & TICKET_INDEX_MASK) as usize;
+                        let entry = entries[e_idx];
+                        let p_active = ticket & TICKET_P_ACTIVE != 0;
+                        let q_active = ticket & TICKET_Q_ACTIVE != 0;
+                        let (i, j) = (entry.i as usize, entry.j as usize);
+                        let p = degrees[i] as usize;
+                        let q = degrees[j] as usize;
+                        // SAFETY: the shift tables have >= max_degree+1
+                        // entries and p/q are degrees of the table; i and j
+                        // are class positions in the operands' supports,
+                        // mapped into the SoA buffers at slots
+                        // `(position - shift) * LANES`.
+                        let term: [L; LANES] = unsafe {
+                            if p_active {
+                                let a_sh_p = *a_shift.add(p) as usize;
+                                let b_sh_q = *b_shift.add(q) as usize;
+                                let mut t4 = mul4(
+                                    load4::<U, L>(job.a.add((i - a_sh_p) * LANES)),
+                                    load4::<U, L>(job.b.add((j - b_sh_q) * LANES)),
                                 );
+                                if q_active {
+                                    let a_sh_q = *a_shift.add(q) as usize;
+                                    let b_sh_p = *b_shift.add(p) as usize;
+                                    t4 = add4(
+                                        t4,
+                                        neg4(mul4(
+                                            load4::<U, L>(job.a.add((j - a_sh_q) * LANES)),
+                                            load4::<U, L>(job.b.add((i - b_sh_p) * LANES)),
+                                        )),
+                                    );
+                                }
+                                t4
+                            } else {
+                                let a_sh_q = *a_shift.add(q) as usize;
+                                let b_sh_p = *b_shift.add(p) as usize;
+                                neg4(mul4(
+                                    load4::<U, L>(job.a.add((j - a_sh_q) * LANES)),
+                                    load4::<U, L>(job.b.add((i - b_sh_p) * LANES)),
+                                ))
                             }
-                            t
-                        } else {
-                            neg4(mul4(
-                                load4::<U, L>(job.a.add((j - a_sh_q) * LANES)),
-                                load4::<U, L>(job.b.add((i - b_sh_p) * LANES)),
-                            ))
-                        }
-                    };
-                    let from = entry.decomp_start as usize;
-                    let to = next.decomp_start as usize;
-                    for (&rel, c) in decomp[from..to].iter().zip(&coeffs[from..to]) {
-                        // SAFETY: rel < re - rs (decomposition rows stay
-                        // inside the unit's target degree slice), so the SoA
-                        // slot `r_base + rel*LANES` is inside the job's
-                        // result buffer.
-                        unsafe {
-                            let off = r_base + rel as usize * LANES;
-                            let rp = job.result.add(off);
-                            let cur = load4::<U, L>(rp);
-                            store4::<U, L>(rp, add4(cur, mul4(splat4::<U, L>(c), term)));
-                        }
+                        };
+                        // SAFETY: tp is inside this job's disjoint SoA term
+                        // range.
+                        unsafe { store4::<U, L>(terms_ptr.add(t_off + tp * LANES), term) };
                     }
+                    task += 1;
+                }
+            } else {
+                // FAN-IN phase: per word class, one 4-lane accumulator,
+                // one 4-wide store. The job's tasks are consecutive
+                // word-class indices in its gating — one run is one
+                // contiguous slice of the hot `words` list.
+                let wi_start = stage.tasks[t].1 as usize;
+                let wi_end = stage.tasks[e - 1].1 as usize + 1;
+                for w in &gating.words[wi_start..wi_end] {
+                    let td = w.td as usize;
+                    // SAFETY: the shift tables have >= max_degree+1 entries
+                    // and `w.td` is a degree of the table (see the plan).
+                    // The class's target word of degree `td` lives at
+                    // `(w.pos - r_shift[td]) * LANES` in the SoA result
+                    // buffer; one 4-lane accumulator, one 4-wide store.
+                    let r_off =
+                        (w.pos as usize - unsafe { *r_shift.add(td) } as usize) * LANES;
+                    // SAFETY: see above — the class's target slot is inside
+                    // the job's SoA result buffer.
+                    let mut acc: [L; LANES] = unsafe { load4::<U, L>(job.result.add(r_off)) };
+                    for &(tp, dp) in &gating.contribs[w.start as usize..w.end as usize] {
+                        let c = &coeffs[dp as usize];
+                        // SAFETY: the term buffers are stable for the
+                        // dispatch; ordered after the term phase by the
+                        // stage counters.
+                        let term: [L; LANES] =
+                            unsafe { load4::<U, L>(terms_ptr.add(t_off + tp as usize * LANES)) };
+                        acc = add4(acc, mul4(splat4::<U, L>(c), term));
+                    }
+                    // SAFETY: single-writer 4-wide store (one class, one
+                    // pack), in bounds (see above).
+                    unsafe { store4::<U, L>(job.result.add(r_off), acc) };
                 }
             }
             t = e;
@@ -870,30 +896,50 @@ const BUNDLE_TARGET_ENTRIES: usize = 2048;
 /// integrity (bundles never split a unit) provides the natural minimum.
 const MIN_BUNDLE_ENTRIES: usize = 16;
 
-/// The kernel prologue's output: the active anagram units (shared through a
-/// [`GatingCache`]), their precomputed active-entry tickets, and the total
-/// visited-entry count.
+/// The kernel prologue's output: the active WRITE-ACCESS classes — one per
+/// target word the sweep touches, holding every active contribution that
+/// writes it — plus the total contribution count (the planner's work unit).
+///
+/// The division of parallel work is per target word: two classes never
+/// write the same result slot, so any pack cut between classes is
+/// race-free, and one class's contributions stay together (in table-entry
+/// order) so each word's float summation order is exactly the serial
+/// sweep's.
 ///
 /// Cloning is cheap (both hot fields are `Arc` slices) — the cohort sweep
 /// stages clone their planned stage's gateways.
 #[derive(Clone)]
 struct KernelGating {
-    active: Arc<[ActiveSegment]>,
-    /// Flat list of packed active-entry tickets (see the `TICKET_*`
-    /// constants): per active segment, in `active` order, only the span's
-    /// entries that passed the owning job's presence tests, with the
-    /// resolved orientation in the top bits. A segment's
-    /// `ticket_start/ticket_end` slices this list; the sweeps iterate
-    /// tickets instead of re-testing every table entry, so the per-entry
-    /// presence resolution runs once per gating, not per kernel call.
+    /// Active word classes, sorted by target position (so sweeps walk the
+    /// result space with sequential stores). Empty classes are omitted: a
+    /// word with no active contribution is not swept at all.
+    words: Arc<[WordClass]>,
+    /// Flat list of `(ticket position, decomp position)` contributions,
+    /// grouped by word class (`words[k]` owns `contribs[start .. end]`), in
+    /// table-entry order within each class. The ticket position indexes
+    /// `tickets` (whose values carry the entry's flat table index with the
+    /// resolved orientation in the top two bits — [`TICKET_INDEX_MASK`],
+    /// [`TICKET_P_ACTIVE`], [`TICKET_Q_ACTIVE`]); the decomp position
+    /// indexes the shared flat coefficient array. The two-phase sweep
+    /// computes one term per ticket (phase 1, table order) and fans the
+    /// contributions in per word class (phase 2) — one term computation
+    /// per active ENTRY, one multiply-add per contribution.
+    contribs: Arc<[(u32, u32)]>,
+    /// The flat active-entry ticket list, in table order (a subsequence of
+    /// the entry stream). Phase 1 of the sweep streams this list
+    /// sequentially — the entry table's natural locality — computing each
+    /// term once; phase 2 reads the terms through the contributions'
+    /// ticket positions.
     tickets: Arc<[u32]>,
-    total_entries: usize,
+    /// Total active contribution count: the fan-in phase's work unit (one
+    /// multiply-add each), used for pack balancing and the slot policy.
+    total_contribs: usize,
 }
 
 /// Memo for the commutation kernel's prologues: maps a job's operand
-/// support lists to its resolved gating — the active anagram-unit list
-/// plus the flat per-entry ticket list with the presence results baked
-/// in.
+/// support lists to its resolved gating — the active per-word write classes
+/// with their `(ticket, decomp position)` contribution lists, presence
+/// results baked in.
 ///
 /// The key is a 128-bit fingerprint per side of the *exact* support lists
 /// (not just their degree masks): the cached tickets bake per-entry
@@ -928,14 +974,17 @@ pub struct GatingCache {
 #[derive(Clone, Default)]
 struct Slot {
     key: Option<([u64; 2], [u64; 2])>,
-    value: (Arc<[ActiveSegment]>, Arc<[u32]>, usize),
+    value: (Arc<[WordClass]>, Arc<[(u32, u32)]>, Arc<[u32]>, usize),
 }
 
 impl GatingCache {
     /// Looks up the support fingerprint pair, returning the memoized
-    /// `(active segments, flat tickets, visited entry count)`.
+    /// `(active word classes, flat contributions, contribution count)`.
     #[inline]
-    fn get(&self, key: ([u64; 2], [u64; 2])) -> Option<&(Arc<[ActiveSegment]>, Arc<[u32]>, usize)> {
+    fn get(
+        &self,
+        key: ([u64; 2], [u64; 2]),
+    ) -> Option<&(Arc<[WordClass]>, Arc<[(u32, u32)]>, Arc<[u32]>, usize)> {
         let cap = self.slots.len();
         if cap == 0 {
             return None;
@@ -952,7 +1001,11 @@ impl GatingCache {
     }
 
     /// Inserts, growing the table to the next power of two when full.
-    fn insert(&mut self, key: ([u64; 2], [u64; 2]), value: (Arc<[ActiveSegment]>, Arc<[u32]>, usize)) {
+    fn insert(
+        &mut self,
+        key: ([u64; 2], [u64; 2]),
+        value: (Arc<[WordClass]>, Arc<[(u32, u32)]>, Arc<[u32]>, usize),
+    ) {
         if self.slots.len() * 3 / 4 <= self.len() {
             let old = std::mem::take(&mut self.slots);
             self.slots = vec![Slot::default(); (old.len() * 2).max(8)];
@@ -968,7 +1021,7 @@ impl GatingCache {
     fn insert_unchecked(
         &mut self,
         key: ([u64; 2], [u64; 2]),
-        value: (Arc<[ActiveSegment]>, Arc<[u32]>, usize),
+        value: (Arc<[WordClass]>, Arc<[(u32, u32)]>, Arc<[u32]>, usize),
     ) {
         let cap = self.slots.len();
         let mut idx = Self::hash(&key) & (cap - 1);
@@ -1013,21 +1066,15 @@ struct RawResult<'a, U> {
 unsafe impl<U: Send> Send for RawResult<'_, U> {}
 unsafe impl<U: Send> Sync for RawResult<'_, U> {}
 
-/// Chooses the entry table and decomposition scatter array for a sweep.
-/// Monomorphized per layout, so the direct path's inner loop compiles to
-/// exactly today's code.
+/// Chooses the entry table for a sweep. Monomorphized per layout, so each
+/// path's inner loop compiles to exactly one code shape.
 trait ScatterLayout {
     fn entries<'a>(class: Option<&'a ClassOrder>, direct: &'a [Entry]) -> &'a [Entry];
-    fn decomp_indices<'a>(class: Option<&'a ClassOrder>, direct: &'a [u32]) -> &'a [u32];
 }
 
-/// Public basis order: public entries, scatter straight into the job's
+/// Public basis order: public entries, writes straight into the job's
 /// result buffer.
 struct DirectLayout;
-
-/// Class-contiguous scatter with public-order operands: public entries,
-/// class decomposition indices, class-layout scratch.
-struct ClassScratchLayout;
 
 /// Fully class-contiguous order: class-ordered operands (read through the
 /// relabeled entry table) and a class-ordered result buffer — no scratch,
@@ -1039,23 +1086,6 @@ impl ScatterLayout for DirectLayout {
     fn entries<'a>(_class: Option<&'a ClassOrder>, direct: &'a [Entry]) -> &'a [Entry] {
         direct
     }
-    #[inline(always)]
-    fn decomp_indices<'a>(_class: Option<&'a ClassOrder>, direct: &'a [u32]) -> &'a [u32] {
-        direct
-    }
-}
-
-impl ScatterLayout for ClassScratchLayout {
-    #[inline(always)]
-    fn entries<'a>(_class: Option<&'a ClassOrder>, direct: &'a [Entry]) -> &'a [Entry] {
-        direct
-    }
-    #[inline(always)]
-    fn decomp_indices<'a>(class: Option<&'a ClassOrder>, _direct: &'a [u32]) -> &'a [u32] {
-        class
-            .expect("class layout without a class order")
-            .decomp_cls()
-    }
 }
 
 impl ScatterLayout for ClassInternalLayout {
@@ -1065,30 +1095,25 @@ impl ScatterLayout for ClassInternalLayout {
             .expect("class layout without a class order")
             .entries_cls()
     }
-    #[inline(always)]
-    fn decomp_indices<'a>(class: Option<&'a ClassOrder>, _direct: &'a [u32]) -> &'a [u32] {
-        class
-            .expect("class layout without a class order")
-            .decomp_cls()
-    }
 }
 
-/// Parallel sweep: dispatches the flattened (job, unit) bundles to rayon,
-/// scattering each unit's decompositions through its job's writer. `L`
-/// selects the scatter layout — public order into the job's result buffer,
-/// or class-contiguous order into the job's scratch. `on_job_done` runs
-/// once after a job's last bundle finishes (used by the class layout to
-/// permute that job's scratch while other workers keep sweeping).
-fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
+/// Parallel two-phase sweep: phase 1 (term chunks — entry-atomic, streamed
+/// in table order) fills the per-job term buffers; phase 2 (word-class
+/// bundles — write-atomic, one single-writer store per word) fans the
+/// contributions in. Two sequential rayon dispatches; the join between
+/// them is the phase barrier. `L` selects the entry table layout — public
+/// order into the job's result buffer, or class-contiguous order into a
+/// class-ordered result buffer.
+fn sweep_bundles_parallel<L: ScatterLayout, T, U>(
     jobs: &[KernelJob<'_, U>],
     writers: &[RawResult<U>],
     gateways: &[KernelGating],
     entries_slice: &[Entry],
-    decomp_indices_slice: &[u32],
-    decomp_coeffs_slice: &[U],
     class_order: Option<&ClassOrder>,
-    bundles: &[Vec<(usize, ActiveSegment)>],
-    on_job_done: &F,
+    decomp_coeffs_slice: &[U],
+    term_bufs: &[RawResult<U>],
+    term_chunks: &[(u32, u32, u32)],
+    fanin_bundles: &[Vec<(usize, u32)>],
 ) where
     T: Clone + Ord + Generator + Hash,
     U: Clone
@@ -1104,7 +1129,6 @@ fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
         + Send
         + Sync
         + 'static,
-    F: Fn(usize) + Sync,
 {
     use rayon::prelude::*;
 
@@ -1112,93 +1136,92 @@ fn sweep_bundles_parallel<L: ScatterLayout, T, U, F>(
     let sweep_span = tracing::debug_span!(
         "kernel_sweep_parallel",
         jobs = jobs.len(),
-        bundles = bundles.len(),
+        bundles = fanin_bundles.len(),
         threads = rayon::current_num_threads(),
     )
     .entered();
     let entries_tbl = <L as ScatterLayout>::entries(class_order, entries_slice);
-    let rel_tbl = <L as ScatterLayout>::decomp_indices(class_order, decomp_indices_slice);
-    bundles
+
+    // Phase 1: one term per active entry, in table order. Chunks of one
+    // job write disjoint ticket ranges of the job's term buffer; different
+    // jobs write disjoint buffers.
+    term_chunks
+        .par_iter()
+        .for_each(|&(ji, chunk_start, chunk_end)| {
+            let job = &jobs[ji as usize];
+            let gating = &gateways[ji as usize];
+            let buf = term_bufs[ji as usize].ptr;
+            for tp in chunk_start as usize..chunk_end as usize {
+                let ticket = gating.tickets[tp];
+                let e = (ticket & TICKET_INDEX_MASK) as usize;
+                let entry = entries_tbl[e];
+                let p_active = ticket & TICKET_P_ACTIVE != 0;
+                let q_active = ticket & TICKET_Q_ACTIVE != 0;
+                let (i, j) = (entry.i as usize, entry.j as usize);
+                // SAFETY: i and j are positions < the operand lengths (the
+                // tickets resolved presence against the operand supports).
+                // `raw_mul` skips the float wrappers' per-op NaN checks
+                // (raw-float fast path); `-` never checks.
+                let term = unsafe {
+                    if p_active {
+                        let mut t = raw_mul(&*job.a.add(i), &*job.b.add(j));
+                        if q_active {
+                            raw_add_assign(&mut t, &-raw_mul(&*job.a.add(j), &*job.b.add(i)));
+                        }
+                        t
+                    } else {
+                        -raw_mul(&*job.a.add(j), &*job.b.add(i))
+                    }
+                };
+                // SAFETY: tp is inside this job's term buffer (chunks
+                // partition the ticket list; buffers are job-disjoint) and
+                // the buffer outlives the dispatch.
+                unsafe { *buf.add(tp) = term };
+            }
+        });
+
+    // Phase 2: the write-access fan-in. Each word class sums its
+    // contributions' `coefficient x term` (table-entry order — exactly the
+    // serial sweep's per-word `+=` sequence) into a local, starting from
+    // the buffer's current value (callers zero their buffers;
+    // accumulate-into semantics are preserved), and stores ONCE.
+    fanin_bundles
         .par_iter()
         .enumerate()
         .for_each(|(_bundle_index, bundle)| {
-            // Per-task span: close events carry the worker's thread id, so
-            // the workload assignment across threads is directly observable.
             #[cfg(feature = "tracing")]
             let _bundle_span = tracing::debug_span!(
                 "kernel_bundle",
                 bundle = _bundle_index,
-                units = bundle.len(),
-                entries = bundle
-                    .iter()
-                    .map(|(_, au)| (au.span_end - au.span_start - 1) as usize)
-                    .sum::<usize>()
+                words = bundle.len(),
             )
             .entered();
-            // Tasks are job-ordered, so a bundle's per-job runs are
-            // contiguous; after finishing a job's run, hand the job to the
-            // completion callback.
-            let mut start = 0usize;
-            while start < bundle.len() {
-                let ji = bundle[start].0;
-                let mut end = start;
-                while end < bundle.len() && bundle[end].0 == ji {
-                    end += 1;
-                }
-                for &(_, au) in &bundle[start..end] {
-                    let job = &jobs[ji];
-                    let writer = &writers[ji];
-                    let gating = &gateways[ji];
-                    let rs = au.rs as usize;
-                    let rel_indices = rel_tbl;
-                    // Precomputed tickets (see `sweep_units_serial`): the
-                    // visit stream is the presence-resolved subsequence of
-                    // the span, orientation flags packed — no per-entry bit
-                    // tests in the hot loop, identical term computations.
-                    for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize]
-                    {
-                        let e = (ticket & TICKET_INDEX_MASK) as usize;
-                        let entry = entries_tbl[e];
-                        let next = entries_tbl[e + 1];
-                        let p_active = ticket & TICKET_P_ACTIVE != 0;
-                        let q_active = ticket & TICKET_Q_ACTIVE != 0;
-                        let (i, j) = (entry.i as usize, entry.j as usize);
-                        // SAFETY: i and j are class positions < the operand
-                        // lengths (the gating's entries index the class space).
-                        // `raw_mul` skips the float wrappers' per-op NaN checks
-                        // (raw-float fast path); `-` never checks.
-                        let term = unsafe {
-                            if p_active {
-                                let mut t = raw_mul(&*job.a.add(i), &*job.b.add(j));
-                                if q_active {
-                                    raw_add_assign(
-                                        &mut t,
-                                        &-raw_mul(&*job.a.add(j), &*job.b.add(i)),
-                                    );
-                                }
-                                t
-                            } else {
-                                -raw_mul(&*job.a.add(j), &*job.b.add(i))
-                            }
-                        };
-                        let from = entry.decomp_start as usize;
-                        let to = next.decomp_start as usize;
-                        for (&rel, c) in rel_indices[from..to]
-                            .iter()
-                            .zip(&decomp_coeffs_slice[from..to])
-                        {
-                            // SAFETY: the scatter index belongs to this
-                            // unit's target slice and to no other unit's
-                            // (content homogeneity), and is < the buffer
-                            // length by the table invariant.
-                            unsafe {
-                                writer.scatter_add(rs + rel as usize, raw_mul(c, &term));
-                            }
-                        }
+            for &(ji, wi) in bundle {
+                let job = &jobs[ji];
+                let writer = &writers[ji];
+                let gating = &gateways[ji];
+                let w = &gating.words[wi as usize];
+                let pos = w.pos as usize;
+                // SAFETY: `pos` is inside the job's result buffer (the
+                // gating transposes against the working layout's result
+                // space) and is written by exactly this task — word
+                // classes are disjoint write regions and bundles never
+                // split one. The term buffers were fully written by phase
+                // 1 (the dispatch join orders the phases).
+                let mut acc = unsafe { (*writer.ptr.add(pos)).clone() };
+                for &(tp, dp) in &gating.contribs[w.start as usize..w.end as usize] {
+                    unsafe {
+                        raw_add_assign(
+                            &mut acc,
+                            &raw_mul(
+                                &decomp_coeffs_slice[dp as usize],
+                                &*term_bufs[ji].ptr.add(tp as usize),
+                            ),
+                        );
                     }
                 }
-                on_job_done(ji);
-                start = end;
+                // SAFETY: single-writer store, in bounds (see above).
+                unsafe { *writer.ptr.add(pos) = acc };
             }
         });
     #[cfg(feature = "tracing")]
@@ -1209,14 +1232,6 @@ impl<U> RawResult<'_, U>
 where
     U: Clone + AddAssign + 'static,
 {
-    #[inline(always)]
-    unsafe fn scatter_add(&self, index: usize, value: U) {
-        // SAFETY: callers guarantee `index` is in bounds and disjoint across
-        // concurrent tasks (the job's result buffer and the unit partition).
-        // `raw_add_assign_ptr` skips the float wrappers' per-op NaN checks
-        // (raw-float fast path, see `raw_mul`'s NaN policy).
-        unsafe { raw_add_assign_ptr(self.ptr.add(index), &value) };
-    }
 }
 
 /// One independent commutation: operand slices plus the destination buffer.
@@ -1336,24 +1351,22 @@ pub fn commutator_coefficients_batch_with_cache<T, U>(
             LieSeries::<T, U>::kernel_prologue_cached(a_series, j.a_nonzero, j.b_nonzero, cache)
         })
         .collect();
-    let total: usize = gateways.iter().map(|g| g.total_entries).sum();
+    let total: usize = gateways.iter().map(|g| g.total_contribs).sum();
     #[cfg(feature = "tracing")]
     {
         drop(prologue_span);
         tracing::debug!(
             jobs = jobs.len(),
-            total_entries = total,
+            total_contribs = total,
             "kernel_prologue done"
         );
     }
 
-    // Hoisted flat-table views: every active unit's span indexes directly
-    // into these, so neither sweep touches the unit table again.
+    // Hoisted flat-table views: every contribution's ticket indexes the
+    // entry table directly, so neither sweep touches the unit table again.
     let table = &a_series.feasible_decompositions;
     let entries_slice = table.entries();
-    let decomp_indices_slice = table.decomp_indices_rel();
     let decomp_coeffs_slice = table.decomp_coeffs();
-    let class_order = table.cached_class_order().map(|co| co.as_ref());
 
     // With more than one thread available the batch always dispatches to
     // the parallel sweep; rayon's work stealing balances the pieces. Only a
@@ -1364,7 +1377,7 @@ pub fn commutator_coefficients_batch_with_cache<T, U>(
         let sweep_span = tracing::debug_span!(
             "kernel_sweep_serial",
             jobs = jobs.len(),
-            total_entries = total,
+            total_contribs = total,
             threads
         )
         .entered();
@@ -1381,167 +1394,104 @@ pub fn commutator_coefficients_batch_with_cache<T, U>(
                     std::slice::from_raw_parts(job.b, job.b_len),
                 )
             };
-            match class_order {
-                None => LieSeries::sweep_units_serial(
-                    a_series,
-                    a_slice,
-                    b_slice,
-                    gating,
-                    result,
-                    entries_slice,
-                    decomp_indices_slice,
-                    &mut NoSink,
-                ),
-                Some(co) => {
-                    // Class-contiguous sweep into a scratch buffer, then
-                    // permute into the job's public-order result.
-                    let mut scratch = vec![U::default(); job.result_len];
-                    LieSeries::sweep_units_serial(
-                        a_series,
-                        a_slice,
-                        b_slice,
-                        gating,
-                        &mut scratch,
-                        entries_slice,
-                        co.decomp_cls(),
-                        &mut NoSink,
-                    );
-                    for (k, &src) in co.inv().iter().enumerate() {
-                        result[k] = scratch[src as usize].clone();
-                    }
-                }
-            }
+            // The gating's word classes carry public positions: one
+            // single-writer accumulation + store per word, straight into
+            // the public result buffer. (The old class-contiguous scratch
+            // densified a scatter of repeated `+=`s; one store per word
+            // needs no densifying, and the scratch + permutation epilogue
+            // it paid is gone.)
+            LieSeries::sweep_words_serial(
+                a_series,
+                a_slice,
+                b_slice,
+                gating,
+                result,
+                entries_slice,
+                &mut NoSink,
+            );
         }
         #[cfg(feature = "tracing")]
         drop(sweep_span);
         return;
     }
 
-    // Class mode sweeps into a per-job scratch laid out class-contiguous
-    // (the epilogue permutes it into the job's public result buffer); the
-    // direct mode writes the result buffer itself. Either way each job's
-    // sweep target is distinct.
-    let scratches: Vec<Vec<U>> = match class_order {
-        Some(_) => jobs
-            .iter()
-            .map(|j| vec![U::default(); j.result_len])
-            .collect(),
-        None => Vec::new(),
-    };
     // SAFETY: each job's sweep target is a distinct buffer (disjoint across
-    // jobs by the caller's contract, disjoint across a job's units by the
-    // anagram partition — contiguously so in the class layout), so the
-    // concurrent writes never alias. The buffers are not otherwise accessed
-    // during the sweep.
-    let writers: Vec<RawResult<U>> = match class_order {
-        None => jobs
-            .iter()
-            .map(|j| RawResult {
-                ptr: j.result,
-                _marker: PhantomData,
-            })
-            .collect(),
-        Some(_) => scratches
-            .iter()
-            .map(|s| RawResult {
-                ptr: s.as_ptr() as *mut U,
-                _marker: PhantomData,
-            })
-            .collect(),
-    };
+    // jobs by the caller's contract), and within a job each word class is
+    // written by exactly one task (bundles never split a class), so the
+    // concurrent single-writer stores never alias. The buffers are not
+    // otherwise accessed during the sweep.
+    let writers: Vec<RawResult<U>> = jobs
+        .iter()
+        .map(|j| RawResult {
+            ptr: j.result,
+            _marker: PhantomData,
+        })
+        .collect();
 
-    // Flatten (job, active unit) pairs, carrying each unit's orientation
-    // flags, into bundles of roughly `BUNDLE_TARGET_ENTRIES` entries. Units
-    // stay in kernel order within a bundle, preserving the per-word
-    // accumulation order.
-    let mut tasks: Vec<(usize, ActiveSegment)> = Vec::with_capacity(total);
-    for (ji, gating) in gateways.iter().enumerate() {
-        for au in gating.active.iter() {
-            tasks.push((ji, *au));
+    // Per-job term buffers (phase 1's output) and their entry-atomic
+    // ticket chunks.
+    let mut term_bufs: Vec<Vec<U>> = gateways
+        .iter()
+        .map(|g| vec![U::default(); g.tickets.len()])
+        .collect();
+    // SAFETY: the buffers are stable allocations outliving the dispatch;
+    // phase 1's chunks write disjoint ticket ranges (one buffer per job).
+    let terms_raw: Vec<RawResult<U>> = term_bufs
+        .iter_mut()
+        .map(|v| RawResult {
+            ptr: v.as_mut_ptr(),
+            _marker: PhantomData,
+        })
+        .collect();
+    let mut term_chunks: Vec<(u32, u32, u32)> = Vec::new();
+    for (ji, g) in gateways.iter().enumerate() {
+        let t = g.tickets.len() as u32;
+        let mut cs = 0u32;
+        while cs < t {
+            let ce = (cs + TERM_CHUNK as u32).min(t);
+            term_chunks.push((ji as u32, cs, ce));
+            cs = ce;
         }
     }
+
+    // Flatten (job, word class) pairs into bundles of roughly
+    // `BUNDLE_TARGET_ENTRIES` contributions. Classes stay in kernel order
+    // within a bundle (target-position order), preserving each word's
+    // accumulation order; a class is never split.
+    let mut bundles: Vec<Vec<(usize, u32)>> = vec![Vec::new()];
+    let mut cur = 0usize;
     // Enough bundles that every thread can hold a piece, without dropping
-    // below the per-task break-even size. The cut happens between units:
-    // `prev_last_of_unit` marks the boundary after a unit's last segment, so
-    // a unit's segments always share one bundle (they scatter onto the same
-    // words, and the sweep's `+=` is only race-free within one thread).
+    // below the per-task break-even size. The cut happens between word
+    // classes — always safe: two classes never write the same word.
     //
     // Balancing by decomposition volume (the alternative: bundles of equal
-    // summed decomposition length) was measured and rejected: per-bundle
-    // sweep time is ~7.5 ns/entry *uniformly* across degree mixes, so
-    // entry counts are already the right balance metric, and work-based
-    // cuts only unbalance them.
+    // summed decomposition length) was measured and rejected in the
+    // unit-atomic engine: per-bundle sweep time is ~uniform per work unit
+    // across degree mixes, so counts are already the right balance metric.
     let bundle_target = (total / (2 * threads)).clamp(MIN_BUNDLE_ENTRIES, BUNDLE_TARGET_ENTRIES);
-    let mut bundles: Vec<Vec<(usize, ActiveSegment)>> = vec![Vec::new()];
-    let mut cur = 0usize;
-    let mut prev_last_of_unit = false;
-    for task in tasks {
-        let entries = (task.1.span_end - task.1.span_start - 1) as usize;
-        if prev_last_of_unit && cur >= bundle_target {
-            bundles.push(Vec::new());
-            cur = 0;
+    for (ji, gating) in gateways.iter().enumerate() {
+        for (wi, w) in gating.words.iter().enumerate() {
+            let contribs = (w.end - w.start) as usize;
+            if cur >= bundle_target {
+                bundles.push(Vec::new());
+                cur = 0;
+            }
+            bundles.last_mut().unwrap().push((ji, wi as u32));
+            cur += contribs;
         }
-        bundles.last_mut().unwrap().push(task);
-        cur += entries;
-        prev_last_of_unit = task.1.last_of_unit;
     }
 
-    match class_order {
-        Some(co) => {
-            // Per-job bundle counts drive the completion countdown: the
-            // worker finishing a job's last bundle permutes that job's
-            // scratch into its public result immediately, overlapping the
-            // permutation with the remaining jobs' sweeps.
-            let mut bundle_counts = vec![0usize; jobs.len()];
-            for bundle in &bundles {
-                // Count (bundle, job) runs, not tasks: the completion
-                // callback fires once per run, so the countdown must start
-                // at the number of runs the job appears in.
-                for run in bundle.chunk_by(|a, b| a.0 == b.0) {
-                    bundle_counts[run[0].0] += 1;
-                }
-            }
-            let remaining: Vec<AtomicUsize> =
-                bundle_counts.iter().map(|&c| AtomicUsize::new(c)).collect();
-            let on_job_done = |ji: usize| {
-                if remaining[ji].fetch_sub(1, Ordering::Relaxed) != 1 {
-                    return;
-                }
-                let scratch = &scratches[ji];
-                let job = &jobs[ji];
-                // SAFETY: the job's result buffer is valid for `result_len`
-                // elements (the struct's contract), and every bundle touching
-                // this job has finished — the countdown above is the last one
-                // — so the buffer is exclusively ours here.
-                let result = unsafe { std::slice::from_raw_parts_mut(job.result, job.result_len) };
-                for (k, &src) in co.inv().iter().enumerate() {
-                    result[k] = scratch[src as usize].clone();
-                }
-            };
-            sweep_bundles_parallel::<ClassScratchLayout, T, U, _>(
-                jobs,
-                &writers,
-                &gateways,
-                entries_slice,
-                decomp_indices_slice,
-                decomp_coeffs_slice,
-                Some(co),
-                &bundles,
-                &on_job_done,
-            );
-        }
-        None => sweep_bundles_parallel::<DirectLayout, T, U, _>(
-            jobs,
-            &writers,
-            &gateways,
-            entries_slice,
-            decomp_indices_slice,
-            decomp_coeffs_slice,
-            None,
-            &bundles,
-            &|_: usize| {},
-        ),
-    }
+    sweep_bundles_parallel::<DirectLayout, T, U>(
+        jobs,
+        &writers,
+        &gateways,
+        entries_slice,
+        None,
+        decomp_coeffs_slice,
+        &terms_raw,
+        &term_chunks,
+        &bundles,
+    )
 }
 
 /// Batch kernel in the class-contiguous working mode: every job's operand
@@ -1589,13 +1539,12 @@ pub fn commutator_coefficients_class_batch_with_cache<T, U>(
             )
         })
         .collect();
-    let total: usize = gateways.iter().map(|g| g.total_entries).sum();
+    let total: usize = gateways.iter().map(|g| g.total_contribs).sum();
     #[cfg(feature = "tracing")]
     drop(prologue_span);
 
     let table = &a_series.feasible_decompositions;
     let entries_slice = table.entries();
-    let decomp_indices_slice = table.decomp_indices_rel();
     let decomp_coeffs_slice = table.decomp_coeffs();
     let co: &ClassOrder = order;
 
@@ -1615,14 +1564,13 @@ pub fn commutator_coefficients_class_batch_with_cache<T, U>(
                     std::slice::from_raw_parts(job.b, job.b_len),
                 )
             };
-            LieSeries::sweep_units_serial(
+            LieSeries::sweep_words_serial(
                 a_series,
                 a_slice,
                 b_slice,
                 gating,
                 result,
                 co.entries_cls(),
-                co.decomp_cls(),
                 &mut NoSink,
             );
         }
@@ -1630,9 +1578,9 @@ pub fn commutator_coefficients_class_batch_with_cache<T, U>(
     }
 
     // SAFETY: each job's result is a distinct buffer (disjoint across jobs
-    // by the caller's contract, disjoint across a job's units by the
-    // anagram partition — contiguously so in the class layout), so the
-    // concurrent writes never alias.
+    // by the caller's contract), and within a job each word class is
+    // written by exactly one task (bundles never split a class), so the
+    // concurrent single-writer stores never alias.
     let writers: Vec<RawResult<U>> = jobs
         .iter()
         .map(|j| RawResult {
@@ -1641,41 +1589,62 @@ pub fn commutator_coefficients_class_batch_with_cache<T, U>(
         })
         .collect();
 
-    // Flatten (job, active unit) pairs into bundles — same cut rule as the
-    // public kernel: entry-count balanced, cuts only between units.
-    let mut tasks: Vec<(usize, ActiveSegment)> = Vec::with_capacity(total);
-    for (ji, gating) in gateways.iter().enumerate() {
-        for au in gating.active.iter() {
-            tasks.push((ji, *au));
+    // Per-job term buffers (phase 1's output) and their entry-atomic
+    // ticket chunks — same shape as the public kernel.
+    let mut term_bufs: Vec<Vec<U>> = gateways
+        .iter()
+        .map(|g| vec![U::default(); g.tickets.len()])
+        .collect();
+    // SAFETY: stable allocations outliving the dispatch; phase 1's chunks
+    // write disjoint ticket ranges (one buffer per job).
+    let terms_raw: Vec<RawResult<U>> = term_bufs
+        .iter_mut()
+        .map(|v| RawResult {
+            ptr: v.as_mut_ptr(),
+            _marker: PhantomData,
+        })
+        .collect();
+    let mut term_chunks: Vec<(u32, u32, u32)> = Vec::new();
+    for (ji, g) in gateways.iter().enumerate() {
+        let t = g.tickets.len() as u32;
+        let mut cs = 0u32;
+        while cs < t {
+            let ce = (cs + TERM_CHUNK as u32).min(t);
+            term_chunks.push((ji as u32, cs, ce));
+            cs = ce;
         }
     }
-    let bundle_target = (total / (2 * threads)).clamp(MIN_BUNDLE_ENTRIES, BUNDLE_TARGET_ENTRIES);
-    let mut bundles: Vec<Vec<(usize, ActiveSegment)>> = vec![Vec::new()];
+
+    // Flatten (job, word class) pairs into bundles — same cut rule as the
+    // public kernel: contribution-count balanced, cuts only between word
+    // classes (always safe: two classes never write the same word).
+    let mut bundles: Vec<Vec<(usize, u32)>> = vec![Vec::new()];
     let mut cur = 0usize;
-    let mut prev_last_of_unit = false;
-    for task in tasks {
-        let entries = (task.1.span_end - task.1.span_start - 1) as usize;
-        if prev_last_of_unit && cur >= bundle_target {
-            bundles.push(Vec::new());
-            cur = 0;
+    let bundle_target = (total / (2 * threads)).clamp(MIN_BUNDLE_ENTRIES, BUNDLE_TARGET_ENTRIES);
+    for (ji, gating) in gateways.iter().enumerate() {
+        for (wi, w) in gating.words.iter().enumerate() {
+            let contribs = (w.end - w.start) as usize;
+            if cur >= bundle_target {
+                bundles.push(Vec::new());
+                cur = 0;
+            }
+            bundles.last_mut().unwrap().push((ji, wi as u32));
+            cur += contribs;
         }
-        bundles.last_mut().unwrap().push(task);
-        cur += entries;
-        prev_last_of_unit = task.1.last_of_unit;
     }
 
     // The class-ordered result buffer needs no epilogue: the sweep's writes
     // are already final.
-    sweep_bundles_parallel::<ClassInternalLayout, T, U, _>(
+    sweep_bundles_parallel::<ClassInternalLayout, T, U>(
         jobs,
         &writers,
         &gateways,
         entries_slice,
-        decomp_indices_slice,
-        decomp_coeffs_slice,
         Some(co),
+        decomp_coeffs_slice,
+        &terms_raw,
+        &term_chunks,
         &bundles,
-        &|_: usize| {},
     );
 }
 
@@ -1924,10 +1893,69 @@ pub struct ClassBatchStage<'a, U> {
     /// Sweep stages: run the 4-lane SoA cohort sweep instead of the scalar
     /// one. A cohort stage's jobs carry SoA-interleaved operand/result
     /// pointers (the four lanes' values of class position `p` live at
-    /// `[p*4 .. p*4+4]`, lane `l` at `p*4 + l`), and every other plan input
-    /// (tasks, packs, gateways, support lists) is lane-invariant — see
+    /// `[p*4 .. p*4+4]`, lane `l` at `p*4 + l`), its term buffers are
+    /// SoA-interleaved the same way, and every other plan input (tasks,
+    /// packs, gateways, support lists) is lane-invariant — see
     /// `CommutatorDag::fold_batch_cohort` for how such a plan is built.
     cohort: bool,
+    /// Sweep stages: which phase of the two-phase sweep this stage runs.
+    phase: StagePhase,
+    /// Sweep stages: the level's per-job term buffers — phase 1's output,
+    /// phase 2's input. One flat allocation with per-job disjoint ranges,
+    /// `Arc`-shared so the cohort variant clones by refcount. Written by
+    /// the term stage's packs (disjoint ticket ranges), read by the
+    /// fan-in stage's packs; the stage counters order the two phases.
+    terms: Option<Arc<TermBuffers<U>>>,
+}
+
+/// Which half of a sweep stage's two-phase work the stage runs: the term
+/// pass (one term per active entry, streamed in table order, written to
+/// the stage's per-job term buffers) or the write-access fan-in (each
+/// word class sums its contributions' `coefficient x term` and stores
+/// once).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StagePhase {
+    Terms,
+    Fanin,
+}
+
+/// A sweep stage pair's per-job term buffers: one flat allocation, job
+/// `j`'s tickets at `data[offset_j .. offset_j + len_j]` (disjoint
+/// ranges). The term stage's packs write disjoint ticket ranges of their
+/// job's buffer; the fan-in stage's packs read them; the stage counters
+/// order the phases — the same raw-pointer protocol as the jobs' operand
+/// and result buffers (see [`KernelJob`]).
+pub struct TermBuffers<U> {
+    data: std::cell::UnsafeCell<Vec<U>>,
+    /// `(offset, len)` per job index into `data`.
+    job_ranges: Vec<(u32, u32)>,
+}
+
+// SAFETY: written and read only through raw pointers, at indices owned by
+// exactly one pack (disjoint ticket chunks in the term phase; read-only in
+// the fan-in phase), with cross-stage ordering provided by the stage
+// counters. `U: Send` covers the values crossing threads.
+unsafe impl<U: Send> Send for TermBuffers<U> {}
+unsafe impl<U: Send> Sync for TermBuffers<U> {}
+
+impl<U> TermBuffers<U> {
+    /// The raw data pointer into the flat buffer's heap storage (see the
+    /// SAFETY contract on the struct).
+    #[inline]
+    pub(crate) fn data_ptr(&self) -> *mut U {
+        // SAFETY: dereferences the UnsafeCell's Vec to reach its heap
+        // buffer (`get()` alone points at the Vec STRUCT, not its
+        // elements).
+        unsafe { (*self.data.get()).as_mut_ptr() }
+    }
+
+    /// Job `j`'s `(offset, len)` range.
+    #[inline]
+    pub(crate) fn job_range(&self, job: usize) -> (usize, usize) {
+        let (o, l) = self.job_ranges[job];
+        (o as usize, l as usize)
+    }
+
 }
 
 /// The per-block task/pack shape shared by every block stage of one
@@ -1965,16 +1993,24 @@ impl<'a, U> ClassBatchStage<'a, U> {
             block: Some(task),
             fold,
             cohort: false,
+            phase: StagePhase::Terms,
+            terms: None,
         }
     }
 
     /// The cohort (SoA) sweep variant of a planned sweep stage: identical
-    /// tasks, packs, gateways and job views (all lane-invariant — see the
+    /// tasks, packs, gateways, job views and term buffers (all
+    /// lane-invariant apart from the buffers' lane interleave — see the
     /// `cohort` field), dispatched to the 4-lane SoA kernel instead of the
     /// scalar sweep. The stage's jobs' operand/result pointers must be
-    /// SoA-interleaved with lane stride 4 (the cohort engine's job tables
-    /// are built that way); the support lists are the shared plan's.
+    /// SoA-interleaved with lane stride 4 and the plan must have been
+    /// built with `cohort = true` (SoA-interleaved term buffers) — see
+    /// `plan_class_sweep_stages`.
     pub fn cohort_variant(stage: &Self) -> Self {
+        assert!(
+            stage.cohort,
+            "cohort_variant requires a plan built with cohort = true              (SoA-interleaved term buffers)"
+        );
         Self {
             tasks: Arc::clone(&stage.tasks),
             packs: Arc::clone(&stage.packs),
@@ -1983,6 +2019,8 @@ impl<'a, U> ClassBatchStage<'a, U> {
             block: None,
             fold: 0,
             cohort: true,
+            phase: stage.phase,
+            terms: stage.terms.clone(),
         }
     }
 }
@@ -2182,7 +2220,9 @@ fn finish_pack(
 struct FoldWalk<'a, U> {
     stages: &'a [&'a ClassBatchStage<'a, U>],
     entries: &'a [Entry],
-    decomp: &'a [u32],
+    /// Class position → Lyndon degree (the compact-buffer shifts index by
+    /// degree; a contribution's entry positions are class positions).
+    degrees: &'a [u8],
     coeffs: &'a [U],
 }
 
@@ -2231,16 +2271,123 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
         true
     }
 
-    /// Sweeps pack `pack` of a sweep stage. Packs are unit-atomic cuts of
-    /// the stage's node-ordered task list, so the per-word accumulation
-    /// order is exactly the serial sweep's regardless of which slot claims
-    /// which pack. Tasks are grouped by job, so the pack's per-job state
-    /// (operand views, result writer, gating) is hoisted to maximal job
-    /// runs — the same shape as the per-level kernel's serial sweep.
+    /// Sweeps pack `pack` of a sweep stage: the term phase (one task per
+    /// ticket chunk) or the write-access fan-in (one task per word-class
+    /// run). Both phases' packs are single-writer regions — ticket chunks
+    /// write disjoint term-buffer ranges; word classes write disjoint
+    /// result words — so the per-word accumulation order is exactly the
+    /// serial sweep's regardless of which slot claims which pack.
     #[inline]
     fn sweep_pack_range(&self, s: usize, stage: &ClassBatchStage<'a, U>, pack: usize) {
+        match stage.phase {
+            StagePhase::Terms => self.sweep_term_pack(s, stage, pack),
+            StagePhase::Fanin => self.sweep_fanin_pack(s, stage, pack),
+        }
+    }
+
+    /// TERM phase: computes one term per active entry for the pack's
+    /// ticket chunks, streamed in table order (the ticket list is a
+    /// subsequence of the entry stream — the entry table's natural
+    /// locality), writing the stage's term buffers. A multi-target entry
+    /// (over half of a real table) computes its term exactly once.
+    #[inline]
+    fn sweep_term_pack(&self, s: usize, stage: &ClassBatchStage<'a, U>, pack: usize) {
         let (start, end) = stage.packs[pack];
         let jobs = stage.jobs;
+        let terms = stage.terms.as_ref().expect("term stage without term buffers");
+        let terms_ptr = terms.data_ptr();
+        let mut t = start;
+        while t < end {
+            let ji = stage.tasks[t].0 as usize;
+            let mut e = t + 1;
+            while e < end && stage.tasks[e].0 == stage.tasks[t].0 {
+                e += 1;
+            }
+            let job = &jobs[ji];
+            let gating = &stage.gateways[ji];
+            let a_shift = job.a_shift;
+            let b_shift = job.b_shift;
+            // SAFETY: the term buffers are valid for the whole dispatch
+            // (stage-owned allocation) and this pack's ticket chunks write
+            // DISJOINT ranges (chunks partition each job's ticket list;
+            // jobs own disjoint buffer ranges) — no `&mut` is created,
+            // because two packs of one job would otherwise hold aliasing
+            // `&mut` slices. Cross-stage accesses are ordered by the
+            // stage counters.
+            let (t_off, t_len) = terms.job_range(ji);
+            debug_assert!(t_len == gating.tickets.len());
+            for &(ji_task, chunk_start) in &stage.tasks[t..e] {
+                let _ = ji_task;
+                let tp0 = chunk_start as usize;
+                let tp1 = (tp0 + TERM_CHUNK).min(t_len);
+                // DEBUG: term-chunk-completion trace (coverage check).
+                if CKS_ON.get().copied().unwrap_or(false)
+                    && let Some(buf) = DEBUG_WRITES.get()
+                {
+                    buf.lock().unwrap().push(format!(
+                        "TCT s={s} j={ji} c={tp0}..{tp1} p={pack}"
+                    ));
+                }
+                for tp in tp0..tp1 {
+                    let ticket = gating.tickets[tp];
+                    let e_idx = (ticket & TICKET_INDEX_MASK) as usize;
+                    let entry = self.entries[e_idx];
+                    let p_active = ticket & TICKET_P_ACTIVE != 0;
+                    let q_active = ticket & TICKET_Q_ACTIVE != 0;
+                    let (i, j) = (entry.i as usize, entry.j as usize);
+                    // Compact-layout operand shifts (see `KernelJob`): the
+                    // contribution's operand degrees come from the
+                    // class-position degree table.
+                    let p = self.degrees[i] as usize;
+                    let q = self.degrees[j] as usize;
+                    // SAFETY: the shift tables have >= max_degree+1 entries
+                    // and p/q are degrees of the table; i and j are class
+                    // positions in the operands' supports (the tickets
+                    // resolved presence). `raw_mul` skips the float
+                    // wrappers' per-op NaN checks (raw-float fast path).
+                    let term = unsafe {
+                        if p_active {
+                            let a_sh_p = *a_shift.add(p) as usize;
+                            let b_sh_q = *b_shift.add(q) as usize;
+                            let mut t =
+                                raw_mul(&*job.a.add(i - a_sh_p), &*job.b.add(j - b_sh_q));
+                            if q_active {
+                                let a_sh_q = *a_shift.add(q) as usize;
+                                let b_sh_p = *b_shift.add(p) as usize;
+                                raw_add_assign(
+                                    &mut t,
+                                    &-raw_mul(&*job.a.add(j - a_sh_q), &*job.b.add(i - b_sh_p)),
+                                );
+                            }
+                            t
+                        } else {
+                            let a_sh_q = *a_shift.add(q) as usize;
+                            let b_sh_p = *b_shift.add(p) as usize;
+                            -raw_mul(&*job.a.add(j - a_sh_q), &*job.b.add(i - b_sh_p))
+                        }
+                    };
+                    // SAFETY: tp is inside this job's disjoint term range.
+                    unsafe { *terms_ptr.add(t_off + tp) = term };
+                }
+            }
+            t = e;
+        }
+    }
+
+    /// FAN-IN phase: the write-access sweep. Each word class sums its
+    /// contributions' `coefficient x term` (table-entry order — exactly
+    /// the serial sweep's per-word `+=` sequence) into a local, starting
+    /// from the buffer's current value (callers zero their buffers;
+    /// accumulate-into semantics are preserved), and stores ONCE. No
+    /// shifts, no entry loads, no per-contribution term work: the phase-2
+    /// hot loop is one dense term load, one coefficient load, one
+    /// multiply-add.
+    #[inline]
+    fn sweep_fanin_pack(&self, s: usize, stage: &ClassBatchStage<'a, U>, pack: usize) {
+        let (start, end) = stage.packs[pack];
+        let jobs = stage.jobs;
+        let terms = stage.terms.as_ref().expect("fan-in stage without term buffers");
+        let terms_ptr = terms.data_ptr();
         let mut t = start;
         while t < end {
             let ji = stage.tasks[t].0 as usize;
@@ -2250,100 +2397,63 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
             }
             let job = &jobs[ji];
             // SAFETY: within a stage the jobs' result buffers are pairwise
-            // disjoint (caller contract), and within one job the units are
-            // conflict-free write regions (each result word belongs to one
-            // unit), so concurrent packs of the same job write disjoint
-            // words through raw pointers — no `&mut` is created, because
-            // two packs of one job would otherwise hold aliasing `&mut`
-            // slices (UB under the aliasing model even with disjoint
-            // ranges). Cross-stage accesses are ordered by the stage
-            // counters. The buffer outlives the walk (stable allocations,
-            // no resize during the dispatch).
+            // disjoint (caller contract), and within one job each word
+            // class is a single-writer region (two classes never write the
+            // same word, packs never split a class), so concurrent packs of
+            // the same job write disjoint words through raw pointers — no
+            // `&mut` is created, because two packs of one job would
+            // otherwise hold aliasing `&mut` slices (UB under the aliasing
+            // model even with disjoint ranges). Cross-stage accesses are
+            // ordered by the stage counters. The buffer outlives the walk
+            // (stable allocations, no resize during the dispatch).
             let result: *mut U = job.result;
             let gating = &stage.gateways[ji];
-            // Compact-layout address shifts (see `KernelJob`): class position
-            // `x` of degree `d` lives at `x - shift[d]` in its buffer. The
-            // shifts are per-degree tables (tiny, L1-resident) and the
-            // segment's degrees are constant (`au.p` for the `i` side, `q =
-            // td - p` for the `j` side, `au.td` for the scatter), so the
-            // hoisted subtractions below keep the hot loop's exact shape.
-            let a_shift = job.a_shift;
-            let b_shift = job.b_shift;
             let r_shift = job.r_shift;
-            // The job's tasks are consecutive unit indices in its gating
-            // (tasks are pushed job by job, in unit order, and packs cut
-            // between tasks), so one run is one contiguous slice of the
-            // gating's hot `active` list.
-            let ui_start = stage.tasks[t].1 as usize;
-            let ui_end = stage.tasks[e - 1].1 as usize + 1;
-            for (uk, au) in gating.active[ui_start..ui_end].iter().enumerate() {
-                // DEBUG: unit-completion trace (coverage check).
+            // The job's tasks are consecutive word-class indices in its
+            // gating (tasks are pushed job by job, in target-position
+            // order, and packs cut between tasks), so one run is one
+            // contiguous slice of the gating's hot `words` list.
+            let wi_start = stage.tasks[t].1 as usize;
+            let wi_end = stage.tasks[e - 1].1 as usize + 1;
+            // SAFETY: the term buffers are stable for the dispatch; this
+            // stage's reads are ordered after the term stage's writes by
+            // the stage counters.
+            let (t_off, _) = terms.job_range(ji);
+            for (wk, w) in gating.words[wi_start..wi_end].iter().enumerate() {
+                // DEBUG: word-class-completion trace (coverage check).
                 if CKS_ON.get().copied().unwrap_or(false)
                     && let Some(buf) = DEBUG_WRITES.get()
                 {
                     buf.lock()
                         .unwrap()
-                        .push(format!("UNT s={s} j={ji} u={} p={pack}", ui_start + uk));
+                        .push(format!("WCT s={s} j={ji} w={} p={pack}", wi_start + wk));
                 }
-                let rs = au.rs as usize;
-                // SAFETY: the shift tables have >= max_degree+1 entries and
-                // `au.p`/`au.td` are degrees of the table (see the plan).
-                let p = au.p as usize;
-                let td = au.td as usize;
-                let q = td - p;
-                let a_sh_p = unsafe { *a_shift.add(p) } as usize;
-                let a_sh_q = unsafe { *a_shift.add(q) } as usize;
-                let b_sh_p = unsafe { *b_shift.add(p) } as usize;
-                let b_sh_q = unsafe { *b_shift.add(q) } as usize;
-                // The scatter targets `rs + rel` of degree `td` live at
-                // `rs + rel - r_shift[td]` in the result buffer; hoist the
-                // constant part so the inner loop is one add, as before.
-                let r_base = rs - unsafe { *r_shift.add(td) } as usize;
-                // Precomputed tickets (see `sweep_units_serial`): the visit
-                // stream is the presence-resolved subsequence of the span,
-                // orientation flags packed in the top bits — no per-entry
-                // bit tests in the hot loop, identical term computations.
-                for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize] {
-                    let e = (ticket & TICKET_INDEX_MASK) as usize;
-                    let entry = self.entries[e];
-                    // The table's trailing sentinel backs the +1 successor
-                    // (see `sweep_units_serial`).
-                    let next = self.entries[e + 1];
-                    let p_active = ticket & TICKET_P_ACTIVE != 0;
-                    let q_active = ticket & TICKET_Q_ACTIVE != 0;
-                    let (i, j) = (entry.i as usize, entry.j as usize);
-                    // SAFETY: i and j are class positions of degrees p and q;
-                    // the presence tests guarantee they are in the operands'
-                    // supports, whose shift tables map them into the compact
-                    // (or full-d, shift 0) buffers below. `raw_mul` skips the
-                    // float wrappers' per-op NaN checks (raw-float fast path);
-                    // `-` never checks.
-                    let term = unsafe {
-                        if p_active {
-                            let mut t =
-                                raw_mul(&*job.a.add(i - a_sh_p), &*job.b.add(j - b_sh_q));
-                            if q_active {
-                                raw_add_assign(
-                                    &mut t,
-                                    &-raw_mul(&*job.a.add(j - a_sh_q), &*job.b.add(i - b_sh_p)),
-                                );
-                            }
-                            t
-                        } else {
-                            -raw_mul(&*job.a.add(j - a_sh_q), &*job.b.add(i - b_sh_p))
-                        }
-                    };
-                    let from = entry.decomp_start as usize;
-                    let to = next.decomp_start as usize;
-                    for (&rel, c) in self.decomp[from..to].iter().zip(&self.coeffs[from..to]) {
-                        // Raw-pointer accumulate: see the SAFETY note above.
-                        // `raw_add_assign_ptr` skips the float wrappers'
-                        // per-op NaN checks (raw-float fast path).
-                        unsafe {
-                            raw_add_assign_ptr(result.add(r_base + rel as usize), &raw_mul(c, &term));
-                        }
+                let td = w.td as usize;
+                // The class's target word of degree `td` lives at
+                // `w.pos - r_shift[td]` in the compact result buffer.
+                let r_pos = w.pos as usize - unsafe { *r_shift.add(td) } as usize;
+                // SAFETY: the shift tables have >= max_degree+1 entries
+                // and `w.td` is a degree of the table (see the plan); the
+                // class's target position is inside the job's result
+                // buffer (the gating transposes against the working
+                // layout's result space).
+                let mut acc = unsafe { (*result.add(r_pos)).clone() };
+                for &(tp, dp) in &gating.contribs[w.start as usize..w.end as usize] {
+                    // `raw_mul`/`raw_add_assign` skip the float wrappers'
+                    // per-op NaN checks (raw-float fast path).
+                    unsafe {
+                        raw_add_assign(
+                            &mut acc,
+                            &raw_mul(
+                                &self.coeffs[dp as usize],
+                                &*terms_ptr.add(t_off + tp as usize),
+                            ),
+                        );
                     }
                 }
+                // SAFETY: single-writer store (one class, one pack), in
+                // bounds (see above).
+                unsafe { *result.add(r_pos) = acc };
             }
             t = e;
         }
@@ -2353,19 +2463,23 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
     /// lane-typed kernel in [`cohort`] (the stage's `cohort` flag routes
     /// here; the engine that built the stage verified the cohort
     /// capability for `U`). The stage's jobs carry SoA-interleaved
-    /// operand/result pointers; every other plan input (tasks, packs,
+    /// operand/result/term pointers; every other plan input (tasks, packs,
     /// gateways, support lists) is lane-invariant — see the `cohort`
     /// module's docs for the layout and the bit-exactness argument.
     #[inline]
     fn cohort_sweep_pack_range(&self, _s: usize, stage: &ClassBatchStage<'a, U>, pack: usize) {
-        cohort::sweep_pack_range(self.entries, self.decomp, self.coeffs, stage, pack);
+        cohort::sweep_pack_range(self.entries, self.degrees, self.coeffs, stage, pack);
     }
 }
 
 /// Plans the sweep stages for the DAG's dependency levels: per-job gating
-/// from the (fixed) support lists, then balanced class-contiguous pack
-/// cuts. The stages borrow `levels`; a batched fold plans once and reuses
-/// the same stages for every fold in the batch.
+/// from the (fixed) support lists, then TWO stages per level — the term
+/// pass (entry-atomic ticket chunks, streamed in table order) and the
+/// write-access fan-in (word classes, balanced pack cuts) — sharing one
+/// per-level term-buffer allocation. `cohort` builds the 4-lane SoA
+/// variant (term buffers lane-interleaved, stages flagged for the cohort
+/// kernel). The stages borrow `levels`; a batched fold plans once and
+/// reuses the same stages for every fold in the batch.
 ///
 /// `want_scatter_sets` gates the exact per-job batch scatter sets: the
 /// batch path sizes its compact buffers from them, but the per-fold path
@@ -2378,6 +2492,7 @@ pub fn plan_class_sweep_stages<'a, T, U>(
     levels: &'a [Vec<KernelJob<'a, U>>],
     cache: &mut GatingCache,
     want_scatter_sets: bool,
+    cohort: bool,
 ) -> (Vec<ClassBatchStage<'a, U>>, Vec<Vec<Vec<u32>>>)
 where
     T: Clone + Ord + Generator + Hash,
@@ -2396,19 +2511,17 @@ where
         + 'static,
 {
     let threads = rayon::current_num_threads().max(1);
-    let mut stages = Vec::with_capacity(levels.len());
+    let lanes = if cohort { cohort::LANES } else { 1 };
+    let mut stages = Vec::with_capacity(2 * levels.len());
     // The jobs' TRUE batch scatter sets: the class positions each node's
     // sweep writes under its (fixed) operand supports. The recorded node
     // lists are only a union-level fixed point (the batch eligibility
     // checks the union, not each list) — a level-0 job's list, recorded
     // under an earlier, smaller accumulator support, can miss positions
     // the batch's first fold scatters. Compact buffers must therefore be
-    // sized from this exact set, which bounds the sweep's scatter
-    // structurally: every decomp word of an active entry lies in the
-    // entry's target degree slice.
-    let entries_tbl = order.entries_cls();
-    let decomp_tbl = order.decomp_cls();
-    let space = a_series.coefficients.len();
+    // sized from this exact set. Under the write-access division the set
+    // is exact and free: the gating's active word classes ARE the write
+    // set (sorted ascending — the gating emits classes by position).
     let mut scatter_sets: Vec<Vec<Vec<u32>>> =
         Vec::with_capacity(if want_scatter_sets { levels.len() } else { 0 });
     // Pass 1: gate every job up front (the support lists are fixed for the
@@ -2436,87 +2549,63 @@ where
                 .collect()
         })
         .collect();
+    // Planned sweep work per fold: the fan-in's contributions PLUS the
+    // term phase's one-term-per-active-entry pass (both phases' packs are
+    // claimed by the same walk slots).
     let sweep_entries: usize = level_gateways
         .iter()
-        .map(|gateways| gateways.iter().map(|g| g.tickets.len()).sum::<usize>())
+        .map(|gateways| {
+            gateways
+                .iter()
+                .map(|g| g.total_contribs + g.tickets.len())
+                .sum::<usize>()
+        })
         .sum();
     let slots = work_adaptive_slots(threads, usize::MAX, sweep_entries);
     for (level, gateways) in levels.iter().zip(level_gateways) {
         if want_scatter_sets {
-            // Exact scatter sets for this level's jobs (same visit logic as
-            // `sweep_pack_range`: the gating's precomputed tickets — the
-            // presence-resolved, orientation-packed subsequence of each
-            // segment's span — and per-entry decomposition ranges).
-            let mut level_sets: Vec<Vec<u32>> = Vec::with_capacity(level.len());
-            for (ji, _) in level.iter().enumerate() {
-                let gateway = &gateways[ji];
-                let mut seen = vec![false; space];
-                for au in gateway.active.iter() {
-                    let rs = au.rs as usize;
-                    for &ticket in
-                        &gateway.tickets[au.ticket_start as usize..au.ticket_end as usize]
-                    {
-                        let e = (ticket & TICKET_INDEX_MASK) as usize;
-                        let from = entries_tbl[e].decomp_start as usize;
-                        let to = entries_tbl[e + 1].decomp_start as usize;
-                        for &rel in &decomp_tbl[from..to] {
-                            seen[rs + rel as usize] = true;
-                        }
-                    }
-                }
-                level_sets.push(
-                    seen.into_iter()
-                        .enumerate()
-                        .filter(|(_, s)| *s)
-                        .map(|(p, _)| p as u32)
-                        .collect(),
-                );
-            }
+            // Exact scatter sets for this level's jobs: the active word
+            // classes themselves (each class's `pos` is written exactly
+            // once by the sweep, in ascending order).
+            let level_sets: Vec<Vec<u32>> = gateways
+                .iter()
+                .map(|gateway| gateway.words.iter().map(|w| w.pos).collect())
+                .collect();
             scatter_sets.push(level_sets);
         }
-        // Flatten (job, unit) tasks by reference; each node is one anagram
-        // class, so the node-ordered task list is class-contiguous already.
-        let total: usize = gateways.iter().map(|g| g.total_entries).sum();
-        let unit_count: usize = gateways.iter().map(|g| g.active.len()).sum();
-        let mut tasks: Vec<(u32, u32)> = Vec::with_capacity(unit_count);
+        // Flatten (job, word class) tasks: the write-access division's
+        // atomic scheduling units. One class per target word; classes are
+        // emitted per job in target-position order, so the task list is
+        // result-position-ordered per job and any cut between tasks is
+        // race-free (two classes never write the same word).
+        let total: usize = gateways.iter().map(|g| g.total_contribs).sum();
+        let word_count: usize = gateways.iter().map(|g| g.words.len()).sum();
+        let mut tasks: Vec<(u32, u32)> = Vec::with_capacity(word_count);
         for (ji, gating) in gateways.iter().enumerate() {
-            for ui in 0..gating.active.len() {
-                tasks.push((ji as u32, ui as u32));
+            for wi in 0..gating.words.len() {
+                tasks.push((ji as u32, wi as u32));
             }
         }
-        // Balanced prefix cuts at unit boundaries: pack `p` of `p_count`
-        // takes tasks while `cur < total * (p + 1) / p_count`. Packs are
-        // capped by the task count, not the job count: a narrow upper
-        // level's few big jobs must still spread across every slot (units
-        // are conflict-free write regions, and each word's accumulation
-        // sequence stays whole inside whichever pack owns its unit).
+        // Balanced prefix cuts at word-class boundaries: pack `p` of
+        // `p_count` takes tasks while `cur < total * (p + 1) / p_count`.
+        // Packs are capped by the task count, not the job count: a narrow
+        // upper level's few big jobs must still spread across every slot
+        // (word classes are conflict-free write regions, and each word's
+        // accumulation sequence stays whole inside whichever pack owns its
+        // class).
         //
-        // The balance weight is the unit's entry count (its WORK proxy):
-        // the alternative — per-entry decomposition-row totals, O(1) per
-        // unit by telescoping the entries' consecutive `decomp_start`
-        // endpoints — measured no better (it traded small gains on narrow
-        // grids for 3-7% losses on the wide 2x12/3x8 ones), and entry
-        // count is the simpler, previously validated weight.
-        // Packs may only cut AFTER a segment flagged `last_of_unit`: the
-        // segments of one table unit scatter onto the same target words, so
-        // splitting them across packs races the concurrent `+=`s (lost
-        // updates — the nondeterministic divergence the batch used to flake
-        // with). The atomic scheduling unit is therefore the whole unit
-        // bundle, and the pack count is capped by the bundle count, not the
-        // segment count.
-        let bundle_count = gateways
-            .iter()
-            .map(|g| g.active.iter().filter(|au| au.last_of_unit).count())
-            .sum::<usize>();
+        // The balance weight is the class's contribution count (its WORK
+        // proxy: one term computation + one multiply-add each).
+        let class_count = word_count;
         // Smallest work worth splitting a stage's sweep across an extra
-        // pack: below ~8 entries per pack the per-pack claim/gate cost
-        // dominates the pack's compute.
+        // pack: below ~8 contributions per pack the per-pack claim/gate
+        // cost dominates the pack's compute.
         const MIN_PACK_WORK: usize = 8;
         let p_count = slots
-            .min(bundle_count.max(1))
+            .min(class_count.max(1))
             // Work-scaled cap: a stage too small to give every slot a
-            // pack of at least `MIN_PACK_WORK` entries must not spawn
-            // micro-packs — the claim/gate churn outweighs the
+            // pack of at least `MIN_PACK_WORK` contributions must not
+            // spawn micro-packs — the claim/gate churn outweighs the
             // parallelism on narrow grids (e.g. 12x2, whose whole fold is
             // ~66 entries per stage). Balanced bounds below keep the
             // resulting packs even. The leading `slots` cap is the
@@ -2528,11 +2617,11 @@ where
         if p_count > 1 && !tasks.is_empty() {
             let mut start = 0usize;
             let mut cur = 0usize;
-            for (ti, &(ji, ui)) in tasks.iter().enumerate() {
-                let au = &gateways[ji as usize].active[ui as usize];
-                cur += (au.span_end - au.span_start - 1) as usize;
+            for (ti, &(ji, wi)) in tasks.iter().enumerate() {
+                let w = &gateways[ji as usize].words[wi as usize];
+                cur += (w.end - w.start) as usize;
                 let next_bound = total * (packs.len() + 1) / p_count;
-                if cur >= next_bound && ti + 1 < tasks.len() && au.last_of_unit {
+                if cur >= next_bound && ti + 1 < tasks.len() {
                     packs.push((start, ti + 1));
                     start = ti + 1;
                 }
@@ -2541,6 +2630,53 @@ where
         } else if !tasks.is_empty() {
             packs.push((0, tasks.len()));
         }
+        // The level's per-job term buffers: one flat allocation, job j's
+        // tickets at `[offset_j, offset_j + tickets_j)` (lane-scaled for
+        // cohort stages). Phase 1 writes every active ticket position
+        // before the fan-in phase reads any (the stage barrier between
+        // the pair orders them).
+        let mut term_ranges: Vec<(u32, u32)> = Vec::with_capacity(gateways.len());
+        let mut terms_len = 0usize;
+        for g in &gateways {
+            let t = g.tickets.len() * lanes;
+            term_ranges.push((terms_len as u32, t as u32));
+            terms_len += t;
+        }
+        let terms = Arc::new(TermBuffers {
+            data: std::cell::UnsafeCell::new(vec![U::default(); terms_len]),
+            job_ranges: term_ranges,
+        });
+        // TERM stage: (job, chunk start) tasks over ticket chunks of
+        // `TERM_CHUNK` tickets — entry-atomic (distinct ticket positions,
+        // disjoint writes), streamed in table order.
+        let mut term_tasks: Vec<(u32, u32)> = Vec::new();
+        for (ji, g) in gateways.iter().enumerate() {
+            let t = g.tickets.len() as u32;
+            let mut cs = 0u32;
+            while cs < t {
+                term_tasks.push((ji as u32, cs));
+                cs = (cs + TERM_CHUNK as u32).min(t);
+            }
+        }
+        let term_packs = balanced_packs(
+            &term_tasks,
+            |&(ji, cs)| {
+                let t = gateways[ji as usize].tickets.len() as u32;
+                ((cs + TERM_CHUNK as u32).min(t) - cs) as usize
+            },
+            slots,
+        );
+        stages.push(ClassBatchStage {
+            tasks: term_tasks.into(),
+            packs: term_packs.into(),
+            gateways: gateways.clone(),
+            jobs: level.as_slice(),
+            block: None,
+            fold: 0,
+            cohort,
+            phase: StagePhase::Terms,
+            terms: Some(Arc::clone(&terms)),
+        });
         stages.push(ClassBatchStage {
             tasks: tasks.into(),
             packs: packs.into(),
@@ -2548,10 +2684,53 @@ where
             jobs: level.as_slice(),
             block: None,
             fold: 0,
-            cohort: false,
+            cohort,
+            phase: StagePhase::Fanin,
+            terms: Some(terms),
         });
     }
     (stages, scatter_sets)
+}
+
+/// The term stage's ticket-chunk size: one task sweeps this many active
+/// entries' terms. Sized like the fan-in's `MIN_PACK_WORK` break-even —
+/// a chunk is one pack-claim's worth of sequential table streaming.
+const TERM_CHUNK: usize = 2048;
+
+/// Balanced prefix pack cuts over `tasks` with per-task weights: pack `p`
+/// of `p_count` takes tasks while the running weight is below
+/// `total * (p + 1) / p_count`. Any task boundary is a legal cut (both
+/// sweep phases' tasks are single-writer regions: ticket chunks and word
+/// classes respectively).
+fn balanced_packs(
+    tasks: &[(u32, u32)],
+    weight: impl Fn(&(u32, u32)) -> usize,
+    slots: usize,
+) -> Vec<(usize, usize)> {
+    let total: usize = tasks.iter().map(&weight).sum();
+    // Smallest work worth splitting a stage across an extra pack: below
+    // ~8 weighted units per pack the per-pack claim/gate cost dominates.
+    const MIN_PACK_WORK: usize = 8;
+    let p_count = slots
+        .min(total.div_ceil(MIN_PACK_WORK).max(1))
+        .max(1);
+    let mut packs: Vec<(usize, usize)> = Vec::with_capacity(p_count);
+    if p_count > 1 && !tasks.is_empty() {
+        let mut start = 0usize;
+        let mut cur = 0usize;
+        for (ti, task) in tasks.iter().enumerate() {
+            cur += weight(task);
+            let next_bound = total * (packs.len() + 1) / p_count;
+            if cur >= next_bound && ti + 1 < tasks.len() {
+                packs.push((start, ti + 1));
+                start = ti + 1;
+            }
+        }
+        packs.push((start, tasks.len()));
+    } else if !tasks.is_empty() {
+        packs.push((0, tasks.len()));
+    }
+    packs
 }
 
 /// The slot policy's work quantum, in planned active-entry tickets per
@@ -2590,7 +2769,14 @@ pub fn planned_sweep_entries<U>(stages: &[&ClassBatchStage<'_, U>]) -> usize {
         .iter()
         .map(|s| match s.block {
             Some(_) => 0,
-            None => s.gateways.iter().map(|g| g.tickets.len()).sum::<usize>(),
+            None => s
+                .gateways
+                .iter()
+                .map(|g| match s.phase {
+                    StagePhase::Terms => g.tickets.len(),
+                    StagePhase::Fanin => g.total_contribs,
+                })
+                .sum::<usize>(),
         })
         .sum()
 }
@@ -2604,7 +2790,14 @@ fn planned_stage_entries<U>(stages: &[&ClassBatchStage<'_, U>]) -> usize {
         .iter()
         .map(|s| match s.block {
             Some(_) => s.packs.len(),
-            None => s.gateways.iter().map(|g| g.tickets.len()).sum::<usize>(),
+            None => s
+                .gateways
+                .iter()
+                .map(|g| match s.phase {
+                    StagePhase::Terms => g.tickets.len(),
+                    StagePhase::Fanin => g.total_contribs,
+                })
+                .sum::<usize>(),
         })
         .sum()
 }
@@ -2701,7 +2894,7 @@ pub fn run_class_batch_with_work<T, U>(
     let walk = FoldWalk {
         stages,
         entries: order.entries_cls(),
-        decomp: order.decomp_cls(),
+        degrees: order.degree_cls(),
         coeffs: a_series.feasible_decompositions.decomp_coeffs(),
     };
 
@@ -2867,7 +3060,7 @@ pub fn commutator_coefficients_class_fold_with_cache<T, U>(
     // sizes compact buffers from them): skip their exact-set computation —
     // the gating and pack cuts the sweep actually reads are unchanged.
     let (stages, _scatter_sets) =
-        plan_class_sweep_stages(a_series, order, levels, cache, false);
+        plan_class_sweep_stages(a_series, order, levels, cache, false, false);
     let stage_refs: Vec<&ClassBatchStage<U>> = stages.iter().collect();
     // One fold unit: the stage chain is a single fold's sweep stages, so
     // the slot policy sees the fold's own planned work.
@@ -2903,43 +3096,6 @@ impl ScatterSink for CollectSink<'_> {
             *word |= bit;
             self.out.push(index);
         }
-    }
-}
-
-/// Maps internal-layout scatter indices to public basis indices before
-/// handing them to the inner sink.
-pub(crate) struct TranslateSink<'a, S> {
-    perm: &'a [u32],
-    inner: S,
-}
-
-impl<S: ScatterSink> ScatterSink for TranslateSink<'_, S> {
-    #[inline(always)]
-    fn scatter(&mut self, index: usize) {
-        self.inner.scatter(self.perm[index] as usize);
-    }
-}
-
-fn scatter_decomposition<U: Clone + Mul<Output = U> + AddAssign + 'static, S: ScatterSink>(
-    basis_indices: &[u32],
-    basis_coefficients: &[U],
-    t: &U,
-    result: &mut [U],
-    block_start: usize,
-    sink: &mut S,
-) {
-    // SAFETY: `basis_index` is relative to the result slice handed in — for
-    // the commutation kernel, the degree-`target` slice of the full result —
-    // and comes from the structure-constant table built in `LieSeries::new`,
-    // so it is always < result.len() for the duration of the call.
-    for (&basis_index, basis_coefficient) in basis_indices.iter().zip(basis_coefficients) {
-        sink.scatter(block_start + basis_index as usize);
-        // `raw_mul`/`raw_add_assign` skip the float wrappers' per-op NaN
-        // checks (raw-float fast path, see `raw_mul`'s NaN policy).
-        raw_add_assign(
-            unsafe { result.get_unchecked_mut(basis_index as usize) },
-            &raw_mul(basis_coefficient, t),
-        );
     }
 }
 
@@ -3050,47 +3206,24 @@ impl<
             .degree_start(a_series.max_degree);
         let gating = Self::kernel_prologue(a_series, a_nonzero, b_nonzero);
         let table = &a_series.feasible_decompositions;
-        match table.cached_class_order() {
-            None => Self::sweep_units_serial(
-                a_series,
-                a_coefficients,
-                b_coefficients,
-                &gating,
-                result_coefficients,
-                table.entries(),
-                table.decomp_indices_rel(),
-                &mut CollectSink {
-                    dirty,
-                    out: targets,
-                    cutoff,
-                },
-            ),
-            Some(co) => {
-                // Sweep into the class-contiguous layout, then permute to
-                // public order; the sink reports public basis indices.
-                let mut scratch = vec![U::default(); result_coefficients.len()];
-                Self::sweep_units_serial(
-                    a_series,
-                    a_coefficients,
-                    b_coefficients,
-                    &gating,
-                    &mut scratch,
-                    table.entries(),
-                    co.decomp_cls(),
-                    &mut TranslateSink {
-                        perm: co.perm(),
-                        inner: CollectSink {
-                            dirty,
-                            out: targets,
-                            cutoff,
-                        },
-                    },
-                );
-                for (k, &src) in co.inv().iter().enumerate() {
-                    result_coefficients[k] = scratch[src as usize].clone();
-                }
-            }
-        }
+        // The gating's word classes carry public positions: one single-writer
+        // store per word, straight into the public result buffer (the old
+        // class-scratch + permutation detour densified a scatter of repeated
+        // `+=`s — one store per word needs no densifying). The sink reports
+        // public basis indices directly.
+        Self::sweep_words_serial(
+            a_series,
+            a_coefficients,
+            b_coefficients,
+            &gating,
+            result_coefficients,
+            table.entries(),
+            &mut CollectSink {
+                dirty,
+                out: targets,
+                cutoff,
+            },
+        );
     }
 
     /// Class-contiguous variant of
@@ -3123,14 +3256,13 @@ impl<
             order,
             &mut GatingCache::default(),
         );
-        LieSeries::sweep_units_serial(
+        LieSeries::sweep_words_serial(
             a_series,
             a_coefficients,
             b_coefficients,
             &gating,
             result_coefficients,
             order.entries_cls(),
-            order.decomp_cls(),
             &mut CollectSink {
                 dirty,
                 out: targets,
@@ -3186,78 +3318,91 @@ impl<
         // Full-support fast path: the nonzero lists are sorted and deduped
         // over `0..cutoff` (the degree-`max_degree` words are filtered
         // upstream), so covering the cutoff means covering every index the
-        // sweep can ever test. Presence is all-ones, both orientations are
-        // on for every unit, and the active-segment and ticket lists are
-        // the table's precomputed full-support gating — no per-index scan,
-        // no gating walk.
+        // sweep can ever test. Presence is all-ones, both orientations on
+        // for every entry, and the per-word transposition is the table's
+        // lazily-built, cached full-support form — the steady state's
+        // gating is an Arc clone, not a walk.
         let cutoff = table.degree_start(table.max_degree());
         if a_nonzero.len() == cutoff && b_nonzero.len() == cutoff {
-            let (active, tickets) = table.full_support_gating();
+            let (words, contribs, tickets) = table.full_support_gating_public();
             return KernelGating {
-                active,
+                total_contribs: contribs.len(),
+                words,
+                contribs,
                 tickets,
-                total_entries: table.len(),
             };
         }
 
         // Memoized gating keyed by the exact support lists (see
-        // `GatingCache`): the fingerprint pass replaces the old per-call
-        // presence-bitset build, so on a hit neither the bitsets nor the
-        // per-entry presence tests run at all.
+        // `GatingCache`): on a hit neither the bitsets, the per-entry
+        // presence tests, nor the per-word transposition run at all.
         let key = (
             Self::support_fingerprint(a_nonzero),
             Self::support_fingerprint(b_nonzero),
         );
-        let (active, tickets, total_entries) = match cache.get(key) {
-            Some((active, tickets, total)) => (active.clone(), tickets.clone(), *total),
-            None => {
-                // Fresh gating: presence bitsets drive the per-entry ticket
-                // flags, degree-support masks the run-level gating. A
-                // unit's entries are grouped into contiguous p-runs
-                // (entries are sorted `(p, q, i, j)` within the unit and
-                // `q = target - p` is forced), and a run is kept only when
-                // its own `(p, target - p)` degree pair is supported —
-                // unit-level gating would drag every other p's entries
-                // through tests that always fail. Surviving runs carry
-                // their pre-packed spans, orientation flags, and resolved
-                // per-entry ticket list so neither sweep re-derives
-                // anything.
-                let words = a_series.basis.len().div_ceil(64);
-                let mut presence = vec![0u64; 2 * words];
-                let (a_present, b_present) = presence.split_at_mut(words);
-                let mut a_deg = [0u64; 2];
-                let mut b_deg = [0u64; 2];
-                for &i in a_nonzero {
-                    a_present[i / 64] |= 1u64 << (i % 64);
-                    let d = table.degree_of(i);
-                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
-                    a_deg[d / 64] |= 1u64 << (d % 64);
-                }
-                for &j in b_nonzero {
-                    b_present[j / 64] |= 1u64 << (j % 64);
-                    let d = table.degree_of(j);
-                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
-                    b_deg[d / 64] |= 1u64 << (d % 64);
-                }
-                let value = Self::build_gating(
-                    table,
-                    table.entries(),
-                    table.entries(),
-                    a_present,
-                    b_present,
-                    a_deg,
-                    b_deg,
-                );
-                cache.insert(key, value.clone());
-                value
-            }
-        };
-
-        KernelGating {
-            active,
-            tickets,
-            total_entries,
+        if let Some((words, contribs, tickets, total)) = cache.get(key) {
+            return KernelGating {
+                words: words.clone(),
+                contribs: contribs.clone(),
+                tickets: tickets.clone(),
+                total_contribs: *total,
+            };
         }
+        // Fresh gating: presence bitsets drive the per-entry ticket
+        // flags, degree-support masks the run-level gating. A unit's
+        // entries are grouped into contiguous p-runs (entries are sorted
+        // `(p, q, i, j)` within the unit and `q = target - p` is forced),
+        // and a run is kept only when its own `(p, target - p)` degree
+        // pair is supported — unit-level gating would drag every other p's
+        // entries through tests that always fail. Surviving entries carry
+        // pre-packed orientation flags, and the run walk simultaneously
+        // transposes every active contribution into its target word's
+        // write class, so neither sweep re-derives anything.
+        let words = a_series.basis.len().div_ceil(64);
+        let mut presence = vec![0u64; 2 * words];
+        let (a_present, b_present) = presence.split_at_mut(words);
+        let mut a_deg = [0u64; 2];
+        let mut b_deg = [0u64; 2];
+        for &i in a_nonzero {
+            a_present[i / 64] |= 1u64 << (i % 64);
+            let d = table.degree_of(i);
+            debug_assert!(d < 128, "degree masks cover degrees 0..127");
+            a_deg[d / 64] |= 1u64 << (d % 64);
+        }
+        for &j in b_nonzero {
+            b_present[j / 64] |= 1u64 << (j % 64);
+            let d = table.degree_of(j);
+            debug_assert!(d < 128, "degree masks cover degrees 0..127");
+            b_deg[d / 64] |= 1u64 << (d % 64);
+        }
+        let value = Self::build_gating(
+            table,
+            table.entries(),
+            table.entries(),
+            table.decomp_indices_rel(),
+            table.index_degrees(),
+            a_series.coefficients.len(),
+            a_present,
+            b_present,
+            a_deg,
+            b_deg,
+        );
+        let KernelGating {
+            ref words,
+            ref contribs,
+            ref tickets,
+            total_contribs,
+        } = value;
+        cache.insert(
+            key,
+            (
+                Arc::clone(words),
+                Arc::clone(contribs),
+                Arc::clone(tickets),
+                total_contribs,
+            ),
+        );
+        value
     }
 
     /// 128-bit fingerprint of a support list, the gating cache's key half.
@@ -3286,37 +3431,46 @@ impl<
     }
 
     /// Walks the decomposition table's units once and resolves the gating
-    /// for the given presence bitsets and degree-support masks: the active
-    /// run list plus the flat per-entry ticket list. Shared by both
-    /// prologue variants. `entries` (public i/j) drives the p-run walk's
-    /// degree lookups — degrees are layout-independent — while
-    /// `presence_entries` must carry the i/j relabeling that matches the
-    /// presence bitsets' index space (public entries for the public
-    /// prologue, the class-order's relabeled table for the class one). The
-    /// two tables share order, index space, and `decomp_start`s, so the
-    /// ticket's entry index is layout-independent either way.
+    /// for the given presence bitsets and degree-support masks: the flat
+    /// per-entry ticket list (orientation bits packed) plus, in the same
+    /// walk, the per-word transposition of every active contribution into
+    /// its target word's write class. Shared by both prologue variants.
+    ///
+    /// `entries` (public i/j) drives the p-run walk's degree lookups —
+    /// degrees are layout-independent — while `presence_entries` must
+    /// carry the i/j relabeling that matches the presence bitsets' index
+    /// space (public entries for the public prologue, the class-order's
+    /// relabeled table for the class one). The two tables share order,
+    /// index space, and `decomp_start`s, so the ticket's entry index is
+    /// layout-independent either way. `decomp_tbl`/`pos_degree` are the
+    /// working layout's scatter indices and position→degree map, and
+    /// `space` is the result buffer's position count.
     fn build_gating(
         table: &FeasibleDecompositions<U>,
         entries: &[Entry],
         presence_entries: &[Entry],
+        decomp_tbl: &[u32],
+        pos_degree: &[u8],
+        space: usize,
         a_present: &[u64],
         b_present: &[u64],
         a_deg: [u64; 2],
         b_deg: [u64; 2],
-    ) -> (Arc<[ActiveSegment]>, Arc<[u32]>, usize) {
+    ) -> KernelGating {
         debug_assert!(
             table.len() < (1 << 30),
             "entry indices must fit a ticket's 30 bits"
         );
-        let mut active: Vec<ActiveSegment> = Vec::new();
         let mut tickets: Vec<u32> = Vec::new();
-        let mut total_entries = 0usize;
+        // Active contributions in table-entry order: (target position,
+        // ticket index, flat decomp position). The transposition below
+        // sorts them by target position, stable per position.
+        let mut items: Vec<(u32, u32, u32)> = Vec::new();
         for unit in table.units().iter() {
             let t = unit.target as usize;
-            let (rs, re) = table.degree_range(unit.target);
+            let rs = table.degree_start(unit.target as usize);
             let mut run_start = unit.start;
             let mut cur_p = u8::MAX;
-            let mut last_active = usize::MAX;
             // Real entries only: `unit.end` is the trailing sentinel's
             // slot (its decomp_start closes the last run's last
             // decomposition range via the +1 span).
@@ -3326,60 +3480,113 @@ impl<
                     continue;
                 }
                 if cur_p != u8::MAX {
-                    total_entries += Self::push_run(
-                        entries,
+                    Self::push_run(
                         presence_entries,
+                        decomp_tbl,
                         a_present,
                         b_present,
-                        &mut active,
                         &mut tickets,
+                        &mut items,
                         a_deg,
                         b_deg,
                         cur_p,
                         t,
-                        rs,
-                        re,
+                        rs as u32,
                         run_start,
                         ei,
-                        &mut last_active,
                     );
                 }
                 cur_p = p;
                 run_start = ei;
             }
             if cur_p != u8::MAX {
-                total_entries += Self::push_run(
-                    entries,
+                Self::push_run(
                     presence_entries,
+                    decomp_tbl,
                     a_present,
                     b_present,
-                    &mut active,
                     &mut tickets,
+                    &mut items,
                     a_deg,
                     b_deg,
                     cur_p,
                     t,
-                    rs,
-                    re,
+                    rs as u32,
                     run_start,
                     unit.end,
-                    &mut last_active,
                 );
             }
-            if last_active != usize::MAX {
-                active[last_active].last_of_unit = true;
+        }
+        Self::transpose_gating(items, tickets, pos_degree, space)
+    }
+
+    /// Stable counting sort of the walk's contributions by target
+    /// position, producing the active word classes and their flat
+    /// `(ticket, decomp position)` contribution list. Stability preserves
+    /// each word's table-entry accumulation order — exactly the serial
+    /// sweep's per-word float summation order — and sorting by position
+    /// gives sweeps sequential stores.
+    fn transpose_gating(
+        items: Vec<(u32, u32, u32)>,
+        tickets: Vec<u32>,
+        pos_degree: &[u8],
+        space: usize,
+    ) -> KernelGating {
+        // counts[p + 1] = number of contributions with target position <= p
+        // after the prefix scan; counts[p] is then word p's range start.
+        let mut counts = vec![0u32; space + 1];
+        for &(pos, _, _) in &items {
+            debug_assert!(
+                (pos as usize) < space,
+                "contribution target {} outside the result space ({space})",
+                pos
+            );
+            counts[pos as usize + 1] += 1;
+        }
+        for k in 1..=space {
+            counts[k] += counts[k - 1];
+        }
+        let mut contribs = vec![(0u32, 0u32); items.len()];
+        let mut cursor = counts.clone();
+        for &(pos, ticket_idx, decomp_pos) in &items {
+            let slot = cursor[pos as usize] as usize;
+            // Store the ticket POSITION: the two-phase sweep resolves the
+            // term through the phase-1 terms buffer (indexed by ticket
+            // position), not through the ticket value.
+            contribs[slot] = (ticket_idx, decomp_pos);
+            cursor[pos as usize] += 1;
+        }
+        // Active word classes: one per word with at least one active
+        // contribution. Positions are ascending, so `words` is sorted by
+        // `pos` and the ranges are disjoint and contiguous.
+        let mut words: Vec<WordClass> = Vec::new();
+        for p in 0..space {
+            let (start, end) = (counts[p], counts[p + 1]);
+            if end > start {
+                words.push(WordClass {
+                    pos: p as u32,
+                    td: pos_degree[p],
+                    start,
+                    end,
+                });
             }
         }
-        (Arc::from(active), Arc::from(tickets), total_entries)
+        KernelGating {
+            words: Arc::from(words),
+            contribs: Arc::from(contribs),
+            tickets: Arc::from(tickets),
+            total_contribs: items.len(),
+        }
     }
     /// Class-space variant of [`Self::kernel_prologue_cached`]: the
     /// support lists are class-indexed, so the presence bitsets are
-    /// class-positioned and the degree masks read through the ordering's
-    /// relabeled degree table. The memo key — the exact class-indexed
-    /// support lists — is the class-space image of the public variant's, so
-    /// each working mode resolves its own gating entries (the cached
-    /// active-segment spans and ticket indices are layout-independent and
-    /// would in fact be identical).
+    /// class-positioned, the degree masks read through the ordering's
+    /// relabeled degree table, and the per-word transposition targets
+    /// class positions. The memo key — the exact class-indexed support
+    /// lists — is the class-space image of the public variant's, so each
+    /// working mode resolves its own gating entries (the class order is a
+    /// pure function of the basis, so the two modes' transpositions are
+    /// the same permutation apart).
     fn kernel_prologue_cached_class(
         a_series: &LieSeries<T, U>,
         a_nonzero_cls: &[usize],
@@ -3389,99 +3596,114 @@ impl<
     ) -> KernelGating {
         let table = &a_series.feasible_decompositions;
 
+        // Full-support fast path (class space): same cutoff logic as the
+        // public prologue, transposition cached on the ordering.
         let cutoff = table.degree_start(table.max_degree());
         if a_nonzero_cls.len() == cutoff && b_nonzero_cls.len() == cutoff {
-            let (active, tickets) = table.full_support_gating();
+            let (words, contribs, tickets) = order.full_support_gating_class(table);
             return KernelGating {
-                active,
+                total_contribs: contribs.len(),
+                words,
+                contribs,
                 tickets,
-                total_entries: table.len(),
             };
         }
+
         let key = (
             Self::support_fingerprint(a_nonzero_cls),
             Self::support_fingerprint(b_nonzero_cls),
         );
-        let (active, tickets, total_entries) = match cache.get(key) {
-            Some((active, tickets, total)) => (active.clone(), tickets.clone(), *total),
-            None => {
-                // Class-positioned presence bitsets (indexed by class
-                // positions) and relabeled degrees; the rest of the gating
-                // walk is shared with the public prologue (see
-                // `build_gating`).
-                let words = a_series.basis.len().div_ceil(64);
-                let mut presence = vec![0u64; 2 * words];
-                let (a_present, b_present) = presence.split_at_mut(words);
-                let mut a_deg = [0u64; 2];
-                let mut b_deg = [0u64; 2];
-                for &i in a_nonzero_cls {
-                    a_present[i / 64] |= 1u64 << (i % 64);
-                    let d = order.degree_cls()[i] as usize;
-                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
-                    a_deg[d / 64] |= 1u64 << (d % 64);
-                }
-                for &j in b_nonzero_cls {
-                    b_present[j / 64] |= 1u64 << (j % 64);
-                    let d = order.degree_cls()[j] as usize;
-                    debug_assert!(d < 128, "degree masks cover degrees 0..127");
-                    b_deg[d / 64] |= 1u64 << (d % 64);
-                }
-                let value = Self::build_gating(
-                    table,
-                    table.entries(),
-                    order.entries_cls(),
-                    a_present,
-                    b_present,
-                    a_deg,
-                    b_deg,
-                );
-                cache.insert(key, value.clone());
-                value
-            }
-        };
-
-        KernelGating {
-            active,
-            tickets,
-            total_entries,
+        if let Some((words, contribs, tickets, total)) = cache.get(key) {
+            return KernelGating {
+                words: words.clone(),
+                contribs: contribs.clone(),
+                tickets: tickets.clone(),
+                total_contribs: *total,
+            };
         }
+        // Class-positioned presence bitsets (indexed by class positions)
+        // and relabeled degrees; the rest of the gating walk is shared
+        // with the public prologue (see `build_gating`).
+        let words = a_series.basis.len().div_ceil(64);
+        let mut presence = vec![0u64; 2 * words];
+        let (a_present, b_present) = presence.split_at_mut(words);
+        let mut a_deg = [0u64; 2];
+        let mut b_deg = [0u64; 2];
+        for &i in a_nonzero_cls {
+            a_present[i / 64] |= 1u64 << (i % 64);
+            let d = order.degree_cls()[i] as usize;
+            debug_assert!(d < 128, "degree masks cover degrees 0..127");
+            a_deg[d / 64] |= 1u64 << (d % 64);
+        }
+        for &j in b_nonzero_cls {
+            b_present[j / 64] |= 1u64 << (j % 64);
+            let d = order.degree_cls()[j] as usize;
+            debug_assert!(d < 128, "degree masks cover degrees 0..127");
+            b_deg[d / 64] |= 1u64 << (d % 64);
+        }
+        let value = Self::build_gating(
+            table,
+            table.entries(),
+            order.entries_cls(),
+            order.decomp_cls(),
+            order.degree_cls(),
+            a_series.coefficients.len(),
+            a_present,
+            b_present,
+            a_deg,
+            b_deg,
+        );
+        let KernelGating {
+            ref words,
+            ref contribs,
+            ref tickets,
+            total_contribs,
+        } = value;
+        cache.insert(
+            key,
+            (
+                Arc::clone(words),
+                Arc::clone(contribs),
+                Arc::clone(tickets),
+                total_contribs,
+            ),
+        );
+        value
     }
     /// Resolves one maximal p-run of a unit: run-level gating on the
     /// degree-support masks, then the per-entry presence tests whose
-    /// results become the run's packed tickets. Tickets are built in table
-    /// order — the ticket list is a subsequence of the entry stream, so
-    /// per-word float summation order is provably unchanged. Returns the
-    /// run's table-entry count for the gating's visited-entry total (the
-    /// pack planner's balance weight).
+    /// results become the run's packed tickets — and, in the same walk,
+    /// each active entry's decomposition row is transposed into its
+    /// targets' write-class items. Tickets and items are built in table
+    /// order, so each word's contribution sequence is a subsequence of the
+    /// entry stream in table order: per-word float summation order is
+    /// provably unchanged.
     #[allow(clippy::too_many_arguments)]
     fn push_run(
-        entries: &[Entry],
         presence_entries: &[Entry],
+        decomp_tbl: &[u32],
         a_present: &[u64],
         b_present: &[u64],
-        active: &mut Vec<ActiveSegment>,
         tickets: &mut Vec<u32>,
+        items: &mut Vec<(u32, u32, u32)>,
         a_deg: [u64; 2],
         b_deg: [u64; 2],
         p: u8,
         t: usize,
-        rs: usize,
-        re: usize,
+        rs: u32,
         run_start: u32,
         run_end: u32,
-        last_active: &mut usize,
-    ) -> usize {
+    ) {
         let pu = p as usize;
         let qu = t - pu;
         let o1 = a_deg[pu / 64] >> (pu % 64) & 1 != 0 && b_deg[qu / 64] >> (qu % 64) & 1 != 0;
         let o2 = b_deg[pu / 64] >> (pu % 64) & 1 != 0 && a_deg[qu / 64] >> (qu % 64) & 1 != 0;
         if !o1 && !o2 {
-            return 0;
+            return;
         }
         // The same bitmap expressions the sweeps used to re-evaluate per
         // kernel call, resolved once here: `o1`/`o2` ANDed in identically,
         // presence tested per index.
-        let ticket_start = tickets.len() as u32;
         for ei in run_start..run_end {
             // i/j in the presence bitsets' index space (public for the
             // public prologue, class positions for the class one).
@@ -3496,59 +3718,45 @@ impl<
             if !p_active && !q_active {
                 continue;
             }
+            let ticket_idx = tickets.len() as u32;
             tickets.push(
                 ei | if p_active { TICKET_P_ACTIVE } else { 0 }
                     | if q_active { TICKET_Q_ACTIVE } else { 0 },
             );
+            // Transpose the entry's row into its targets' write classes:
+            // one item per (active entry, row element), in row order.
+            let from = entry.decomp_start as usize;
+            let to = presence_entries[ei as usize + 1].decomp_start as usize;
+            for (k, &rel) in decomp_tbl[from..to].iter().enumerate() {
+                items.push((rs + rel, ticket_idx, (from + k) as u32));
+            }
         }
-        *last_active = active.len();
-        active.push(ActiveSegment {
-            span_start: run_start,
-            span_end: run_end + 1,
-            ticket_start,
-            ticket_end: tickets.len() as u32,
-            rs: rs as u32,
-            re: re as u32,
-            last_of_unit: false,
-            p,
-            td: t as u8,
-        });
-        (run_end - run_start) as usize
     }
-    fn sweep_units_serial<S: ScatterSink>(
+    fn sweep_words_serial<S: ScatterSink>(
         a_series: &LieSeries<T, U>,
         a_coefficients: &[U],
         b_coefficients: &[U],
         gating: &KernelGating,
         result_coefficients: &mut [U],
         entries: &[Entry],
-        decomp_indices: &[u32],
         sink: &mut S,
     ) {
-        let table = &a_series.feasible_decompositions;
-        let decomp_coefficients = table.decomp_coeffs();
-        for au in gating.active.iter() {
-            let result = &mut result_coefficients[au.rs as usize..au.re as usize];
-            // The gating's precomputed tickets: the span's entries that
-            // pass this job's presence tests, in table order, with the
-            // resolved orientation packed in the top two bits. Iterating
-            // the ticket list instead of re-testing every table entry
-            // removes the 4 bit tests + entry loads + branch from the hot
-            // loop; the visit order is a subsequence of the old one, and
-            // skipped entries scattered nothing, so per-word float
-            // summation order is unchanged.
-            for &ticket in &gating.tickets[au.ticket_start as usize..au.ticket_end as usize] {
+        let decomp_coefficients = a_series.feasible_decompositions.decomp_coeffs();
+        // Phase 1: one term per ACTIVE ENTRY, streamed in table order (the
+        // ticket list is a subsequence of the entry stream, so this keeps
+        // the entry table's natural read locality) and stored densely.
+        // Multi-target entries (over half of a real table) compute their
+        // term exactly once.
+        let terms: Vec<U> = gating
+            .tickets
+            .iter()
+            .map(|&ticket| {
                 let e = (ticket & TICKET_INDEX_MASK) as usize;
                 let entry = entries[e];
-                // The table's trailing sentinel backs the +1 successor:
-                // ticket indices are real entries, so `e + 1` is in bounds
-                // and closes the decomposition range exactly as the old
-                // span zip did.
-                let next = entries[e + 1];
                 let p_active = ticket & TICKET_P_ACTIVE != 0;
                 let q_active = ticket & TICKET_Q_ACTIVE != 0;
                 let (i, j) = (entry.i as usize, entry.j as usize);
-                let term = if p_active {
+                if p_active {
                     let mut t = raw_mul(&a_coefficients[i], &b_coefficients[j]);
                     if q_active {
                         raw_add_assign(
@@ -3561,18 +3769,33 @@ impl<
                     // Orientation (a = j, b = i) only: `[basis[j], basis[i]]`
                     // is the negation of the stored decomposition.
                     -raw_mul(&a_coefficients[j], &b_coefficients[i])
-                };
-                let from = entry.decomp_start as usize;
-                let to = next.decomp_start as usize;
-                scatter_decomposition(
-                    &decomp_indices[from..to],
-                    &decomp_coefficients[from..to],
-                    &term,
-                    result,
-                    au.rs as usize,
-                    sink,
+                }
+            })
+            .collect();
+        // Phase 2: the write-access fan-in. Each word class sums its
+        // contributions (table-entry order — exactly the serial scatter's
+        // per-word `+=` sequence) into a local, starting from the buffer's
+        // current value (callers zero their buffers; accumulate-into
+        // semantics are preserved), and stores ONCE. One single-writer
+        // store per word; the class's target never touched by another
+        // class.
+        for w in gating.words.iter() {
+            let pos = w.pos as usize;
+            let mut acc = result_coefficients[pos].clone();
+            for &(tp, dp) in &gating.contribs[w.start as usize..w.end as usize] {
+                // `raw_mul`/`raw_add_assign` skip the float wrappers'
+                // per-op NaN checks (raw-float fast path, see `raw_mul`'s
+                // NaN policy).
+                raw_add_assign(
+                    &mut acc,
+                    &raw_mul(
+                        &decomp_coefficients[dp as usize],
+                        &terms[tp as usize],
+                    ),
                 );
             }
+            result_coefficients[pos] = acc;
+            sink.scatter(pos);
         }
     }
 
@@ -4065,6 +4288,497 @@ mod test {
         }
     }
 
+    /// ADVERSARIAL (write-access division): the gating's per-word
+    /// transposition must be LOSSLESS and TABLE-ORDERED — every active
+    /// (entry, row element) contribution lands in exactly one word class,
+    /// targeting the word its row element names, with the class's
+    /// contributions in table-entry order (the bit-identicality contract),
+    /// classes sorted by target position, and degrees consistent with the
+    /// position. A misbucketed, lost, duplicated, or reordered contribution
+    /// fails here with a distinct message per invariant.
+    #[test]
+    fn write_class_gating_transposition_is_lossless_and_ordered() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use ordered_float::NotNan;
+
+        use super::ClassOrderedCommutation;
+
+        for (d, m) in [(2usize, 4usize), (3usize, 5usize), (3usize, 8usize)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let len = words.len();
+            let series: LieSeries<u8, NotNan<f64>> = LieSeries::new(
+                words.clone(),
+                (0..len)
+                    .map(|i| NotNan::new(((i % 7 + 1) as f64) / 5.0 - 0.7).unwrap())
+                    .collect(),
+            );
+            let table = &series.feasible_decompositions;
+            let entries = table.entries();
+            let decomp = table.decomp_indices_rel();
+            let degrees = table.index_degrees();
+            let order = series.class_order();
+
+            // Independent support pairs: full, one-sided, random halves,
+            // single letters, empty.
+            let cutoff = table.degree_start(table.max_degree());
+            let mut support_sets: Vec<Vec<usize>> = vec![Vec::new()];
+            support_sets.push((0..cutoff).collect());
+            support_sets.push((0..cutoff).filter(|i| i % 2 == 0).collect());
+            support_sets.push((0..cutoff).filter(|i| i % 3 != 1).collect());
+            support_sets.push((0..cutoff).filter(|i| degrees[*i] == 1).collect());
+            support_sets.push(vec![0]);
+
+            for a_support in &support_sets {
+                for b_support in &support_sets {
+                    // Independent active-contribution walk over the table,
+                    // in table-entry order: presence straight from the
+                    // support lists (degree-mask gating is implied by
+                    // membership).
+                    let present = |s: &[usize]| {
+                        let mut p = vec![false; len];
+                        for &i in s {
+                            p[i] = true;
+                        }
+                        p
+                    };
+                    let (ap, bp) = (present(a_support), present(b_support));
+                    let mut expected: Vec<(usize, usize, usize)> = Vec::new(); // (pos, entry, dp)
+                    for (ei, entry) in entries[..entries.len() - 1].iter().enumerate() {
+                        let (i, j) = (entry.i as usize, entry.j as usize);
+                        let p_active = ap[i] && bp[j];
+                        let q_active = ap[j] && bp[i];
+                        if !p_active && !q_active {
+                            continue;
+                        }
+                        let from = entry.decomp_start as usize;
+                        let to = entries[ei + 1].decomp_start as usize;
+                        let rs = table.degree_start(degrees[i] as usize + degrees[j] as usize);
+                        for (k, &rel) in decomp[from..to].iter().enumerate() {
+                            expected.push((rs + rel as usize, ei, from + k));
+                        }
+                    }
+
+                    // Public-mode gating: positions are public basis
+                    // indices.
+                    let mut cache = GatingCache::default();
+                    let gating = LieSeries::<u8, NotNan<f64>>::kernel_prologue_cached(
+                        &series,
+                        a_support,
+                        b_support,
+                        &mut cache,
+                    );
+                    let ctx = "public";
+                    let mut total = 0usize;
+                    let mut last_pos = None::<u32>;
+                    let mut seen: Vec<(usize, usize)> = Vec::new();
+                    for w in gating.words.iter() {
+                        assert!(
+                            last_pos.is_none_or(|prev| prev < w.pos),
+                            "{ctx}: word classes not sorted ascending by position"
+                        );
+                        last_pos = Some(w.pos);
+                        assert_eq!(
+                            degrees[w.pos as usize], w.td,
+                            "{ctx}: class {} degree mismatch", w.pos
+                        );
+                        assert!(
+                            w.end > w.start,
+                            "{ctx}: empty class emitted at position {}",
+                            w.pos
+                        );
+                        let mut last_entry = None::<usize>;
+                        for &(tp, dp) in
+                            &gating.contribs[w.start as usize..w.end as usize]
+                        {
+                            let ticket = gating.tickets[tp as usize];
+                            let ei = (ticket & TICKET_INDEX_MASK) as usize;
+                            let entry = entries[ei];
+                            let (i, j) = (entry.i as usize, entry.j as usize);
+                            // Orientation bits must match the independent
+                            // presence resolution for this entry.
+                            let want_p = ap[i] && bp[j];
+                            let want_q = ap[j] && bp[i];
+                            assert_eq!(
+                                ticket & TICKET_P_ACTIVE != 0,
+                                want_p,
+                                "{ctx}: p_active flag mismatch at entry {ei}"
+                            );
+                            assert_eq!(
+                                ticket & TICKET_Q_ACTIVE != 0,
+                                want_q,
+                                "{ctx}: q_active flag mismatch at entry {ei}"
+                            );
+                            // The contribution must target THIS class's
+                            // word: recompute the position from the row.
+                            let from = entry.decomp_start as usize;
+                            let to = entries[ei + 1].decomp_start as usize;
+                            assert!(
+                                (from..to).contains(&(dp as usize)),
+                                "{ctx}: decomp position {dp} outside entry {ei}'s row"
+                            );
+                            let rs = table.degree_start(degrees[i] as usize + degrees[j] as usize);
+                            assert_eq!(
+                                rs + decomp[dp as usize] as usize,
+                                w.pos as usize,
+                                "{ctx}: contribution (entry {ei}, dp {dp}) bucketed under word {} but targets {}",
+                                w.pos,
+                                rs + decomp[dp as usize] as usize
+                            );
+                            // Table order within the class.
+                            assert!(
+                                last_entry.is_none_or(|prev| prev <= ei),
+                                "{ctx}: class {} contributions out of table order",
+                                w.pos
+                            );
+                            last_entry = Some(ei);
+                            seen.push((ei, dp as usize));
+                            total += 1;
+                        }
+                    }
+                    assert_eq!(
+                        total,
+                        expected.len(),
+                        "{ctx}: contribution count mismatch (supports {a_support:?}/{b_support:?})"
+                    );
+                    seen.sort_unstable();
+                    let mut expected_pairs: Vec<(usize, usize)> = expected
+                        .iter()
+                        .map(|&(_, ei, dp)| (ei, dp))
+                        .collect();
+                    expected_pairs.sort_unstable();
+                    assert_eq!(
+                        seen, expected_pairs,
+                        "{ctx}: transposed contribution set differs from the independent walk"
+                    );
+
+                    // Class-mode gating: positions are class positions; the
+                    // same invariants must hold against the class-space
+                    // image of the expected list.
+                    let inv = order.inv();
+                    let a_cls: Vec<usize> = a_support.iter().map(|&i| inv[i] as usize).collect();
+                    let b_cls: Vec<usize> = b_support.iter().map(|&i| inv[i] as usize).collect();
+                    let gating_cls = LieSeries::<u8, NotNan<f64>>::kernel_prologue_cached_class(
+                        &series,
+                        &a_cls,
+                        &b_cls,
+                        &order,
+                        &mut cache,
+                    );
+                    let degree_cls = order.degree_cls();
+                    let decomp_cls = order.decomp_cls();
+                    let entries_cls = order.entries_cls();
+                    let mut total_cls = 0usize;
+                    for w in gating_cls.words.iter() {
+                        assert_eq!(
+                            degree_cls[w.pos as usize], w.td,
+                            "class: class-mode class {} degree mismatch",
+                            w.pos
+                        );
+                        for &(tp, dp) in
+                            &gating_cls.contribs[w.start as usize..w.end as usize]
+                        {
+                            let ticket = gating_cls.tickets[tp as usize];
+                            let ei = (ticket & TICKET_INDEX_MASK) as usize;
+                            let entry = entries_cls[ei];
+                            let (i, j) = (entry.i as usize, entry.j as usize);
+                            let from = entry.decomp_start as usize;
+                            let to = entries_cls[ei + 1].decomp_start as usize;
+                            assert!(
+                                (from..to).contains(&(dp as usize)),
+                                "class: decomp position outside row"
+                            );
+                            let rs = table.degree_start(
+                                degree_cls[i] as usize + degree_cls[j] as usize,
+                            );
+                            assert_eq!(
+                                rs + decomp_cls[dp as usize] as usize,
+                                w.pos as usize,
+                                "class: contribution bucketed under the wrong class word"
+                            );
+                            total_cls += 1;
+                        }
+                    }
+                    assert_eq!(
+                        total_cls,
+                        expected.len(),
+                        "class: class-mode contribution count mismatch"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ADVERSARIAL (write-access division): the kernel sweep must equal an
+    /// INDEPENDENT per-word fan-in reference — built by walking the table's
+    /// entries in table order with presence resolved straight from the
+    /// support lists — bit for bit, across coefficient types (raw-float
+    /// fast path and exact rationals), layouts (public direct and
+    /// class-contiguous), thread counts, and adversarial inputs (all-zero,
+    /// single-hot, planted exact cancellations). Distinct failure: this
+    /// guards arithmetic and per-word accumulation order, not gating
+    /// structure (the transposition test above).
+    #[test]
+    fn write_class_sweep_matches_independent_fanin_reference() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use ordered_float::NotNan;
+        use std::collections::BTreeMap;
+
+        use super::ClassOrderedCommutation;
+
+        // The reference: result[w] += c * term over the table's entries in
+        // table order, term = (p_active ? a_i*b_j : 0) - (q_active ?
+        // a_j*b_i : 0), entries with neither orientation skipped. Same add
+        // sequence per word as the kernel's write classes, derived without
+        // touching the gating.
+        fn reference<U>(
+            series: &LieSeries<u8, U>,
+            a: &[U],
+            a_present: &[bool],
+            b: &[U],
+            b_present: &[bool],
+        ) -> Vec<U>
+        where
+            U: Clone + Default + Mul<Output = U> + AddAssign + Neg<Output = U> + PartialEq,
+        {
+            let table = &series.feasible_decompositions;
+            let entries = table.entries();
+            let coeffs = table.decomp_coeffs();
+            let mut acc: BTreeMap<usize, U> = BTreeMap::new();
+            for (ei, entry) in entries[..entries.len() - 1].iter().enumerate() {
+                let (i, j) = (entry.i as usize, entry.j as usize);
+                let p_active = a_present[i] && b_present[j];
+                let q_active = a_present[j] && b_present[i];
+                if !p_active && !q_active {
+                    continue;
+                }
+                let term = if p_active {
+                    let mut t = a[i].clone() * b[j].clone();
+                    if q_active {
+                        t += -(a[j].clone() * b[i].clone());
+                    }
+                    t
+                } else {
+                    -(a[j].clone() * b[i].clone())
+                };
+                let from = entry.decomp_start as usize;
+                let to = entries[ei + 1].decomp_start as usize;
+                let rs = table.degree_start(
+                    table.degree_of(i) + table.degree_of(j),
+                );
+                for dp in from..to {
+                    // Absolute decomp position -> the row's target: the
+                    // relative array is stored per entry in row order.
+                    let rel = table.decomp_indices_rel()[dp];
+                    let w = rs + rel as usize;
+                    let contrib = coeffs[dp].clone() * term.clone();
+                    *acc.entry(w).or_insert_with(U::default) += contrib;
+                }
+            }
+            let mut out = vec![U::default(); series.coefficients.len()];
+            for (w, v) in acc {
+                out[w] = v;
+            }
+            out
+        }
+
+        for (d, m) in [(2usize, 4usize), (3usize, 6usize)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let len = words.len();
+            let table_deg = |i: usize| words[i].len();
+            let _ = table_deg;
+
+            // Adversarial value sets: zeros (support holes), signed values
+            // that plant exact cancellations between entries feeding the
+            // same word, and asymmetric magnitudes.
+            let mk = |f: &dyn Fn(usize) -> f64| {
+                (0..len)
+                    .map(|i| NotNan::new(f(i)).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let a_sets = [
+                mk(&|_| 0.0),
+                mk(&|i| if i == 0 { 1.0 } else { 0.0 }),
+                mk(&|i| ((i % 5 + 1) as f64) / 3.0 - 1.0),
+                mk(&|i| if i % 2 == 0 { 1.0 } else { -1.0 }),
+            ];
+            let b_sets = [
+                mk(&|_| 0.0),
+                mk(&|i| if i == 1 { 1.0 } else { 0.0 }),
+                mk(&|i| ((i * 3 + 2) % 7) as f64 / 2.0 - 1.5),
+                mk(&|i| if i % 3 == 0 { 2.0 } else { -0.5 }),
+            ];
+
+            let cutoff_len = len; // full lists; the kernel filters by value
+            for a_coefficients in &a_sets {
+                for b_coefficients in &b_sets {
+                    let a: LieSeries<u8, NotNan<f64>> =
+                        LieSeries::new(words.clone(), a_coefficients.clone());
+                    let b: LieSeries<u8, NotNan<f64>> =
+                        LieSeries::new(words.clone(), b_coefficients.clone());
+                    let a_nonzero = a.nonzero_coefficient_indices(a_coefficients);
+                    let b_nonzero = b.nonzero_coefficient_indices(b_coefficients);
+                    let ap = {
+                        let mut p = vec![false; cutoff_len];
+                        for &i in &a_nonzero {
+                            p[i] = true;
+                        }
+                        p
+                    };
+                    let bp = {
+                        let mut p = vec![false; cutoff_len];
+                        for &i in &b_nonzero {
+                            p[i] = true;
+                        }
+                        p
+                    };
+                    let expected =
+                        reference(&a, a_coefficients, &ap, b_coefficients, &bp);
+
+                    for threads in [1usize, 4usize] {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(threads)
+                            .build()
+                            .expect("pool");
+                        pool.install(|| {
+                            // Public direct kernel.
+                            let mut out =
+                                vec![NotNan::<f64>::default(); len];
+                            LieSeries::commutator_coefficients_with_nonzero(
+                                &a,
+                                a_coefficients,
+                                &a_nonzero,
+                                b_coefficients,
+                                &b_nonzero,
+                                &mut out,
+                            );
+                            assert_eq!(
+                                out, expected,
+                                "public kernel differs (d={d}, m={m}, t={threads}, \
+                                 a={:?}, b={:?})",
+                                a_coefficients.iter().map(|x| x.into_inner()).collect::<Vec<_>>(),
+                                b_coefficients.iter().map(|x| x.into_inner()).collect::<Vec<_>>()
+                            );
+
+                            // Class-contiguous kernel: operands class-
+                            // ordered, result mapped back through `inv`.
+                            let order = a.class_order();
+                            let a_cls = a.class_coefficients(&order, a_coefficients);
+                            let b_cls = b.class_coefficients(&order, b_coefficients);
+                            let a_nz_cls: Vec<usize> =
+                                a_nonzero.iter().map(|&i| order.inv()[i] as usize).collect();
+                            let b_nz_cls: Vec<usize> =
+                                b_nonzero.iter().map(|&i| order.inv()[i] as usize).collect();
+                            let mut out_cls =
+                                vec![NotNan::<f64>::default(); len];
+                            a.class_commutation(
+                                &order,
+                                &a_cls,
+                                &a_nz_cls,
+                                &b_cls,
+                                &b_nz_cls,
+                                &mut out_cls,
+                                &mut GatingCache::default(),
+                            );
+                            let public = a.public_coefficients(&order, &out_cls);
+                            assert_eq!(
+                                public, expected,
+                                "class kernel differs (d={d}, m={m}, t={threads})"
+                            );
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// ADVERSARIAL (write-access division): a word class stays OWNED under
+    /// total cancellation — `a == b` makes every term exactly zero, yet
+    /// every reachable word is still swept (one single-writer store of the
+    /// exact zero) and still reported by the collecting variant: the
+    /// reported targets are a WRITE-set superset, never a value-filtered
+    /// set. Distinct failure: guards target ownership and the superset
+    /// property, not arithmetic (the fan-in test above).
+    #[test]
+    fn write_class_canceled_word_stays_owned_and_reported() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use ordered_float::NotNan;
+
+        for (d, m) in [(2usize, 5usize), (3usize, 4usize)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let len = words.len();
+            let coeffs: Vec<_> = (0..len)
+                .map(|i| NotNan::new(((i % 9 + 1) as f64) / 4.0 - 1.1).unwrap())
+                .collect();
+            let a: LieSeries<u8, NotNan<f64>> =
+                LieSeries::new(words.clone(), coeffs.clone());
+            let b: LieSeries<u8, NotNan<f64>> = LieSeries::new(words, coeffs);
+            let full: Vec<usize> = (0..len).collect();
+
+            // [A, A] = 0 exactly (float products are commutative), but
+            // every word with a feasible decomposition is still written.
+            let mut out = vec![NotNan::<f64>::default(); len];
+            LieSeries::commutator_coefficients_with_nonzero(
+                &a,
+                &a.coefficients,
+                &full,
+                &b.coefficients,
+                &full,
+                &mut out,
+            );
+            for (w, v) in out.iter().enumerate() {
+                assert_eq!(*v, NotNan::<f64>::default(), "word {w} not exactly zero");
+            }
+
+            // The collecting variant must still report every written word:
+            // value-filtered targets would be unsound for list reuse (a
+            // canceled target can go nonzero again when values change).
+            let mut dirty = vec![0u64; len / 64 + 1];
+            let mut targets = Vec::new();
+            LieSeries::commutator_coefficients_with_nonzero_collecting(
+                &a,
+                &a.coefficients,
+                &full,
+                &b.coefficients,
+                &full,
+                &mut out,
+                &mut dirty,
+                &mut targets,
+            );
+            // Independent expectation: every word targeted by any active
+            // contribution of any entry (full supports -> every entry).
+            let table = &a.feasible_decompositions;
+            let entries = table.entries();
+            let decomp = table.decomp_indices_rel();
+            let degrees = table.index_degrees();
+            let mut expected: Vec<usize> = Vec::new();
+            for (ei, entry) in entries[..entries.len() - 1].iter().enumerate() {
+                let (i, j) = (entry.i as usize, entry.j as usize);
+                let from = entry.decomp_start as usize;
+                let to = entries[ei + 1].decomp_start as usize;
+                let rs = table.degree_start(degrees[i] as usize + degrees[j] as usize);
+                for &rel in &decomp[from..to] {
+                    expected.push(rs + rel as usize);
+                }
+            }
+            expected.sort_unstable();
+            expected.dedup();
+            // The sink reports kernel-VISIBLE positions only: the degree-
+            // `max_degree` tail lies above the support cutoff (nothing can
+            // consume those values in a truncated BCH fold), so both sides
+            // filter at `degree_start(max_degree)`.
+            let cutoff = table.degree_start(table.max_degree());
+            expected.retain(|&w| w < cutoff);
+            targets.sort_unstable();
+            assert_eq!(
+                targets, expected,
+                "collecting targets lost canceled words (write-set superset violated)"
+            );
+        }
+    }
+
     /// Bundling decides only which thread runs which anagram unit; the
     /// per-word accumulation order is unchanged, so the result must be
     /// bit-identical for any thread count. Guards the work-balanced bundle
@@ -4238,14 +4952,24 @@ mod test {
                 );
             }
             // Class targets are internal positions: map them back with
-            // `perm` (internal -> public) before comparing.
+            // `perm` (internal -> public) before comparing. Under the
+            // write-access division each variant emits its targets sorted
+            // ascending in ITS OWN layout's position order (one store per
+            // word class, classes in position order), so the public
+            // sequences differ by the layout permutation — the invariant is
+            // the same target SET, each position reported exactly once
+            // (per-word accumulation order is guarded by the bit-identical
+            // result comparison above).
             let perm = order.perm();
-            let relabeled: Vec<usize> = class_targets
+            let mut relabeled: Vec<usize> = class_targets
                 .iter()
                 .copied()
                 .map(|p| perm[p] as usize)
                 .collect();
-            assert_eq!(direct_targets, relabeled, "collecting targets differ");
+            relabeled.sort_unstable();
+            let mut direct_sorted = direct_targets.clone();
+            direct_sorted.sort_unstable();
+            assert_eq!(direct_sorted, relabeled, "collecting targets differ");
         }
     }
 
@@ -4350,7 +5074,6 @@ mod test {
 #[cfg(test)]
 mod anagram {
     use super::*;
-    use crate::feasible_decompositions::UnitMeta;
     use lyndon_rs::lyndon::{LyndonBasis, Sort};
     use ordered_float::NotNan;
 
@@ -4508,5 +5231,42 @@ mod anagram {
     #[inline]
     fn is_nan_f64(x: f64) -> bool {
         x != x
+    }
+}
+
+#[cfg(test)]
+mod obj1_probe {
+    use super::*;
+    use lyndon_rs::lyndon::{LyndonBasis, Sort};
+    use ordered_float::NotNan;
+
+    #[test]
+    #[ignore = "probe"]
+    fn probe_entry_contribution_ratio() {
+        for (d, m) in [(2usize, 12usize), (3usize, 8usize), (4usize, 8usize), (2usize, 8usize), (3usize, 12usize)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let len = words.len();
+            let a: LieSeries<u8, NotNan<f64>> =
+                LieSeries::new(words, vec![NotNan::new(1.0).unwrap(); len]);
+            let table = &a.feasible_decompositions;
+            let entries = table.entries();
+            let e = entries.len() - 1;
+            let c: usize = (0..e)
+                .map(|ei| {
+                    entries[ei + 1].decomp_start as usize - entries[ei].decomp_start as usize
+                })
+                .sum();
+            let rows_gt1 = (0..e)
+                .filter(|&ei| {
+                    entries[ei + 1].decomp_start - entries[ei].decomp_start > 1
+                })
+                .count();
+            println!(
+                "d={d} m={m}: basis={len} entries={e} contribs={c} rho={:.3} rows_gt1={rows_gt1} ({:.1}%)",
+                c as f64 / e as f64,
+                100 * rows_gt1 / e.max(1)
+            );
+        }
     }
 }

@@ -162,6 +162,10 @@ Inside a unit, several canonical pairs feed the *same* result word (the word's d
   ]
 ]
 
+=== The finer division: write-access classes
+
+The engine's shipped division has since moved one level finer. The *write-access class* — all contributions writing ONE result word, wherever in the table their entries sit — is the atomic scheduling unit. It is the exact conflict boundary the anagram unit only approximated: two classes never share a word by construction (each is the full fan-in of one word), so any cut between classes is race-free, and a class's contributions stay together in table-entry order, which reproduces the serial per-word accumulation sequence exactly. The gating transposes each support-resolved pass over the table into these per-word lists in the same walk (a stable counting sort by target position), so sweeps read a flat `(ticket, coefficient)` stream per class and finish with *one single-writer store per word* — the scatter's repeated `+=` into a class block and the class-contiguous scratch it motivated both disappear; packs balance by contribution count and may cut between any two words of the same anagram class. The payoff is granularity: a DAG node is one anagram class, but a node's sweep now decomposes into hundreds of word-sized pieces, which un-seralizes the fold's funnel levels (a level with two node-classes previously scheduled as two coarse bundles) and lets the pack-slot walk balance to within a few contributions. The anagram unit remains in the table as the entries' storage grouping and the gating walk's degree-gating structure; it is no longer the parallel boundary.
+
 == One commutation, parallelized end to end
 
 A single evaluation of $[X,Y]$ has four phases; two are parallel, two are serial-but-amortized. The architecture's recurring theme is: *anything whose value depends only on the operand supports (which words are nonzero), not on their values, can be precomputed and cached — supports change rarely, values change every fold.*
@@ -287,7 +291,7 @@ Naively, a fold with $L$ levels pays $L$ separate fork/join dispatches — measu
       align(right + horizon, cap(6.2pt)[slot 2]), boxc(58pt, 13pt, rs, "wait (parked)", white), boxc(58pt, 13pt, sw.lighten(50%), "pack η", black), boxc(58pt, 13pt, idl, "parks", luma(120)), boxc(58pt, 13pt, idl, "—", luma(120)),
     )
     #v(2pt)
-    #cap(6.3pt)[The walk across one fold (3 slots, 4 levels; shaded = sweep work, red = waiting). Barriers are implicit in the counters; empty levels or low-work phases are where slots park (and free their workers for co-scheduled work) after draining the cursor. Per-word accumulation order is exactly the serial schedule's: packs never split a unit.]
+    #cap(6.3pt)[The walk across one fold (3 slots, 4 levels; shaded = sweep work, red = waiting). Barriers are implicit in the counters; empty levels or low-work phases are where slots park (and free their workers for co-scheduled work) after draining the cursor. Per-word accumulation order is exactly the serial schedule's: packs never split a write-access class.]
   ]
 ]
 
@@ -436,5 +440,5 @@ The tournament's folds then compose with a second multiplier, *cohort execution*
 
 #v(4pt)
 #block(width: 100%, fill: luma(245), inset: 6pt, radius: 2pt, text(size: 8pt)[
-  *Summary.* Parallelism in this engine is *structural*, not opportunistic: the algebra partitions work into anagram units that never share a write; the fold DAG partitions those units into dependency levels; the batch amortizes all support-invariant planning; the scheduler spends threads only where measured work justifies the barriers. The fold chain along the path is a data dependency of the BCH recursion itself — and the tree reduction of §8, now performed adaptively by the batch driver, is the only mechanism mathematics offers for crossing it.
+  *Summary.* Parallelism in this engine is *structural*, not opportunistic: the algebra partitions work into write regions that never share a word — anagram units at storage granularity, per-word write-access classes at scheduling granularity; the fold DAG partitions those pieces into dependency levels; the batch amortizes all support-invariant planning; the scheduler spends threads only where measured work justifies the barriers. The fold chain along the path is a data dependency of the BCH recursion itself — and the tree reduction of §8, now performed adaptively by the batch driver, is the only mechanism mathematics offers for crossing it.
 ])
