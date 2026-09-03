@@ -220,15 +220,49 @@ Truncated at degree $m$, the BCH series $A ⊕ B = A + B + ½[A,B] + 1/12[A,[A,B
 ]
 
 #align(center)[
-  #block(width: 96%)[
-    #grid(columns: (52pt, 1fr), column-gutter: 4pt, row-gutter: 2.5pt,
-      align(right + horizon, cap(6.4pt)[atoms]), grid(columns: (1fr,)*6, column-gutter: 1.5pt, ..range(6).map(i => boxc(100%, 12pt, luma(150), if i == 0 {"A"} else {"B"}, white))),
-      align(right + horizon, cap(6.4pt)[level 1]), grid(columns: (1fr,)*6, column-gutter: 1.5pt, ..range(6).map(i => if i < 2 { boxc(100%, 12pt, sw.lighten(20%), "node", white) } else { boxc(100%, 12pt, idl, "·", luma(120)) })),
-      align(right + horizon, cap(6.4pt)[⋮ mid levels ⋮]), grid(columns: (1fr,)*6, column-gutter: 1.5pt, ..range(6).map(i => boxc(100%, 12pt, sw.lighten(10%), "node", white))),
-      align(right + horizon, cap(6.4pt)[top levels]), grid(columns: (1fr,)*6, column-gutter: 1.5pt, ..range(6).map(i => if i < 3 { boxc(100%, 12pt, sw.darken(10%), "node", white) } else { boxc(100%, 12pt, idl, "·", luma(120)) })),
-    )
-    #v(2pt)
-    #cap(6.3pt)[The fold DAG is a *funnel*: thin at the atoms and at the deepest levels, widest in the middle (2×12: 11 levels, ~600 nodes, peak ~150 nodes at one level). Width per level is what a parallel schedule can harvest; the barriers between levels are what it must pay.]
+  #block(width: 88%, inset: 4pt)[
+    #import "@preview/cetz:0.4.2": canvas, draw
+    #canvas(length: 1pt, {
+      import draw: *
+      let node(x, y, w, label, fillc, txtc) = {
+        rect((x - w / 2, y), (x + w / 2, y + 11), fill: fillc, radius: 1.5pt, stroke: 0.4pt + luma(140))
+        content((x, y + 5.5), anchor: "center", text(size: 5.8pt, fill: txtc)[#label])
+      }
+      let edge(p, q) = line(p, q, stroke: 0.55pt + luma(110))
+      let dedge(p, q) = line(p, q, stroke: (paint: luma(150), dash: "dashed", thickness: 0.5pt))
+      // edges first (drawn under the nodes)
+      edge((85, 11), (111, 26))            // A -> [A,B]
+      edge((145, 11), (119, 26))           // B -> [A,B]
+      edge((85, 11), (58, 52))             // A -> [A,[A,B]]
+      edge((108, 37), (60, 52))            // [A,B] -> [A,[A,B]]
+      edge((145, 11), (177, 52))           // B -> [B,[A,B]]
+      edge((122, 37), (175, 52))           // [A,B] -> [B,[A,B]]
+      dedge((60, 63), (103, 82))           // into the middle band
+      dedge((175, 63), (127, 82))
+      dedge((108, 92), (100, 106))         // out of the band to the top
+      dedge((122, 92), (134, 106))
+      // funnel hint: light dashed guides, narrow at atoms and top, wide mid-levels
+      dedge((70, -4), (18, 87)); dedge((18, 87), (82, 120))
+      dedge((160, -4), (212, 87)); dedge((212, 87), (148, 120))
+      // nodes
+      node(85, 0, 26, "A", luma(150), white)
+      node(145, 0, 26, "B", luma(150), white)
+      node(115, 26, 34, "[A,B]", sw.lighten(30%), white)
+      node(60, 52, 52, "[A,[A,B]]", sw.lighten(15%), white)
+      node(175, 52, 52, "[B,[A,B]]", sw.lighten(15%), white)
+      node(100, 106, 30, "[A,·]", sw.darken(10%), white)
+      node(134, 106, 30, "[B,·]", sw.darken(10%), white)
+      content((115, 87), anchor: "center", text(size: 11pt, fill: luma(80))[⋮])
+      content((158, 87), anchor: "west", cap(6pt)[\ ~150 nodes/level])
+      // level markers
+      content((22, 5.5), anchor: "east", cap(6pt)[atoms])
+      content((22, 31.5), anchor: "east", cap(6pt)[level 1])
+      content((22, 57.5), anchor: "east", cap(6pt)[level 2])
+      content((22, 87), anchor: "east", cap(6pt)[⋮ mid])
+      content((22, 111.5), anchor: "east", cap(6pt)[top])
+    })
+    #v(3pt)
+    #cap(6.3pt)[The fold as a DAG — the $[A,B]$-iterate spine of the truncated BCH structure, shown schematically. Solid edges: consumption of an operand (a node's two operands are results of earlier levels and/or the atoms — note how $[A,B]$ is *shared* by every node above it: interning computes it once). The dashed guides suggest the *funnel* shape of the real DAG at working scale (2×12: 11 levels, ~600 nodes, ~150 nodes at the widest level): thin at the atoms and the deepest levels, wide in the middle. The levels are the longest path from the atoms; width per level is what a parallel schedule can harvest, and the barrier after each full level is what it must pay.]
   ]
 ]
 
