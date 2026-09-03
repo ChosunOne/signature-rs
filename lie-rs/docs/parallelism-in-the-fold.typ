@@ -368,24 +368,71 @@ The one honest escape hatch already exists in the algebra: BCH concatenation is 
       grid(columns: (1fr,)*8, column-gutter: 1.5pt, ..(range(2).map(i => boxc(100%, 12pt, sw.lighten(15%), "⋈", white)) + range(6).map(i => boxc(100%, 12pt, white, "", white)))),
       grid(columns: (1fr,)*8, column-gutter: 1.5pt, ..((boxc(100%, 12pt, sw.darken(5%), "⋈", white),) + range(7).map(i => boxc(100%, 12pt, white, "", white)))),
     )
-    #cap(6.3pt)[A tournament reduction over 8 segments: $log_2 n$ sequential rounds, every pair in a round independent. Rounds start *sparse* (degree-1 displacements: cheap, support-gated folds) and only the last $~2 log_2 n$ concatenations along the critical path pay full dense-fold cost. A 1000-segment path goes from 1000 serial dense folds to ~10 dense folds of dependency depth, with up to 500 independent concurrent concatenations in round 1.]
+    #cap(6.3pt)[A tournament reduction over 8 segments: $log_2 n$ sequential rounds, every pair in a round independent. Rounds start *sparse* (degree-1 displacements: cheap, support-gated folds) and only the last $~2 log_2 n$ concatenations along the critical path pay full dense-fold cost. A 1000-segment path: from 1000 serial dense folds to ~10 of dependency depth, up to 500 concurrent in round 1.]
   ]
 ]
 
-The engine now performs exactly this reduction, adaptively and with no new API surface: when a batch holds at least 16 displacements on a multi-thread pool, the batch driver reduces a *balanced tournament over contiguous chunks* instead of the serial chain. Leaves are not cold per-fold dispatches — each leaf folds its chunk through the same sequential batch engine (warm-up folds, then one steady batched dispatch). Cold per-fold leaves forfeited that amortization and regressed 2×12 by up to 1.27× in measurement; with batched leaves the per-leaf warm-up duplication is the only real tax, and the merge tail — the only remaining serial spine — is ~$2 log_2 (n\/8)$ dense folds deep. The tree shape is a pure function of the displacement count (at most 32 leaves), so results are *bit-stable at any pool size*; exact (rational) coefficients remain bit-identical to the sequential driver, while f64 reassociation shifts rounding only in the last ulps (measured ≈$10^(-13)$ abs on $\~10^2$ magnitudes — accepted, and pinned by tolerance tests against the sequential oracle plus exactness oracles for rationals). The §7 discipline applies at the tree level too: leaves and merges run through the same work-adaptive machinery, so a thin regime's early rounds do not pay for scheduling. Measured end-to-end with batched leaves: 12×2 went 1.84 ms → 0.50 ms at 8 threads ($3.7×$, and $6.7×$ at a 10000-segment path), 8×3 went 7.94 ms → 2.08 ms at 32 threads ($3.8×$), 3×8 went 154 ms → 92 ms at 32 threads ($1.7×$), and 2×12 — the regime that *needs* the intra-fold machinery most — still improved from 525 ms to 390 ms at 16 threads ($1.35×$, $2.0×$ at 10000 segments), because ~128 batched leaves plus 127 merges replace 1000 dense folds. Single-threaded runs are unaffected: the driver keeps the sequential chain there, so the reformulation is upside-only on every measured grid.
+The engine now performs exactly this reduction, adaptively and with no new API surface: when a batch holds at least 16 displacements on a multi-thread pool, the batch driver reduces a *balanced tournament over contiguous chunks* instead of the serial chain. Leaves are not cold per-fold dispatches — each leaf folds its chunk through the same sequential batch engine (warm-up folds, then one steady batched dispatch). Cold per-fold leaves forfeited that amortization and regressed 2×12 by up to 1.27× in measurement; with batched leaves the per-leaf warm-up duplication is the only real tax, and the merge tail — the only remaining serial spine — is ~$2 log_2 (n\/8)$ dense folds deep. The tree shape is a pure function of the displacement count (at most 32 leaves), so results are *bit-stable at any pool size*; exact (rational) coefficients remain bit-identical to the sequential driver, while f64 reassociation shifts rounding only in the last ulps (measured ≈$10^(-13)$ abs on $\~10^2$ magnitudes — accepted, and pinned by tolerance tests against the sequential oracle plus exactness oracles for rationals). The §7 discipline applies at the tree level too: leaves and merges run through the same work-adaptive machinery, so a thin regime's early rounds do not pay for scheduling. Measured end-to-end (full grid in the regime map below): 12×2 1.84→0.50 ms \@8t ($6.7×$ at 10000 segments), 8×3 7.94→2.08 ms \@32t, 3×8 154→92 ms \@32t, and 2×12 — the regime that *needs* the intra-fold machinery most — 525→390 ms \@16t ($2.0×$ at 10000 segments): ~128 batched leaves plus 127 merges replace 1000 dense folds. Single-threaded runs are unaffected: the driver keeps the sequential chain there, so the reformulation is upside-only on every measured grid.
+
+The tournament's folds then compose with a second multiplier, *cohort execution*. A round's folds all walk the same data-independent plan, so the engine executes four of them as one SIMD walk over lane-interleaved buffers:
+
+#align(center)[
+  #block(inset: 4pt)[
+    #import "@preview/cetz:0.4.2": canvas, draw
+    #canvas(length: 1pt, {
+      import draw: *
+      let lanes = (sw.lighten(45%), sw.lighten(20%), sw.darken(5%), sw.darken(30%))
+      let slot(x, y, w, h, lab) = {
+        for l in range(4) {
+          rect((x, y + l * h / 4), (x + w, y + (l + 1) * h / 4), fill: lanes.at(3 - l), stroke: 0.35pt + luma(120))
+          content((x + w / 2, y + (l + 0.5) * h / 4), anchor: "center", text(size: 5pt, fill: white)[f#(4 - l)])
+        }
+        content((x + w / 2, y + h + 2), anchor: "south", cap(6pt)[#lab])
+      }
+      // shared plan strip with visible walk steps
+      rect((16, 84), (258, 96), fill: luma(238), radius: 1.5pt, stroke: 0.4pt + luma(140))
+      for (i, cx) in ((0, 55), (1, 129), (2, 203)) {
+        rect((cx - 33, 86.5), (cx + 33, 93.5), fill: white, radius: 1pt, stroke: 0.35pt + luma(150))
+        content((cx, 90), anchor: "center", text(size: 5.4pt)[ $(u_#(i + 1), v_#(i + 1), w_#(i + 1)) arrow e_#(i + 1)$ ])
+      }
+      content((16, 80), anchor: "west", cap(5.8pt)[ONE walk of the shared plan — decomps, tickets, scatter indices, identical for the whole 4-fold group:])
+      // the slot towers
+      slot(36, 26, 22, 32, [$A_4[u_k]$])
+      slot(110, 26, 22, 32, [$B_4[v_k]$])
+      slot(204, 26, 22, 32, [$"out"_4[e]$])
+      content((84, 46), anchor: "center", text(size: 12pt)[$times$])
+      content((168, 46), anchor: "center", text(size: 12pt)[$+$])
+      content((84, 32), anchor: "center", text(size: 5pt)[mul — then add\ (vertical per lane,\ no FMA)])
+      content((168, 32), anchor: "center", text(size: 5pt)[accumulates,\ per lane])
+      // dashed guides from plan strip down to slots
+      line((47, 82), (47, 62), stroke: (paint: luma(150), dash: "dashed", thickness: 0.5pt))
+      line((121, 82), (121, 62), stroke: (paint: luma(150), dash: "dashed", thickness: 0.5pt))
+      line((215, 82), (215, 62), stroke: (paint: luma(150), dash: "dashed", thickness: 0.5pt))
+      // the trick annotations
+      content((47, 16), anchor: "center", cap(5.6pt)[ONE contiguous\ 4-wide load, all lanes])
+      content((121, 16), anchor: "center", cap(5.6pt)[ONE contiguous\ 4-wide load, all lanes])
+      content((215, 16), anchor: "center", cap(5.6pt)[ONE contiguous\ 4-wide store —\ 4 folds written at once])
+      content((6, 42), anchor: "west", cap(5.6pt)[lane = one\ tournament\ fold\ (f₁…f₄)])
+    })
+    #v(2pt)
+    #cap(6.3pt)[Cohort execution of one 4-fold tournament group. Coefficient buffers are interleaved per index (`[idx*4+lane]`): every index access of the shared plan walk touches all four lanes in ONE contiguous 4-wide load/store — no gather/scatter instructions anywhere; arithmetic is vertical per lane (mul, then add — deliberately *no* FMA, proven worthless in this load/scatter-bound phase). Indices, gating tickets, and control flow are shared; only coefficient values differ per lane. Each lane therefore replicates the scalar fold's operation order exactly, so a cohort run is *0-ulp bit-identical* to the scalar tournament over the same reduction tree. The kernel is capability-gated like the existing raw-float fast path: f64/f32 (including `NotNan`-wrapped) via TypeId + runtime AVX2 check; every other coefficient type keeps the scalar kernel bit-for-bit. Engagement is measured-out (≤16 threads, or ≥256-term folds, or enough groups; env off switch). A/B: −32% 2×12\@4t, −37% 3×8\@4t, −29% 8×3\@4t (the old 32-thread time on 4 threads), −20% 2×12\@8t; neutral elsewhere. Absolute bests unchanged — cohorts buy that 4–8 threads now reach ~1.5× of the 16–32-thread times.]
+  ]
+]
+
+#pagebreak()
 
 == Regime map: what was measured
 
-#text(size: 8pt)[
-  #grid(columns: (52pt, 84pt, 78pt, 74pt, 1fr), column-gutter: 5pt, row-gutter: 2.5pt,
+#text(size: 7.7pt)[
+  #grid(columns: (50pt, 82pt, 76pt, 72pt, 1fr), column-gutter: 4.5pt, row-gutter: 2.2pt,
     [*grid*], [*stock, best config*], [*today, best config*], [*gain*], [*why*],
-    [2×12], [1393 ms \@32t], [390 ms \@16t], [3.6×], [Every intra-fold layer engaged — plus the tournament: 128 batched leaves + 127 merges replace 1000 dense folds ($2.0×$ from it alone at 10000 segments). #h(0.5em)_(low-d, high-m)_],
-    [3×8], [331 ms \@8t], [92 ms \@32t], [3.6×], [Same; tournament gain grows with the pool ($1.7×$ at 32t).],
+    [2×12], [1393 ms \@32t], [390 ms \@16t], [3.6×], [Every intra-fold layer engaged — plus the tournament: 128 batched leaves + 127 merges replace 1000 dense folds ($2.0×$ alone at 10000 segments). #h(0.5em)_(low-d, high-m)_],
+    [3×8], [331 ms \@8t], [92 ms \@32t], [3.6×], [Same; tournament gain grows with pool ($1.7×$ \@32t).],
     [12×2], [2.55 ms \@1t (16t: 16.7 ms!)], [0.50 ms \@8t], [5.1×, pathology gone — and threads come back], [66 entries/fold: adaptivity runs the fold serial — the tournament puts map lanes on the fold AXIS ($6.7×$ vs stock at 10000 segments). #h(0.5em)_(high-d, low-m)_],
     [8×3], [8.02 ms \@2t (32t: 28.6 ms)], [2.08 ms \@32t], [3.9×], [700 entries/fold: formerly on the serial/parallel boundary — same mechanism as 12×2.],
   )
 ]
-#cap(6.6pt)[End-to-end log signatures of 1000-segment random paths, criterion medians, 32-core machine. "Stock" = the engine before the parallelism work documented in the companion notes (unit-boundary pack cuts, one-dispatch fold, class-contiguous kernel, entry tickets, work-adaptive slots, allocation-free batch driver, associative tournament reduction). Single-threaded runs keep the sequential driver (bit-identical results there); in floating point the parallel paths reassociate folds — exact types unchanged, rounding shifts confined to the last ulps and pinned by oracle tests.]
+#cap(6.6pt)[End-to-end log signatures of 1000-segment random paths, criterion medians, 32-core machine. "Stock" = the engine before the parallelism work documented in the companion notes. Single-threaded runs keep the sequential driver (bit-identical there); parallel paths reassociate floating-point folds — exact types unchanged, ulps pinned by oracle tests.]
 
 #v(4pt)
 #block(width: 100%, fill: luma(245), inset: 6pt, radius: 2pt, text(size: 8pt)[
