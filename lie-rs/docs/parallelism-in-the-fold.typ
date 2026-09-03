@@ -350,7 +350,7 @@ The one structural number that decides whether parallelism helps is *planned swe
 
 This single rule closed the high-dimension/low-degree pathology: the parallel infrastructure is still there, but a 66-entry fold no longer pays for it.
 
-== What threads can never reach — and the one axis they still could
+== What threads cannot reach inside a fold — and the associative axis they can
 
 It is worth stating plainly where parallelism *does not* exist, because it is a consequence of the mathematics rather than an implementation gap:
 
@@ -372,22 +372,22 @@ The one honest escape hatch already exists in the algebra: BCH concatenation is 
   ]
 ]
 
-Two caveats keep it out of the current engine: floating-point results would no longer be bit-identical to the sequential fold (reassociation changes rounding order — mathematically immaterial, contractually significant when tests assert exact bit equality), and the early rounds are so cheap that the same scheduling-discipline lessons of §7 apply at the tree level. But it is the *only* axis of parallelism that scales with path length — for the high-dimension/low-degree regime, whose per-fold work is intrinsically thin, it is the difference between "threads are politely declined" (today) and "threads map onto segments" (possible).
+The engine now performs exactly this reduction, adaptively and with no new API surface: when a batch holds at least 16 displacements on a multi-thread pool, the batch driver reduces a *balanced tournament over contiguous chunks* instead of the serial chain. Leaves are not cold per-fold dispatches — each leaf folds its chunk through the same sequential batch engine (warm-up folds, then one steady batched dispatch). Cold per-fold leaves forfeited that amortization and regressed 2×12 by up to 1.27× in measurement; with batched leaves the per-leaf warm-up duplication is the only real tax, and the merge tail — the only remaining serial spine — is ~$2 log_2 (n\/8)$ dense folds deep. The tree shape is a pure function of the displacement count (at most 32 leaves), so results are *bit-stable at any pool size*; exact (rational) coefficients remain bit-identical to the sequential driver, while f64 reassociation shifts rounding only in the last ulps (measured ≈$10^(-13)$ abs on $\~10^2$ magnitudes — accepted, and pinned by tolerance tests against the sequential oracle plus exactness oracles for rationals). The §7 discipline applies at the tree level too: leaves and merges run through the same work-adaptive machinery, so a thin regime's early rounds do not pay for scheduling. Measured end-to-end with batched leaves: 12×2 went 1.84 ms → 0.50 ms at 8 threads ($3.7×$, and $6.7×$ at a 10000-segment path), 8×3 went 7.94 ms → 2.08 ms at 32 threads ($3.8×$), 3×8 went 154 ms → 92 ms at 32 threads ($1.7×$), and 2×12 — the regime that *needs* the intra-fold machinery most — still improved from 525 ms to 390 ms at 16 threads ($1.35×$, $2.0×$ at 10000 segments), because ~128 batched leaves plus 127 merges replace 1000 dense folds. Single-threaded runs are unaffected: the driver keeps the sequential chain there, so the reformulation is upside-only on every measured grid.
 
 == Regime map: what was measured
 
 #text(size: 8pt)[
   #grid(columns: (52pt, 84pt, 78pt, 74pt, 1fr), column-gutter: 5pt, row-gutter: 2.5pt,
     [*grid*], [*stock, best config*], [*today, best config*], [*gain*], [*why*],
-    [2×12], [1393 ms \@32t], [533 ms \@16t], [2.61×], [All layers engaged: tickets, balanced packs, 16–19 slots of real work, adaptive accumulate. #h(0.5em)_(low-d, high-m)_],
-    [3×8], [331 ms \@8t], [155 ms \@16t], [2.13×], [Same, moderately narrower fold.],
-    [12×2], [2.55 ms \@1t (16t: 16.7 ms!)], [1.25 ms — flat at 1t…32t], [2.04×, pathology gone], [66 entries/fold: adaptivity runs it serial-inside-parallel; batch amortization + allocation elimination. #h(0.5em)_(high-d, low-m)_],
-    [8×3], [8.02 ms \@2t (32t: 28.6 ms)], [7.6 ms — flat], [1.06×, pathology gone], [700 entries/fold: right on the serial/parallel boundary.],
+    [2×12], [1393 ms \@32t], [390 ms \@16t], [3.6×], [Every intra-fold layer engaged — plus the tournament: 128 batched leaves + 127 merges replace 1000 dense folds ($2.0×$ from it alone at 10000 segments). #h(0.5em)_(low-d, high-m)_],
+    [3×8], [331 ms \@8t], [92 ms \@32t], [3.6×], [Same; tournament gain grows with the pool ($1.7×$ at 32t).],
+    [12×2], [2.55 ms \@1t (16t: 16.7 ms!)], [0.50 ms \@8t], [5.1×, pathology gone — and threads come back], [66 entries/fold: adaptivity runs the fold serial — the tournament puts map lanes on the fold AXIS ($6.7×$ vs stock at 10000 segments). #h(0.5em)_(high-d, low-m)_],
+    [8×3], [8.02 ms \@2t (32t: 28.6 ms)], [2.08 ms \@32t], [3.9×], [700 entries/fold: formerly on the serial/parallel boundary — same mechanism as 12×2.],
   )
 ]
-#cap(6.6pt)[End-to-end log signatures of 1000-segment random paths, criterion medians, 32-core machine. "Stock" = the engine before the parallelism work documented in the companion notes (unit-boundary pack cuts, one-dispatch fold, class-contiguous kernel, entry tickets, work-adaptive slots, allocation-free batch driver). Bit-identical results to the sequential fold throughout.]
+#cap(6.6pt)[End-to-end log signatures of 1000-segment random paths, criterion medians, 32-core machine. "Stock" = the engine before the parallelism work documented in the companion notes (unit-boundary pack cuts, one-dispatch fold, class-contiguous kernel, entry tickets, work-adaptive slots, allocation-free batch driver, associative tournament reduction). Single-threaded runs keep the sequential driver (bit-identical results there); in floating point the parallel paths reassociate folds — exact types unchanged, rounding shifts confined to the last ulps and pinned by oracle tests.]
 
 #v(4pt)
 #block(width: 100%, fill: luma(245), inset: 6pt, radius: 2pt, text(size: 8pt)[
-  *Summary.* Parallelism in this engine is *structural*, not opportunistic: the algebra partitions work into anagram units that never share a write; the fold DAG partitions those units into dependency levels; the batch amortizes everything that is support-invariant; and the scheduler spends threads only where the measured work volume justifies the barriers. The serial spine of the computation — the fold chain along the path — is a data dependency of the BCH recursion itself, and the tree reduction of §8 is the only mechanism mathematics offers for crossing it.
+  *Summary.* Parallelism in this engine is *structural*, not opportunistic: the algebra partitions work into anagram units that never share a write; the fold DAG partitions those units into dependency levels; the batch amortizes all support-invariant planning; the scheduler spends threads only where measured work justifies the barriers. The fold chain along the path is a data dependency of the BCH recursion itself — and the tree reduction of §8, now performed adaptively by the batch driver, is the only mechanism mathematics offers for crossing it.
 ])
