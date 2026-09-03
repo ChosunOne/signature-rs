@@ -5230,7 +5230,9 @@ mod anagram {
 
     #[inline]
     fn is_nan_f64(x: f64) -> bool {
-        x != x
+        // `x != x` trips clippy::eq_op (deny-by-default); is_nan is the
+        // same predicate for f64.
+        x.is_nan()
     }
 }
 

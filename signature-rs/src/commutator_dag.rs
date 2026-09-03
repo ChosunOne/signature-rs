@@ -207,30 +207,35 @@ static COHORT_OFF: AtomicBool = AtomicBool::new(false);
 static COHORT_ENV_INIT: OnceLock<()> = OnceLock::new();
 
 /// Cohort engine executions ([`CommutatorDag::fold_batch_cohort`] calls —
-/// leaf-group tails plus merge groups). The oracle test's observability
-/// that the cohort path actually engaged for a configuration.
+/// leaf-group warm-up/tail cohorts plus merge groups). The oracle test's
+/// observability that the cohort path actually engaged for a configuration.
 pub(crate) static COHORT_ENGINE_RUNS: AtomicUsize = AtomicUsize::new(0);
 
-/// True when the cohort (4-lane SIMD-across-folds) engine may run for
-/// coefficient type `U`: the type must be a repr-transparent raw float
-/// (mirroring the kernel's raw-float fast path — every other type,
-/// e.g. `Ratio<i128>`, keeps the scalar kernel bit-for-bit), the CPU must
-/// have AVX2 (the conservative floor for the 4×f64 lane vectors; the
-/// kernel itself is plain autovectored array code — no FMA, so results
-/// stay bit-identical at any vector width), and the kill switch must not
-/// disable the path.
+/// Individual lane-folds executed through the cohort engine: for every
+/// dispatch, the number of (step, active-lane) pairs — the folds that
+/// shared one plan walk instead of walking the scalar engine one fold at
+/// a time. The engagement test's fold-coverage observable: cohort
+/// lane-folds / total folds proves the SIMD-across-folds engine ran
+/// every eligible concatenated segment, not only the merge rounds.
+pub(crate) static COHORT_LANE_FOLDS: AtomicUsize = AtomicUsize::new(0);
+
+/// True when the COEFFICIENT TYPE and CPU support the cohort engine,
+/// irrespective of the kill switch: a repr-transparent raw float type
+/// (mirroring the kernel's raw-float fast path — every other type, e.g.
+/// `Ratio<i128>`, keeps the scalar kernel bit-for-bit) and AVX2 (the
+/// conservative floor for the 4×f64 lane vectors; the kernel itself is
+/// plain autovectored array code — no FMA, so results stay bit-identical
+/// at any vector width).
+///
+/// This is the driver's tree-selection predicate: the
+/// tournament-vs-sequential choice must NOT depend on the kill switch —
+/// the switch swaps the ENGINES inside the tournament (cohort vs scalar),
+/// never the association tree, so the oracle tests can pin the two
+/// bit-identical.
 ///
 /// All checks are per-call cheap: two `TypeId` compares (constant-folded
-/// per monomorphization), one CPU-feature cache probe, one atomic load.
-pub(crate) fn cohort_capable<U: 'static>() -> bool {
-    COHORT_ENV_INIT.get_or_init(|| {
-        if std::env::var_os("SIG_NO_COHORT").is_some_and(|v| v == *"1") {
-            COHORT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    });
-    if COHORT_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
+/// per monomorphization) and one CPU-feature cache probe.
+pub(crate) fn cohort_type_capable<U: 'static>() -> bool {
     if !lie_rs::cohort_supported::<U>() {
         return false;
     }
@@ -242,6 +247,21 @@ pub(crate) fn cohort_capable<U: 'static>() -> bool {
     {
         false
     }
+}
+
+/// True when the cohort (4-lane SIMD-across-folds) engine may run for
+/// coefficient type `U`: [`cohort_type_capable`] plus the kill switch
+/// must not disable the path.
+pub(crate) fn cohort_capable<U: 'static>() -> bool {
+    COHORT_ENV_INIT.get_or_init(|| {
+        if std::env::var_os("SIG_NO_COHORT").is_some_and(|v| v == *"1") {
+            COHORT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    if COHORT_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    cohort_type_capable::<U>()
 }
 
 /// Flips the cohort kill switch in-process (the oracle test's scalar
@@ -1487,6 +1507,10 @@ where
                     .fold(0u8, |m, l| m | (1 << l))
             })
             .collect();
+        COHORT_LANE_FOLDS.fetch_add(
+            active_masks.iter().map(|m| m.count_ones() as usize).sum(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let internal = self.structure.nodes.len() - 2;
         self.ensure_buffers(series.coefficients.len(), internal);

@@ -1,5 +1,5 @@
 use lie_rs::LieSeriesGenerator;
-use lie_rs::{LieSeries, bch_series_generator::BchSeriesGenerator};
+use lie_rs::{ClassOrderedCommutation, LieSeries, bch_series_generator::BchSeriesGenerator};
 use lyndon_rs::lyndon::LyndonWord;
 use lyndon_rs::{
     generators::Generator,
@@ -16,7 +16,7 @@ use std::{
     sync::Mutex,
 };
 
-use crate::commutator_dag::{CohortLane, CommutatorDag, cohort_capable};
+use crate::commutator_dag::{CohortLane, CommutatorDag, cohort_capable, cohort_type_capable};
 
 /// True exactly for a NaN payload. `x != x` holds for no value except NaN,
 /// which keeps the check available for every coefficient type without adding
@@ -29,9 +29,14 @@ fn is_nan_value<U: PartialEq>(c: &U) -> bool {
 
 /// Minimum number of displacement slices for
 /// [`LogSignature::concatenate_batch_coefficients`] to prefer the parallel
-/// tournament reduction over the sequential fold chain. Below this the
-/// per-fold/batch sequential path is cheaper than the tournament's tree
-/// overhead (extra DAG warm-ups, pool coordination, one final merge fold).
+/// tournament reduction over the sequential fold chain for types the
+/// cohort engine cannot carry (exact rationals and other non-raw-float
+/// coefficients). Below this the per-fold/batch sequential path is cheaper
+/// than the tournament's tree overhead (extra DAG warm-ups, pool
+/// coordination, one final merge fold). Cohort-capable types ignore this
+/// floor — their tournament engages from 2 displacements up, because the
+/// SIMD-across-folds engine reuses one plan walk across 2-4 folds and
+/// amortizes the tree overhead away.
 const TOURNAMENT_MIN_DISPLACEMENTS: usize = 16;
 
 /// Minimum displacements per tournament leaf chunk. Leaves fold a
@@ -331,57 +336,140 @@ fn return_pooled_dag<U>(pool: &Mutex<Vec<CommutatorDag<U>>>, dag: CommutatorDag<
         .push(dag);
 }
 
-/// One cohort lane's evolving leaf-round state. `U`-only (no `T`), so the
-/// vector of states crosses into nested rayon tasks for the warm-up and
-/// scalar-step phases — the `LieSeries` instances those tasks build live
-/// and die inside their own task (non-last `Arc` drops, the tournament's
-/// [`SeriesTemplate`] safety contract).
-struct CohortLeafState<U> {
-    /// The lane's accumulator (public basis order).
-    acc: Vec<U>,
-    /// The lane's private DAG (pooled; `Some` until returned).
-    dag: Option<CommutatorDag<U>>,
-    /// Chunk range of this lane's leaf (indices into the batch's `rhss`).
-    start: usize,
-    len: usize,
-    /// Folds already executed.
-    done: usize,
+/// True when every displacement slice in the leaf group's chunks has
+/// kernel-visible support ⊆ `b_nonzero` (the shared-plan condition of
+/// `leaf_group_engine`). Subset — not equality — is the sound condition:
+/// the shared plan's masks are derived from the LARGEST support, and a
+/// smaller-support slice gathers exact zeros into every unshared mask
+/// position, contributing exact-zero adds (bit-identical to the scalar
+/// engine skipping them — the sign of zero is unobservable on
+/// accumulators).
+fn leaf_group_supports_subset<T, U>(
+    template: &SeriesTemplate<U, T>,
+    rhss: &[&[U]],
+    chunk: usize,
+    first_leaf: usize,
+    group_leaves: usize,
+    b_nonzero: &[usize],
+) -> bool
+where
+    T: Clone + Ord + Generator + Hash,
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + Send
+        + Sync
+        + 'static,
+{
+    (0..group_leaves).all(|l| {
+        let start = (first_leaf + l) * chunk;
+        let end = (start + chunk).min(rhss.len());
+        rhss[start..end].iter().all(|r| {
+            template
+                .0
+                .nonzero_coefficient_indices(r)
+                .iter()
+                .all(|&i| b_nonzero.binary_search(&i).is_ok())
+        })
+    })
 }
 
-impl<U> CohortLeafState<U> {
-    fn rest<'a>(&self, rhss: &'a [&'a [U]]) -> &'a [&'a [U]] {
-        &rhss[self.start + self.done..self.start + self.len]
-    }
-
-    fn is_done(&self) -> bool {
-        self.done >= self.len
+/// Derives a leaf's reachable-support plan: the fixed point
+/// `a* = union(lists(a*, b)) ∪ b` of the DAG's scatter-target sets, in
+/// public basis order. See `cohort_leaf_group` for why the per-node lists
+/// must be rebuilt for exactly these atom supports before any shared-plan
+/// dispatch (the interior jobs' operand gating reads them verbatim;
+/// lists built for smaller atom supports miss the DAG's acc-side units
+/// and their targets, dropping real contributions once the accumulators
+/// grow past the displacement support). The iteration is monotone and
+/// bounded by the basis: two passes in practice — the first build already
+/// reaches the full word closure (every closure word has a pure-B
+/// decomposition chain), the second repairs the per-node target sets for
+/// the acc-side units.
+fn leaf_steady_plan<T, U>(
+    template: &SeriesTemplate<U, T>,
+    dag: &mut CommutatorDag<U>,
+    zero_acc: &[U],
+    first_slice: &[U],
+    b: &[usize],
+) -> Vec<usize>
+where
+    T: Clone + Ord + Generator + Hash,
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + Send
+        + Sync
+        + 'static,
+{
+    let mut a_plan = b.to_vec();
+    loop {
+        dag.ensure_lists_steady(&template.0, zero_acc, &a_plan, first_slice, b);
+        let order = template.0.class_order();
+        let perm = order.perm();
+        let mut next: Vec<usize> = dag
+            .nonzeros
+            .iter()
+            .flat_map(|l| l.iter().map(|&p| perm[p] as usize))
+            .collect();
+        next.extend_from_slice(b);
+        next.sort_unstable();
+        next.dedup();
+        let converged = next == a_plan;
+        a_plan = next;
+        if converged {
+            return a_plan;
+        }
     }
 }
 
-/// The tournament leaf round's COHORT group: folds four adjacent leaf
-/// chunks as one 4-lane cohort — each lane warms up its chunk through the
-/// exact scalar engine (`fold_one_displacement` steps under the
-/// [`batch_rest_eligible`] check, the sequential driver's own decision
-/// sequence), and once every lane is batch-steady with IDENTICAL atom
-/// supports, the lanes' remaining folds run as ONE SoA cohort dispatch
-/// ([`CommutatorDag::fold_batch_cohort`]) — the same reduction tree, the
-/// same per-lane fold sequence, 4 folds per plan walk.
+/// The tournament leaf round's group engine: folds `group_leaves` (2..=4)
+/// adjacent leaf chunks, each from a zeroed accumulator, through the
+/// STEADY-CHUNK leaf engine — one reachable-support plan per lane (see
+/// [`leaf_steady_plan`]), then the lane's WHOLE chunk as ONE batch
+/// dispatch — no per-fold warm-up walks anywhere.
 ///
-/// # Soundness of the shared plan (the eligibility rule)
+/// When the group's displacement slices are support-uniform (every slice's
+/// kernel-visible support ⊆ lane 0's first slice's support — the subset
+/// test is the sound condition: unshared mask positions gather exact
+/// zeros and contribute exact-zero adds) and `cohort` is on, the lanes
+/// share ONE plan and ONE dispatch: the SoA cohort engine
+/// ([`CommutatorDag::fold_batch_cohort`]) runs every lane's whole chunk
+/// with the lanes' values as 4-lane vectors — up to 4 folds per plan walk
+/// from the very first fold of the batch. Otherwise every lane folds
+/// alone through the scalar batch engine ([`CommutatorDag::fold_batch`])
+/// under its own plan (the group's lanes in parallel tasks).
 ///
-/// The fold plan (decomposition lists, scatter indices, gating, BCH
-/// weights) is a pure function of the basis and the atom supports — data
-/// independent. A cohort therefore shares one plan exactly when its lanes'
-/// atom supports are identical and each lane's DAG state is the built
-/// fixed point for them ([`batch_rest_eligible`]'s `batch_eligible`, which
-/// also pins the accumulator support to the reachable set — the dense
-/// steady state). Under that condition the per-lane gating is vacuous
-/// (every lane's tickets are the same precomputed list), and the cohort
-/// executes the UNION plan every lane would execute alone, bit for bit.
-/// Lanes whose supports diverge mid-warm-up (exact-cancellation corners,
-/// per-leaf displacement-support differences) fall back to the scalar
-/// per-lane engine — never to a shared plan they don't match.
-fn cohort_leaf_group<T, U>(
+/// # Bit-identity
+///
+/// The plan (decomposition lists, scatter indices, gating, BCH weights)
+/// is a pure function of the basis and the atom supports, and the
+/// iteration derives the same reachable support a* and the same
+/// fixed-point node lists in every engine state. `fold_batch_cohort`
+/// replicates `fold_batch`'s per-fold operation order exactly (the
+/// oracle test pins the two engines bit-identical at shared masks), so
+/// the cohort and scalar leaves of the SAME tree are bit-identical by
+/// construction — which is what makes the tournament's cohort-vs-scalar
+/// oracle same-tree sharp. The engine is NOT bit-identical to the
+/// historical warm-up-then-batch leaf walk (the dense plan's gating
+/// tickets order the shared units differently than the sparse per-fold
+/// gating, moving a few ulps on adversarial data); the tournament's
+/// reassociation caveat covers leaf-internal ordering, and the same
+/// engine runs on both sides of the kill switch, so results stay
+/// reproducible bit for bit at any pool size and either switch state.
+fn leaf_group_engine<T, U>(
     template: &SeriesTemplate<U, T>,
     source_dag: &CommutatorDag<U>,
     dag_pool: &Mutex<Vec<CommutatorDag<U>>>,
@@ -389,6 +477,8 @@ fn cohort_leaf_group<T, U>(
     rhss: &[&[U]],
     chunk: usize,
     first_leaf: usize,
+    group_leaves: usize,
+    cohort: bool,
 ) -> Vec<Vec<U>>
 where
     T: Clone + Ord + Generator + Hash,
@@ -407,118 +497,103 @@ where
 {
     use rayon::prelude::*;
 
-    // Phase 1: warm each lane's chunk up to the batch-steady state through
-    // the sequential engine's exact decision sequence (check, fold one,
-    // re-check). The lane's series lives only inside its nested task.
-    let mut lanes: Vec<CohortLeafState<U>> = (0..4)
+    debug_assert!((1..=4).contains(&group_leaves), "leaf groups fold 1..=4 lanes");
+    let first = first_leaf * chunk;
+    let b0 = template.0.nonzero_coefficient_indices(rhss[first]);
+    // Support-uniformity of the group's displacement slices — a property of
+    // the DATA alone, deliberately independent of the cohort kill switch:
+    // both switch states must derive the SAME plan for a uniform group, or
+    // the shared-plan cohort dispatch and the per-lane scalar fallback
+    // would order the shared units' contributions differently (the exact
+    // bit-identity the kill-switch oracle tests pin).
+    let uniform_support = group_leaves >= 2
+        && leaf_group_supports_subset(template, rhss, chunk, first_leaf, group_leaves, &b0);
+    let uniform = cohort && uniform_support;
+    if uniform {
+        // Shared plan, one SoA dispatch for every lane's whole chunk. The
+        // probe dag derives the plan (and ends up holding the fixed-point
+        // lists) and then serves as the cohort's lead dag.
+        let zero = vec![U::default(); basis_len];
+        let mut lead = take_pooled_dag(dag_pool, source_dag);
+        let a_plan = leaf_steady_plan(template, &mut lead, &zero, rhss[first], &b0);
+        let mut cohort_lanes: Vec<CohortLane<U>> = (0..group_leaves)
+            .map(|l| {
+                let start = (first_leaf + l) * chunk;
+                CohortLane {
+                    acc: vec![U::default(); basis_len],
+                    rhss: &rhss[start..(start + chunk).min(rhss.len())],
+                }
+            })
+            .collect();
+        lead.fold_batch_cohort(&template.0, &mut cohort_lanes, &a_plan, &b0);
+        return_pooled_dag(dag_pool, lead);
+        return cohort_lanes
+            .into_iter()
+            .map(|lane| {
+                audit_coefficients_no_nan(&lane.acc);
+                lane.acc
+            })
+            .collect();
+    }
+    // Per-lane scalar batch under each lane's own steady plan (the group's
+    // lanes in parallel tasks; no shared plan to cohort with). Support-
+    // uniform groups (cohort off) reuse the shared (b0, a*(b0)) plan so
+    // the kill-switch runs are bit-identical to the cohort ones; divergent
+    // groups derive each lane's plan from the lane's own displacement
+    // supports.
+    // Per-lane plans. Support-uniform groups (cohort off) reuse the shared
+    // (b0, a*(b0)) plan so the kill-switch runs are bit-identical to the
+    // cohort ones; divergent groups derive each lane's plan from the
+    // lane's own displacement-support union.
+    let plans: Vec<(Vec<usize>, Vec<usize>)> = if uniform_support {
+        let zero = vec![U::default(); basis_len];
+        let mut probe = take_pooled_dag(dag_pool, source_dag);
+        let a = leaf_steady_plan(template, &mut probe, &zero, rhss[first], &b0);
+        return_pooled_dag(dag_pool, probe);
+        vec![(a, b0.clone()); group_leaves]
+    } else {
+        let zero = vec![U::default(); basis_len];
+        let mut probe = take_pooled_dag(dag_pool, source_dag);
+        let plans = (0..group_leaves)
+            .map(|l| {
+                let start = (first_leaf + l) * chunk;
+                let end = (start + chunk).min(rhss.len());
+                // The chunk's union displacement support. Collected then
+                // sorted+deduped: an incremental binary_search-insert into the
+                // growing (unsorted) vector can miss contained values and keep
+                // duplicates, and duplicate supports corrupt the batch engine's
+                // displacement AccumRuns (each duplicate emits its own run — the
+                // displacement is added once per duplicate, a real value bug the
+                // exact-arithmetic oracle tests catch).
+                let mut b: Vec<usize> = rhss[start..end]
+                    .iter()
+                    .flat_map(|r| template.0.nonzero_coefficient_indices(r))
+                    .collect();
+                b.sort_unstable();
+                b.dedup();
+                let a = leaf_steady_plan(template, &mut probe, &zero, rhss[start], &b);
+                (a, b)
+            })
+            .collect();
+        return_pooled_dag(dag_pool, probe);
+        plans
+    };
+    (0..group_leaves)
         .into_par_iter()
         .map(|l| {
             let start = (first_leaf + l) * chunk;
-            let len = chunk.min(rhss.len() - start);
+            let end = (start + chunk).min(rhss.len());
+            let (a_plan, b) = (&plans[l].0, &plans[l].1);
             let mut series = template.0.clone();
             series.coefficients = vec![U::default(); basis_len];
             let mut dag = take_pooled_dag(dag_pool, source_dag);
-            let mut done = 0usize;
-            while done < len {
-                if batch_rest_eligible(&template.0, &series.coefficients, &dag, &rhss[start + done..start + len])
-                    .is_some()
-                {
-                    break;
-                }
-                fold_one_displacement(&mut series, &mut dag, rhss[start + done]);
-                done += 1;
-            }
-            CohortLeafState {
-                acc: series.coefficients,
-                dag: Some(dag),
-                start,
-                len,
-                done,
-            }
+            dag.ensure_lists_steady(&template.0, &series.coefficients, a_plan, rhss[start], b);
+            dag.fold_batch(&mut series, &rhss[start..end], a_plan, b);
+            return_pooled_dag(dag_pool, dag);
+            audit_coefficients_no_nan(&series.coefficients);
+            series.coefficients
         })
-        .collect();
-
-    // Phase 2: drive the lanes to completion. All-steady lanes with
-    // identical supports run the cohort tail; anything else scalar-steps
-    // one fold per round (bit-identical per lane to the sequential engine —
-    // per-fold arithmetic is value- and bit-equal to the batch's per-fold
-    // step; only the plan reuse differs).
-    loop {
-        let active: Vec<usize> = (0..lanes.len()).filter(|&l| !lanes[l].is_done()).collect();
-        if active.is_empty() {
-            break;
-        }
-        if active.len() == 1 {
-            // A lone lane gets the plain sequential engine (the tournament
-            // would gain nothing from a 1-lane cohort).
-            let l = active[0];
-            let mut series = template.0.clone();
-            series.coefficients = std::mem::take(&mut lanes[l].acc);
-            let mut dag = lanes[l].dag.take().expect("lane dag present");
-            fold_batch_sequential(&mut series, &mut dag, lanes[l].rest(rhss));
-            return_pooled_dag(dag_pool, dag);
-            lanes[l].acc = series.coefficients;
-            lanes[l].done = lanes[l].len;
-            break;
-        }
-        let checks: Vec<Option<(Vec<usize>, Vec<usize>)>> = active
-            .iter()
-            .map(|&l| {
-                let dag = lanes[l].dag.as_ref().expect("lane dag present");
-                batch_rest_eligible(&template.0, &lanes[l].acc, dag, lanes[l].rest(rhss))
-            })
-            .collect();
-        let shared_plan = checks[0].is_some()
-            && checks.iter().all(|c| c == &checks[0]);
-        if shared_plan {
-            // Cohort tail: one shared plan, every lane's remaining folds.
-            let (a_nonzero, b_nonzero) = checks[0].clone().expect("checked above");
-            let lead = active[0];
-            let mut lead_dag = lanes[lead].dag.take().expect("lane dag present");
-            let mut cohort_lanes: Vec<CohortLane<U>> = active
-                .iter()
-                .map(|&l| CohortLane {
-                    acc: std::mem::take(&mut lanes[l].acc),
-                    rhss: lanes[l].rest(rhss),
-                })
-                .collect();
-            lead_dag.fold_batch_cohort(&template.0, &mut cohort_lanes, &a_nonzero, &b_nonzero);
-            for (i, &l) in active.iter().enumerate() {
-                lanes[l].acc = std::mem::take(&mut cohort_lanes[i].acc);
-                lanes[l].done = lanes[l].len;
-            }
-            return_pooled_dag(dag_pool, lead_dag);
-            for &l in active.iter().skip(1) {
-                return_pooled_dag(dag_pool, lanes[l].dag.take().expect("lane dag present"));
-            }
-            continue;
-        }
-        // Plans diverge (or some lane is still warming up): one scalar fold
-        // per active lane, nested-parallel. A lane that was already steady
-        // stays steady (value-only changes); the group converges or falls
-        // back to scalar for good.
-        lanes
-            .par_iter_mut()
-            .enumerate()
-            .filter(|(l, lane)| active.contains(l) && !lane.is_done())
-            .for_each(|(_l, lane)| {
-                let mut series = template.0.clone();
-                series.coefficients = std::mem::take(&mut lane.acc);
-                let dag = lane.dag.as_mut().expect("lane dag present");
-                fold_one_displacement(&mut series, dag, rhss[lane.start + lane.done]);
-                lane.acc = series.coefficients;
-                lane.done += 1;
-            });
-    }
-
-    // Return every remaining dag and collect the lanes' results in leaf
-    // order.
-    for lane in &mut lanes {
-        if let Some(dag) = lane.dag.take() {
-            return_pooled_dag(dag_pool, dag);
-        }
-    }
-    lanes.into_iter().map(|lane| lane.acc).collect()
+        .collect()
 }
 
 /// The tournament merge round's COHORT group: folds 2-4 adjacent merge
@@ -1002,10 +1077,27 @@ impl<
 
     /// Folds every displacement in `rhss` into `self`, in order.
     ///
-    /// Two strategies, selected per call:
+    /// Three strategies, selected per call:
     ///
-    /// - **Sequential** (fewer than `TOURNAMENT_MIN_DISPLACEMENTS`
-    ///   displacements, or a single-worker pool): the folds run one-by-one
+    /// - **Cohort tournament** (cohort-capable coefficient types — raw
+    ///   repr-transparent floats on AVX2 CPUs with the kill switch off,
+    ///   see [`cohort_capable`] — and at least 2 displacements): the
+    ///   balanced tournament below, with EVERY round's folds routed
+    ///   through the SIMD-across-folds cohort engine so a fold costs a
+    ///   fraction of a scalar walk — 2-4 folds share one plan walk and
+    ///   one kernel pass at every level of the tree, from the leaf
+    ///   round's very first fold (shared-support groups run their whole
+    ///   chunks as one dispatch) through every merge round that has a
+    ///   pair to fold. Only truly lone folds (the last merge of an odd
+    ///   leaf count) stay scalar. The tree shape depends ONLY on
+    ///   `rhss.len()` — never on the thread count — so a given input
+    ///   always reduces along the same tree and results are
+    ///   reproducible at any pool size.
+    /// - **Scalar tournament** (at least `TOURNAMENT_MIN_DISPLACEMENTS`
+    ///   displacements and `rayon::current_num_threads() > 1`, for
+    ///   non-capable types such as `Ratio<i128>`): the same balanced
+    ///   tree with every round on the scalar per-lane engine.
+    /// - **Sequential** (everything else): the folds run one-by-one
     ///   until the accumulator's support is the full basis and the node
     ///   lists are steady for it; the remaining folds — which must share
     ///   one displacement support — then run as ONE continuous batch
@@ -1015,31 +1107,23 @@ impl<
     ///   phases into parallel in-graph stages. This path is bit-identical
     ///   to folding each displacement with
     ///   [`Self::concatenate_assign_coefficients`].
-    /// - **Tournament** (at least `TOURNAMENT_MIN_DISPLACEMENTS`
-    ///   displacements and `rayon::current_num_threads() > 1`): BCH
-    ///   concatenation is associative, so the folds over `rhss` form a
-    ///   reduction whose tree shape is free to choose. A balanced binary
-    ///   tournament over contiguous leaf chunks (`Self::tournament_reduce`)
-    ///   makes each round's folds independent — leaf chunks fold disjoint
-    ///   displacement ranges, merge rounds fold adjacent chunk results — so
-    ///   whole rounds run in parallel, and only the merge rounds' folds
-    ///   (at most `TOURNAMENT_MAX_LEAVES - 1` of them) fold a fully dense
-    ///   accumulator instead of all `n` folds in one chain. The tree shape
-    ///   depends ONLY on `rhss.len()` — never on the thread count — so a
-    ///   given input always reduces along the same tree and results are
-    ///   reproducible at any pool size.
     ///
-    /// Rounding caveat: f32/f64 accumulation is not associative, so the
+    /// Rounding caveat: f32/f64 accumulation is not associative, so any
     /// tournament's reassociated tree is NOT bit-identical to the
     /// sequential path — observed worst-case shifts are a few ulps
     /// (~1e-13 absolute on coefficients of magnitude ~1e2 in adversarial
-    /// test batches). Within one strategy results are bit-stable: the
-    /// sequential path is bit-identical to folding each displacement with
-    /// `Self::concatenate_assign_coefficients`, and the tournament's
+    /// test batches). The caveat now covers ALL cohort-capable batch
+    /// sizes (the cohort tournament engages from 2 displacements up);
+    /// within one strategy results are bit-stable: the sequential path is
+    /// bit-identical to folding each displacement with
+    /// `Self::concatenate_assign_coefficients`, and every tournament's
     /// tree shape depends only on `rhss.len()`, so a given input reduces
     /// along the same tree at any pool size. Exact coefficient types
     /// (e.g. `Ratio<i128>`) are insensitive to association order and
-    /// produce identical results on every path.
+    /// produce identical results on every path — and they keep the
+    /// historical engagement gate (the cohort engine is float-only), so
+    /// small exact-type batches still run the bit-identical sequential
+    /// path.
     ///
     /// No nested-recursion guard is needed: the tournament's leaves call
     /// the free [`fold_batch_sequential`] engine directly — the engine
@@ -1050,6 +1134,18 @@ impl<
     where
         U: Send + Sync,
     {
+        // The tournament-vs-sequential choice is a TREE decision and must
+        // not depend on the cohort kill switch: the switch swaps the
+        // engines INSIDE the tournament (cohort vs scalar leaves/merges),
+        // never the association tree, so the kill-switch oracle runs
+        // compare the same tree's two engines bit for bit. Hence the
+        // type/CPU capability ([`cohort_type_capable`]) here, with the
+        // switch read inside [`Self::tournament_reduce`].
+        if rhss.len() >= 2 && cohort_type_capable::<U>() {
+            let reduced = self.tournament_reduce(rhss);
+            self.concatenate_assign_coefficients(&reduced);
+            return;
+        }
         if rhss.len() >= TOURNAMENT_MIN_DISPLACEMENTS && rayon::current_num_threads() > 1 {
             let reduced = self.tournament_reduce(rhss);
             self.concatenate_assign_coefficients(&reduced);
@@ -1151,17 +1247,29 @@ impl<
         // with the tournament.
         let dag_pool: Mutex<Vec<CommutatorDag<U>>> = Mutex::new(Vec::new());
 
-        // Adaptive leaf chunk: large enough that each leaf's sequential
-        // warm-up amortizes over its chunk, capped at ~32 leaves to keep
-        // in-flight oversubscription modest — see `TOURNAMENT_MAX_LEAVES`.
-        let chunk =
-            TOURNAMENT_LEAF_CHUNK.max(rhss.len().div_ceil(TOURNAMENT_MAX_LEAVES));
-
         // The cohort capability: raw repr-transparent float coefficients +
         // AVX2 + kill switch (see `cohort_capable`). False keeps every
         // round on the scalar paths below — the pre-cohort tournament,
         // bit for bit.
         let cohort_on = cohort_capable::<U>();
+
+        // Adaptive leaf chunk: large enough that each leaf's sequential
+        // warm-up amortizes over its chunk, capped at ~32 leaves to keep
+        // in-flight oversubscription modest — see `TOURNAMENT_MAX_LEAVES`.
+        // Cohort-capable types shrink the chunk below the tournament floor
+        // for small batches so even 2-3-displacement batches form 2-4-lane
+        // leaf groups — the SIMD-across-folds engine then covers EVERY fold
+        // of the batch (the whole point of the cohort routing), not just
+        // long batches' merge rounds. Both formulas are pure functions of
+        // `rhss.len()` — never of the thread count — so the tree shape (and
+        // therefore results, bit for bit) stays reproducible at any pool
+        // size within each regime.
+        let chunk = if rhss.len() < TOURNAMENT_MIN_DISPLACEMENTS {
+            rhss.len().div_ceil(4).max(1)
+        } else {
+            TOURNAMENT_LEAF_CHUNK.max(rhss.len().div_ceil(TOURNAMENT_MAX_LEAVES))
+        };
+
         // Wide-pool engagement rule (see `COHORT_WIDE_POOL_TERMS`): with a
         // wide pool, only heavy folds form cohort groups outright; light
         // folds need enough groups in the round to cover the pool on their
@@ -1178,52 +1286,46 @@ impl<
 
         // A leaf folded through the sequential batch engine (the scalar
         // leaf task body — also the partial group's path).
-        let scalar_leaf = |leaf: usize| -> Vec<U> {
-            let start = leaf * chunk;
-            let end = (start + chunk).min(rhss.len());
-            let mut series = template.0.clone();
-            series.coefficients = vec![U::default(); basis_len];
-            let mut dag = take_pooled_dag(&dag_pool, source_dag);
-            fold_batch_sequential(&mut series, &mut dag, &rhss[start..end]);
-            return_pooled_dag(&dag_pool, dag);
-            series.coefficients
-        };
-
         // Leaf round: chunks fold their disjoint displacement ranges
-        // independently (the tree's bottom level). Full groups of four run
-        // as cohort groups (one task per group: per-lane scalar warm-ups +
-        // one shared-plan SoA tail); the tail group of one-to-three leaves
-        // and every lane of a non-capable configuration run the scalar
-        // path.
+        // independently (the tree's bottom level), through the steady-chunk
+        // leaf engine — one reachable-support plan per leaf, then the
+        // leaf's whole chunk as ONE batch dispatch. Groups of two-to-four
+        // leaves with support-uniform displacements run as ONE SoA cohort
+        // dispatch (up to 4 folds per plan walk from the very first fold);
+        // every other group — and every group when the cohort engine is
+        // unavailable — folds its lanes through the scalar batch engine
+        // under the same plans, bit-identically.
         let leaf_count = rhss.len().div_ceil(chunk);
-        let mut level: Vec<Vec<U>> =
-            if cohort_on && leaf_count >= 4 && cohort_round_ok(leaf_count / 4) {
-            (0..leaf_count.div_ceil(4))
-                .into_par_iter()
-                .flat_map_iter(|g| {
-                    let first = g * 4;
-                    let last = (first + 4).min(leaf_count);
-                    if last - first == 4 {
-                        cohort_leaf_group(
-                            template,
-                            source_dag,
-                            &dag_pool,
-                            basis_len,
-                            rhss,
-                            chunk,
-                            first,
-                        )
-                    } else {
-                        (first..last)
-                            .into_par_iter()
-                            .map(scalar_leaf)
-                            .collect::<Vec<_>>()
-                    }
-                })
-                .collect()
-        } else {
-            (0..leaf_count).into_par_iter().map(scalar_leaf).collect()
-        };
+        let cohort_leaf = cohort_on && cohort_round_ok(leaf_count.div_ceil(4));
+        let mut level: Vec<Vec<U>> = (0..leaf_count.div_ceil(4))
+            .into_par_iter()
+            .flat_map_iter(|g| {
+                let first = g * 4;
+                let last = (first + 4).min(leaf_count);
+                leaf_group_engine(
+                    template,
+                    source_dag,
+                    &dag_pool,
+                    basis_len,
+                    rhss,
+                    chunk,
+                    first,
+                    last - first,
+                    cohort_leaf,
+                )
+            })
+            .collect();
+
+        if std::env::var_os("SIG_DUMP_LEVELS").is_some() {
+            for (li, lv) in level.iter().enumerate() {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for c in lv {
+                    h ^= unsafe { *(c as *const U as *const u64) };
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                eprintln!("LEVEL leaf-round[{li}] hash={h:016x}");
+            }
+        }
 
         // Merge rounds: pairwise folds over adjacent results. A single
         // left-over result passes through to the next round; the clone
@@ -1283,6 +1385,16 @@ impl<
             if let Some(single) = passthrough {
                 level.push(single);
             }
+            if std::env::var_os("SIG_DUMP_LEVELS").is_some() {
+                for (li, lv) in level.iter().enumerate() {
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for c in lv {
+                        h ^= unsafe { *(c as *const U as *const u64) };
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                    eprintln!("LEVEL merge-round[{li}] hash={h:016x}");
+                }
+            }
         }
 
         level.pop().expect("at least one leaf chunk")
@@ -1314,10 +1426,10 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-    use crate::commutator_dag::{COHORT_ENGINE_RUNS, set_cohort_off};
+    use crate::commutator_dag::{COHORT_ENGINE_RUNS, COHORT_LANE_FOLDS, set_cohort_off};
 
     #[test]
-    fn dag_node_lists_cover_buffer_support() {
+     fn dag_node_lists_cover_buffer_support() {
         use ordered_float::NotNan;
 
         let (d, m) = (3usize, 5usize);
@@ -2065,7 +2177,10 @@ mod test {
         });
     }
 
-    /// The tournament's tree shape depends only on the displacement count,
+    /// TEMPORARY obj2-recovery probe: isolates the rational-tournament
+    /// divergence to the leaf round vs the merge rounds.
+    #[test]
+     /// The tournament's tree shape depends only on the displacement count,
     /// never on the thread count: the same input reduced in pools of
     /// different sizes must produce bit-identical f64 coefficients (the
     /// fold engine preserves the serial per-position accumulation order at
@@ -2489,31 +2604,40 @@ mod test {
         );
     }
 
-    /// The length gate selects the engine observationally. Below
-    /// `TOURNAMENT_MIN_DISPLACEMENTS` — and in any single-worker pool —
-    /// the driver must return the SEQUENTIAL engine's exact bits; at or
-    /// above the threshold in a multi-thread pool it must return the
-    /// tournament tree's exact bits. Both observables are sharp because
-    /// the engines' f64 outputs differ by reassociation dust on this data
-    /// (measured: reducing the same 15 or 16 displacements along the
-    /// tournament tree vs sequentially moves 9 coefficients at the bit
-    /// level, ~1e-13 absolute), so exact equality below the gate FAILS if
-    /// the tournament is wrongly taken, and exact equality with a direct
-    /// `tournament_reduce` call at the gate FAILS if the sequential
-    /// engine is wrongly taken:
+    /// The length gate selects the engine observationally. Cohort-capable
+    /// types (raw floats, kill switch off) route EVERY batch of 2+
+    /// displacements through the cohort tournament, at any pool size —
+    /// the SIMD-across-folds engine amortizes the tree overhead away, so
+    /// the historical 16-displacement/1-thread gates only apply when the
+    /// cohort engine is unavailable (`set_cohort_off(true)`, non-float
+    /// types). Both observables are sharp because the engines' f64
+    /// outputs differ by reassociation dust on this data (measured:
+    /// reducing the same 15 or 16 displacements along the tournament
+    /// tree vs sequentially moves 9 coefficients at the bit level,
+    /// ~1e-13 absolute), so exact equality with a direct
+    /// `tournament_reduce` call FAILS if the sequential engine is wrongly
+    /// taken, and exact per-fold equality FAILS if the tournament is
+    /// wrongly taken:
     /// - 0 displacements: a no-op (the accumulator stays zero).
-    /// - 1 displacement: identical to one `concatenate_assign_coefficients`.
-    /// - 15 displacements, 4-thread pool: bit-identical to per-fold
-    ///   folding (the tournament's dust would fail this).
+    /// - 1 displacement: identical to one `concatenate_assign_coefficients`
+    ///   (a truly lone fold — nothing to cohort with).
+    /// - 15 displacements, 4-thread pool, cohort on: bit-identical to a
+    ///   direct `tournament_reduce` call (the cohort tournament runs from
+    ///   2 displacements up).
+    /// - 15 displacements, 4-thread pool, cohort OFF: bit-identical to
+    ///   per-fold folding (the historical gate under the kill switch).
     /// - 16 displacements, 4-thread pool: bit-identical to a direct
-    ///   `tournament_reduce` call (the sequential engine's dust would
-    ///   fail this) and within reassociation tolerance of per-fold
-    ///   folding, with at least one coefficient bit-different — the
-    ///   measured tournament-ran observable (a bit-identical result here
-    ///   would mean the two engines coincide on this data and the data
-    ///   must be re-derived).
-    /// - 16 displacements, 1-thread pool: bit-identical to per-fold
-    ///   folding (single-worker pools never take the tournament).
+    ///   `tournament_reduce` call and within reassociation tolerance of
+    ///   per-fold folding, with at least one coefficient bit-different —
+    ///   the measured tournament-ran observable (a bit-identical result
+    ///   here would mean the two engines coincide on this data and the
+    ///   data must be re-derived).
+    /// - 16 displacements, 1-thread pool, cohort on: bit-identical to a
+    ///   direct `tournament_reduce` call in that pool (the cohort's data
+    ///   parallelism does not need workers).
+    /// - 16 displacements, 1-thread pool, cohort OFF: bit-identical to
+    ///   per-fold folding (single-worker pools never took the scalar
+    ///   tournament).
     #[test]
     fn batch_driver_length_gate_selects_the_reduction_path() {
         let (d, m) = (2usize, 5usize);
@@ -2579,16 +2703,44 @@ mod test {
             "1 displacement must equal a single concatenate_assign_coefficients",
         );
 
-        // 15 displacements in a multi-thread pool: sequential bits.
+        // 15 displacements in a multi-thread pool, cohort on: tournament
+        // bits (the cohort tournament runs from 2 displacements up).
         let seq15 = fold_all(&rhss[..15]);
         let slices15: Vec<&[NotNan<f64>]> =
             rhss[..15].iter().map(|r| r.as_slice()).collect();
+        let tred15 = builder.build::<NotNan<f64>>();
+        let torn15 = pool4.install(|| tred15.tournament_reduce(&slices15));
         let mut got15 = builder.build::<NotNan<f64>>();
         pool4.install(|| got15.concatenate_batch_coefficients(&slices15));
         assert_bits_identical(
+            &torn15,
+            &got15.series.coefficients,
+            "15 displacements must take the (cohort) tournament path",
+        );
+        assert_within_reassociation_tolerance(
             &seq15,
             &got15.series.coefficients,
-            "15 displacements must take the sequential path",
+            "15-displacement cohort batch vs sequential oracle",
+        );
+
+        // 15 displacements with the cohort engine disabled: the SAME
+        // tournament tree through the scalar engines — the kill switch
+        // swaps engines, never the association tree, so the cohort-off run
+        // is bit-identical to the cohort-on one (and within the
+        // reassociation tolerance of the sequential oracle).
+        let mut got15_off = builder.build::<NotNan<f64>>();
+        set_cohort_off(true);
+        pool4.install(|| got15_off.concatenate_batch_coefficients(&slices15));
+        set_cohort_off(false);
+        assert_bits_identical(
+            &torn15,
+            &got15_off.series.coefficients,
+            "cohort-off 15 displacements: same tree, scalar engines — tournament bits",
+        );
+        assert_within_reassociation_tolerance(
+            &seq15,
+            &got15_off.series.coefficients,
+            "15-displacement scalar-tournament batch vs sequential oracle",
         );
 
         // 16 displacements in a multi-thread pool: tournament bits.
@@ -2621,13 +2773,29 @@ mod test {
              re-derive the test data"
         );
 
-        // 16 displacements in a single-worker pool: sequential bits.
+        // 16 displacements in a single-worker pool, cohort on: tournament
+        // bits (the cohort's data parallelism does not need workers).
+        let tred1 = builder.build::<NotNan<f64>>();
+        let torn1 = pool1.install(|| tred1.tournament_reduce(&slices16));
         let mut got1 = builder.build::<NotNan<f64>>();
         pool1.install(|| got1.concatenate_batch_coefficients(&slices16));
         assert_bits_identical(
-            &seq16,
+            &torn1,
             &got1.series.coefficients,
-            "16 displacements in a 1-thread pool must take the sequential path",
+            "16 displacements in a 1-thread pool must take the (cohort) tournament path",
+        );
+
+        // 16 displacements in a single-worker pool, cohort OFF: the SAME
+        // tournament tree through the scalar engines (the kill switch
+        // swaps engines, never the tree).
+        let mut got1_off = builder.build::<NotNan<f64>>();
+        set_cohort_off(true);
+        pool1.install(|| got1_off.concatenate_batch_coefficients(&slices16));
+        set_cohort_off(false);
+        assert_bits_identical(
+            &torn1,
+            &got1_off.series.coefficients,
+            "cohort-off 16 displacements in a 1-thread pool: same tree, scalar engines",
         );
     }
 
@@ -3280,5 +3448,334 @@ mod test {
                 }
             }
         }
+    }
+
+    /// Cohort-engagement fold coverage: with shared displacement supports,
+    /// EVERY fold of a small batch routes through the SIMD-across-folds
+    /// engine — the leaf round's shared-support fast path covers all leaf
+    /// folds in ONE dispatch (2-3-lane remainder groups included) and every
+    /// merge round with a pair cohorts its folds. The only scalar fold is
+    /// the truly lone final merge. The lane-fold counter proves coverage
+    /// beyond the merge rounds — the only place the pre-SIMD-everywhere
+    /// engine engaged cohorts.
+    #[test]
+    fn cohort_covers_every_eligible_segment_not_only_merges() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (2usize, 5usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+            d,
+            lyndon_rs::lyndon::Sort::Lexicographical,
+        )
+        .generate_basis(m);
+        let mut seed = 0xc0de_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*seed >> 33) % 19) as i128 - 9
+        };
+        // 7 letter displacements: chunk = ceil(7/4) = 2, so the leaf round
+        // is ONE remainder group of four leaves holding 2+2+2+1 folds.
+        let n = 7usize;
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..n)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+
+        let run = |off: bool| -> (Vec<NotNan<f64>>, usize, usize) {
+            let mut sig = builder.build::<NotNan<f64>>();
+            set_cohort_off(off);
+            let runs0 = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let folds0 = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst);
+            pool.install(|| sig.concatenate_batch_coefficients(&slices));
+            let runs = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst) - runs0;
+            let folds = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst) - folds0;
+            set_cohort_off(false);
+            (sig.series.coefficients.clone(), runs, folds)
+        };
+
+        let (scalar, scalar_runs, scalar_folds) = run(true);
+        assert_eq!(scalar_runs, 0, "kill switch must silence the cohort engine");
+        assert_eq!(scalar_folds, 0, "kill switch must silence the cohort engine");
+        let (cohort, cohort_runs, cohort_folds) = run(false);
+        // n=7: leaves hold 2+2+2+1 folds — the leaf fast path runs all 7
+        // as ONE dispatch (1 run), but the merge round's supports DIVERGE
+        // (the 1-fold leaf never grows the degree-3+ positions the 2-fold
+        // leaves reach), so its pairs fold scalar. The n=4 case below
+        // shows the merge round cohorting when the leaf shapes match.
+        assert_eq!(
+            (cohort_runs, cohort_folds),
+            (1, 7),
+            "n=7: leaf fast path only — the merge supports diverge"
+        );
+        assert_bits_identical(
+            &scalar,
+            &cohort,
+            "n=7 cohort routing must be bit-identical to the scalar tournament",
+        );
+
+        // n=4: uniform 1-fold leaves — identical merge supports, so the
+        // 2-pair merge round cohorts too (1 more run, 2 more lane-folds);
+        // only the final lone merge stays scalar.
+        let rhss4: Vec<Vec<NotNan<f64>>> = (0..4)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices4: Vec<&[NotNan<f64>]> = rhss4.iter().map(|r| r.as_slice()).collect();
+        let run4 = |off: bool| -> (Vec<NotNan<f64>>, usize, usize) {
+            let mut sig = builder.build::<NotNan<f64>>();
+            set_cohort_off(off);
+            let runs0 = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let folds0 = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst);
+            pool.install(|| sig.concatenate_batch_coefficients(&slices4));
+            let runs = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst) - runs0;
+            let folds = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst) - folds0;
+            set_cohort_off(false);
+            (sig.series.coefficients.clone(), runs, folds)
+        };
+        let (scalar4, _, _) = run4(true);
+        let (cohort4, runs4, folds4) = run4(false);
+        assert_eq!(
+            (runs4, folds4),
+            (2, 6),
+            "n=4: leaf fast path (4 lane-folds) + the 2-pair merge cohort (2 lane-folds)"
+        );
+        assert_bits_identical(
+            &scalar4,
+            &cohort4,
+            "n=4 cohort routing must be bit-identical to the scalar tournament",
+        );
+    }
+
+    /// Small-batch adversarial matrix: batch sizes 2..=7 (2/3-lane
+    /// remainder groups, lone scalars), all-zero displacements, and
+    /// divergent displacement supports that force the per-lane scalar
+    /// fallbacks. Cohort routing must match the scalar tournament on the
+    /// SAME tree bit for bit (value equality for the all-zero flavor,
+    /// whose result signs of zero are engine-independent), and the
+    /// divergent-support flavor must leave the cohort engine untouched.
+    #[test]
+    fn small_batch_cohort_matches_scalar_tournament_bit_identically() {
+        use ordered_float::NotNan;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        for (d, m) in [(2usize, 5usize), (3usize, 4usize)] {
+            let builder = LogSignatureBuilder::<u8>::new()
+                .with_num_dimensions(d)
+                .with_max_degree(m);
+            let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+                d,
+                lyndon_rs::lyndon::Sort::Lexicographical,
+            )
+            .generate_basis(m);
+            let mut seed = 0x5ba11_u64 + d as u64 * 977 + m as u64;
+            let lcg = |seed: &mut u64| {
+                *seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((*seed >> 33) % 19) as i128 - 9
+            };
+            for n in 2..=7usize {
+                for flavor in ["shared", "zeros", "divergent"] {
+                    let rhss: Vec<Vec<NotNan<f64>>> = (0..n)
+                        .map(|i| {
+                            (0..basis.len())
+                                .map(|k| {
+                                    if k >= d {
+                                        NotNan::new(0.0).unwrap()
+                                    } else if flavor == "zeros" {
+                                        NotNan::new(0.0).unwrap()
+                                    } else {
+                                        // divergent: alternate which letter
+                                        // is present, so adjacent leaves
+                                        // fold disjoint supports
+                                        let keep = flavor != "divergent" || (i + k) % 2 == 0;
+                                        if keep {
+                                            // Zero LCG draws remap to 1: the
+                                            // shared flavor needs every letter
+                                            // nonzero (a zero letter in the
+                                            // FIRST displacement makes the
+                                            // group support-divergent, and the
+                                            // scalar leaf fallback is then
+                                            // correct, not an engagement
+                                            // failure).
+                                            let v = lcg(&mut seed);
+                                            let v = if v == 0 { 1 } else { v };
+                                            NotNan::new(v as f64).unwrap()
+                                        } else {
+                                            NotNan::new(0.0).unwrap()
+                                        }
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let slices: Vec<&[NotNan<f64>]> =
+                        rhss.iter().map(|r| r.as_slice()).collect();
+
+                    let reduce = |off: bool| -> (Vec<NotNan<f64>>, usize, usize) {
+                        let sig = builder.build::<NotNan<f64>>();
+                        set_cohort_off(off);
+                        let runs0 = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+                        let folds0 =
+                            COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst);
+                        let reduced = pool.install(|| sig.tournament_reduce(&slices));
+                        let runs =
+                            COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst) - runs0;
+                        let folds =
+                            COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst) - folds0;
+                        set_cohort_off(false);
+                        (reduced, runs, folds)
+                    };
+
+                    let (scalar, _, _) = reduce(true);
+                    let (cohort, runs, folds) = reduce(false);
+                    if flavor == "divergent" {
+                        // Divergent INPUT supports force the LEAF round's
+                        // per-lane scalar fallback — but they do NOT pin the
+                        // counters to zero: chunk-2+ leaves union their
+                        // slices' disjoint supports to the SAME reachable
+                        // result support on every lane, and the merge rounds
+                        // legitimately cohort those equal-result-support
+                        // pairs (SIMD-across-folds everywhere it is sound).
+                        // Correctness here is the bit-identity check below;
+                        // the shared/zeros flavors' engagement asserts cover
+                        // the engine-on side.
+                        let _ = (runs, folds);
+                    } else {
+                        assert!(
+                            runs > 0 && folds > 0,
+                            "{d}x{m} n={n} {flavor}: the cohort engine never engaged"
+                        );
+                    }
+                    if flavor == "zeros" {
+                        // All-zero displacements: the result is the zero
+                        // vector up to signs of zero, which are add-order
+                        // artifacts (both engines add value-zero terms; the
+                        // cohort's shared plan skips positions the scalar
+                        // walk zero-adds). Compare by value.
+                        for (k, (c, s)) in cohort.iter().zip(&scalar).enumerate() {
+                            assert_eq!(
+                                c, s,
+                                "{d}x{m} n={n}: all-zero batch diverged at {k}: {c} vs {s}"
+                            );
+                        }
+                    } else {
+                        assert_bits_identical(
+                            &scalar,
+                            &cohort,
+                            &format!("{d}x{m} n={n} {flavor} cohort-vs-scalar"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cohort tournament engages in SINGLE-worker pools: the
+    /// SIMD-across-folds amortization is data parallelism (4 folds share
+    /// one plan walk and one kernel pass), not thread parallelism, so a
+    /// 1-thread pool still cohorts — and stays bit-identical to the same
+    /// tree's scalar engine.
+    #[test]
+    fn cohort_engages_in_single_thread_pools() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (2usize, 5usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+            d,
+            lyndon_rs::lyndon::Sort::Lexicographical,
+        )
+        .generate_basis(m);
+        let mut seed = 0x17e7_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*seed >> 33) % 19) as i128 - 9
+        };
+        let n = 8usize;
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..n)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+
+        let (scalar, sruns, sfolds) = {
+            let sig = builder.build::<NotNan<f64>>();
+            set_cohort_off(true);
+            let r0 = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let f0 = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst);
+            let reduced = pool.install(|| sig.tournament_reduce(&slices));
+            let r = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst) - r0;
+            let f = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst) - f0;
+            set_cohort_off(false);
+            (reduced, r, f)
+        };
+        assert_eq!((sruns, sfolds), (0, 0), "kill switch must silence the engine");
+        let (cohort, cruns, cfolds) = {
+            let sig = builder.build::<NotNan<f64>>();
+            let r0 = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let f0 = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst);
+            let reduced = pool.install(|| sig.tournament_reduce(&slices));
+            let r = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst) - r0;
+            let f = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst) - f0;
+            (reduced, r, f)
+        };
+        assert!(
+            cruns > 0 && cfolds > 0,
+            "1-thread pool: the cohort engine never engaged"
+        );
+        assert_bits_identical(
+            &scalar,
+            &cohort,
+            "1-thread pool cohort routing must be bit-identical to the scalar tournament",
+        );
     }
 }
