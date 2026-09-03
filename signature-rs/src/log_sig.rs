@@ -280,7 +280,7 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
     /// reduction (see [`LogSignature::concatenate_batch_coefficients`]), the
     /// folds are reassociated along a balanced tree — a shape that depends
     /// only on the number of displacements, never on the thread count — so
-    /// f32/f64 rounding may differ in the last ulp from strictly sequential
+    /// f32/f64 rounding may differ by a few ulps from strictly sequential
     /// folding, while exact coefficient types remain bit-identical.
     #[must_use]
     pub fn build_from_path<
@@ -537,10 +537,16 @@ impl<
     ///   results are reproducible at any pool size.
     ///
     /// Rounding caveat: f32/f64 accumulation is not associative, so the
-    /// tournament's reassociation may change last-ulp rounding relative to
-    /// strictly sequential folding. Exact coefficient types (e.g.
-    /// `Ratio<i128>`) are insensitive to association order and produce
-    /// identical results on every path.
+    /// tournament's reassociated tree is NOT bit-identical to the
+    /// sequential path — observed worst-case shifts are a few ulps
+    /// (~1e-13 absolute on coefficients of magnitude ~1e2 in adversarial
+    /// test batches). Within one strategy results are bit-stable: the
+    /// sequential path is bit-identical to folding each displacement with
+    /// `Self::concatenate_assign_coefficients`, and the tournament's
+    /// tree shape depends only on `rhss.len()`, so a given input reduces
+    /// along the same tree at any pool size. Exact coefficient types
+    /// (e.g. `Ratio<i128>`) are insensitive to association order and
+    /// produce identical results on every path.
     ///
     /// No nested-recursion guard is needed: neither the tournament's folds
     /// nor `concatenate_assign_coefficients` re-enters this driver.
@@ -740,6 +746,7 @@ mod test {
     use ndarray::{Array2, array};
     use num_rational::Ratio;
     use num_traits::ToPrimitive;
+    use ordered_float::NotNan;
     use rstest::rstest;
 
     use super::*;
@@ -1190,10 +1197,14 @@ mod test {
         }
     }
 
-    /// Differential test: after the first fold (which builds the node lists
-    /// through the collecting pass), the steady level-batch evaluation must
-    /// produce bit-identical node buffers to a fresh DAG's collecting
-    /// rebuild — the oracle — for every subsequent fold.
+    /// Differential test for the SEQUENTIAL batch engine, exercised
+    /// directly via `concatenate_batch_sequential` so the exact-equality
+    /// comparison stays valid regardless of the tournament threshold: the
+    /// driver must warm-fold per-fold while the support grows and the node
+    /// lists steady, then batch the eligible rest in ONE dispatch — and
+    /// stay bit-identical to folding each displacement per-fold, for both
+    /// all-eligible letter displacements and a mixed-support run that
+    /// forces the per-fold fallback.
     #[test]
     fn concatenate_batch_matches_sequential_folds() {
         use ordered_float::NotNan;
@@ -1254,11 +1265,12 @@ mod test {
                     seq.concatenate_assign_coefficients(r);
                 }
 
-                // Batched: same displacements through the batch driver.
+                // Batched: same displacements through the sequential
+                // batch driver.
                 let mut bat = builder.build::<NotNan<f64>>();
                 bat.series.coefficients = acc0;
                 let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
-                bat.concatenate_batch_coefficients(&slices);
+                bat.concatenate_batch_sequential(&slices);
 
                 let diffs: Vec<_> = seq
                     .series
@@ -1285,7 +1297,9 @@ mod test {
     /// correctness is timing-sensitive under a stage-ordering race, so a
     /// single pass is not sufficient evidence — this loop makes a race
     /// visible in CI instead of surfacing as a rare downstream wrong
-    /// number.
+    /// number. The sequential driver is exercised directly
+    /// (`concatenate_batch_sequential`) so the hammer targets that
+    /// engine's walk regardless of the tournament threshold.
     #[test]
     fn concatenate_batch_survives_repeated_pool_stress() {
         use ordered_float::NotNan;
@@ -1358,7 +1372,7 @@ mod test {
                     let mut bat = builder.build::<NotNan<f64>>();
                     bat.series.coefficients = acc0;
                     let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
-                    bat.concatenate_batch_coefficients(&slices);
+                    bat.concatenate_batch_sequential(&slices);
 
                     let diffs: Vec<_> = seq
                         .series
@@ -1380,10 +1394,12 @@ mod test {
         }
     }
 
-    /// The batch must also produce bit-identical results with exact
-    /// rational coefficients, where mid-batch cancellations to zero are
-    /// REAL (the dense-mask soundness argument is exercised for values,
-    /// not just float dust).
+    /// The sequential batch engine must also produce bit-identical results
+    /// with exact rational coefficients, where mid-batch cancellations to
+    /// zero are REAL (the dense-mask soundness argument is exercised for
+    /// values, not just float dust). Exercised via
+    /// `concatenate_batch_sequential` directly so the exact-equality
+    /// assertion stays valid regardless of the tournament threshold.
     #[test]
     fn concatenate_batch_exact_rationals_match_sequential() {
         let (d, m) = (2usize, 4usize);
@@ -1422,7 +1438,7 @@ mod test {
         let mut bat = builder.build::<R>();
         bat.series.coefficients = acc0;
         let slices: Vec<&[R]> = rhss.iter().map(|r| r.as_slice()).collect();
-        bat.concatenate_batch_coefficients(&slices);
+        bat.concatenate_batch_sequential(&slices);
         assert_eq!(seq.series.coefficients, bat.series.coefficients);
     }
 
@@ -1530,13 +1546,73 @@ mod test {
         assert_eq!(run(4), run(9));
     }
 
-    /// Folding from a ZERO accumulator (the build_from_path shape): the
-    /// driver must warm-fold per-fold while the support grows, then batch
-    /// the rest — and stay bit-identical to all-per-fold.
+    /// Reassociation tolerance for tournament-vs-sequential f64 value
+    /// comparisons, applied per coefficient as
+    /// `TOURNAMENT_REASSOCIATION_TOL * max(1, |a|, |b|)`. Measured worst
+    /// case on the 16-displacement zero-accumulator batch below:
+    /// 1.279e-13 absolute on coefficients of up to 1.86e2 magnitude — a
+    /// relative 2.2e-15, i.e. ~10 ulps of rounding dust. The bound keeps
+    /// ~780x absolute headroom over that dust at O(1) magnitudes (and
+    /// ~1e-10 relative headroom at larger ones) while staying ten-plus
+    /// orders below the O(1)..O(1e2) shifts that a real support/gating/
+    /// kernel bug produces: dust passes, structural errors fail loudly.
+    const TOURNAMENT_REASSOCIATION_TOL: f64 = 1e-10;
+
+    /// Asserts `tournament` matches the sequential `oracle` within the
+    /// documented reassociation tolerance; `context` names the batch in
+    /// the panic message.
+    fn assert_within_reassociation_tolerance(
+        oracle: &[NotNan<f64>],
+        tournament: &[NotNan<f64>],
+        context: &str,
+    ) {
+        assert_eq!(oracle.len(), tournament.len(), "{context}: length mismatch");
+        for (k, (a, b)) in oracle.iter().zip(tournament.iter()).enumerate() {
+            let (a, b) = (a.into_inner(), b.into_inner());
+            let diff = (a - b).abs();
+            let bound = TOURNAMENT_REASSOCIATION_TOL * a.abs().max(b.abs()).max(1.0);
+            assert!(
+                diff <= bound,
+                "{context}: coefficient {k} off by {diff:.3e} (bound {bound:.3e}): \
+                 oracle={a} tournament={b}"
+            );
+        }
+    }
+
+    /// Bit-level equality for f64 coefficient vectors: `assert_eq` on
+    /// `NotNan` equates `0.0` and `-0.0`, which are different bytes, so
+    /// cross-pool/cross-run determinism is asserted on `to_bits`.
+    fn assert_bits_identical(a: &[NotNan<f64>], b: &[NotNan<f64>], context: &str) {
+        assert_eq!(a.len(), b.len(), "{context}: length mismatch");
+        for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            let (xb, yb) = (x.into_inner().to_bits(), y.into_inner().to_bits());
+            assert!(
+                xb == yb,
+                "{context}: coefficient {k} differs at the bit level: bits {xb:b} vs {yb:b}"
+            );
+        }
+    }
+
+    /// Folding from a ZERO accumulator (the build_from_path shape) through
+    /// the tournament path: every leaf folds its displacement chunk from a
+    /// zeroed accumulator — the same support-growth regime the sequential
+    /// driver runs — and pooled merge DAGs then meet the full-support
+    /// accumulator. The oracle is the sequential driver
+    /// (`concatenate_batch_sequential`) on a fresh clone.
+    ///
+    /// Assertions are split by nature. SUPPORT is structural: which basis
+    /// words are non-zero must agree between the two reduction shapes
+    /// bit-for-bit (a scatter-target or gating bug drops or spurs a
+    /// supported word long before values drift past tolerance), and the
+    /// supported word set is asserted word-for-word — it is data, so a
+    /// machinery change that moves support must fail here, not silently
+    /// re-derive it. VALUES are compared under the documented
+    /// reassociation tolerance: measured worst case on this exact batch
+    /// is 1.279e-13 absolute on coefficients of up to 1.86e2 magnitude
+    /// (~2.2e-15 relative, ~10 ulps; see
+    /// `assert_within_reassociation_tolerance`).
     #[test]
     fn concatenate_batch_grows_from_sparse_support() {
-        use ordered_float::NotNan;
-
         let (d, m) = (2usize, 5usize);
         let builder = LogSignatureBuilder::<u8>::new()
             .with_num_dimensions(d)
@@ -1562,15 +1638,532 @@ mod test {
                     .collect()
             })
             .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
 
-        let mut seq = builder.build::<NotNan<f64>>();
+        // The words support must grow to — identical for every reduction
+        // shape: both letters and every degree-2..4 word over {0,1}; no
+        // degree-5 word enters the kernel-visible support (the support is
+        // cut off at max_degree).
+        const SUPPORTED_WORDS: &[&[u8]] = &[
+            &[0],
+            &[1],
+            &[0, 1],
+            &[0, 0, 1],
+            &[0, 1, 1],
+            &[0, 0, 0, 1],
+            &[0, 0, 1, 1],
+            &[0, 1, 1, 1],
+        ];
+        let check_support = |sig: &LogSignature<u8, NotNan<f64>>, label: &str| {
+            let sup = sig
+                .series
+                .nonzero_coefficient_indices(&sig.series.coefficients);
+            let words: Vec<&[u8]> = sup.iter().map(|&i| basis[i].letters.as_slice()).collect();
+            assert_eq!(words, SUPPORTED_WORDS, "{label}: supported words changed");
+        };
+
+        // Oracle: the strictly sequential driver on a fresh clone of the
+        // zero-accumulator signature (fresh DAG — no node lists yet).
+        let mut oracle = builder.build::<NotNan<f64>>();
+        oracle.concatenate_batch_sequential(&slices);
+        check_support(&oracle, "sequential oracle");
+
+        // Tournament path: 16 displacements in a forced multi-thread pool.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let mut bat = builder.build::<NotNan<f64>>();
+        pool.install(|| bat.concatenate_batch_coefficients(&slices));
+        check_support(&bat, "tournament");
+
+        assert_within_reassociation_tolerance(
+            &oracle.series.coefficients,
+            &bat.series.coefficients,
+            "16-displacement zero-accumulator batch",
+        );
+    }
+
+    /// The sequential engine's growth contract, kept explicit under the
+    /// tournament's shadow: from a ZERO accumulator, folding one-by-one
+    /// grows the kernel-visible support fold by fold (measured trajectory
+    /// on this data: 1 → 6 → 8 words over the first three folds, then
+    /// saturation), and the sequential batch driver — which warm-folds
+    /// through that growth before batching the eligible rest — must stay
+    /// BIT-identical to all-per-fold. Exact equality: no reassociation is
+    /// involved on this path, so any difference is a sequential-machinery
+    /// regression (the tournament path is compared against this engine
+    /// with tolerance in `concatenate_batch_grows_from_sparse_support`,
+    /// and the driver's engine selection itself is pinned by
+    /// `batch_driver_length_gate_selects_the_reduction_path`).
+    #[test]
+    fn concatenate_batch_sequential_bit_identical_from_zero_accumulator() {
+        let (d, m) = (2usize, 5usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mut seed = 0x5a7e_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 7) as i128 - 3
+        };
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..16)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+
+        // Per-fold reference, recording the support-growth trajectory.
+        let mut per_fold = builder.build::<NotNan<f64>>();
+        let mut support_growth = Vec::new();
+        for r in &rhss {
+            per_fold.concatenate_assign_coefficients(r);
+            support_growth.push(
+                per_fold
+                    .series
+                    .nonzero_coefficient_indices(&per_fold.series.coefficients)
+                    .len(),
+            );
+        }
+        assert_eq!(
+            support_growth,
+            vec![1, 6, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+            "support-growth trajectory from the zero accumulator changed"
+        );
+
+        let mut driver = builder.build::<NotNan<f64>>();
+        driver.concatenate_batch_sequential(&slices);
+        assert_eq!(
+            per_fold.series.coefficients,
+            driver.series.coefficients,
+            "sequential batch driver diverged from per-fold folding"
+        );
+        assert_eq!(
+            driver
+                .series
+                .nonzero_coefficient_indices(&driver.series.coefficients)
+                .len(),
+            8,
+            "driver's final support count changed"
+        );
+    }
+
+    /// Exact-type identity at tournament scale, over awkward odd batch
+    /// sizes (17 = 8+8+1: a single-displacement tail leaf; 31 = 8+8+8+7:
+    /// a short tail; 63: eight full leaves), dimensions 2–4, degrees 3–5,
+    /// and mixed sparse supports: every third displacement drops a
+    /// rotating letter, and letter values hit zero exactly, so leaf folds
+    /// rebuild node lists mid-flight and pooled DAGs see varying supports.
+    /// Rational arithmetic has no rounding to hide behind: ANY coefficient
+    /// difference from the sequential fold chain is a real exactness bug
+    /// (reassociation must be invisible to exact types). The gate premise
+    /// is asserted against the source gate itself (n ≥
+    /// `TOURNAMENT_MIN_DISPLACEMENTS` in a multi-thread pool); the
+    /// routing behavior those conditions select is pinned observationally
+    /// by `batch_driver_length_gate_selects_the_reduction_path`.
+    #[rstest]
+    #[case(2, 3, 17)]
+    #[case(3, 4, 31)]
+    #[case(2, 5, 31)]
+    #[case(4, 5, 63)]
+    fn tournament_rationals_exact_at_awkward_sizes(
+        #[case] d: usize,
+        #[case] m: usize,
+        #[case] n: usize,
+    ) {
+        type R = Ratio<i64>;
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mut seed = 0x3a11_u64.wrapping_add((d * 1007 + m * 97 + n) as u64);
+        let lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 7) as i64 - 3
+        };
+        // Letter displacements with a rotating dropped letter every third
+        // displacement (changing supports → collecting rebuilds inside
+        // leaves and across pooled-DAG reuse) and exact-zero letter values
+        // wherever the LCG produces 0.
+        let rhss: Vec<Vec<R>> = (0..n)
+            .map(|i| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d && !(i % 3 == 2 && k == i % d) {
+                            R::from_integer(lcg(&mut seed))
+                        } else {
+                            R::from_integer(0)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[R]> = rhss.iter().map(|r| r.as_slice()).collect();
+
+        let mut seq = builder.build::<R>();
         for r in &rhss {
             seq.concatenate_assign_coefficients(r);
         }
-        let mut bat = builder.build::<NotNan<f64>>();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        pool.install(|| {
+            assert!(
+                n >= TOURNAMENT_MIN_DISPLACEMENTS && rayon::current_num_threads() > 1,
+                "test premise: the driver must select the tournament path"
+            );
+            let mut bat = builder.build::<R>();
+            bat.concatenate_batch_coefficients(&slices);
+            assert_eq!(
+                seq.series.coefficients,
+                bat.series.coefficients,
+                "d={d} m={m} n={n}: rational tournament diverged from sequential"
+            );
+        });
+    }
+
+    /// Cross-thread determinism at scale: the same 40-displacement batch
+    /// (five leaves, three merge rounds, an odd pass-through) reduced
+    /// under forced 1-, 3-, and 16-thread pools must be BYTE-identical —
+    /// the tree shape is a function of the displacement count alone, and
+    /// every fold preserves the serial per-position accumulation order at
+    /// any slot count. `tournament_reduce` is called directly so the
+    /// 1-thread pool exercises the tournament walk itself (the public
+    /// driver routes a single-worker pool to the sequential engine — that
+    /// gate is `batch_driver_length_gate_selects_the_reduction_path`'s
+    /// subject); the public driver is additionally checked for
+    /// byte-identity across 3- and 16-thread pools, where it takes the
+    /// tournament on both.
+    #[test]
+    fn tournament_reduce_bit_identical_across_pool_sizes() {
+        let (d, m) = (2usize, 5usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mut seed = 0xc055_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 7) as i128 - 3
+        };
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..40)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
-        bat.concatenate_batch_coefficients(&slices);
-        assert_eq!(seq.series.coefficients, bat.series.coefficients);
+
+        let reduce_direct = |threads: usize| -> Vec<NotNan<f64>> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let sig = builder.build::<NotNan<f64>>();
+            pool.install(|| sig.tournament_reduce(&slices))
+        };
+        let reduce_driver = |threads: usize| -> Vec<NotNan<f64>> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let mut sig = builder.build::<NotNan<f64>>();
+            pool.install(|| {
+                sig.concatenate_batch_coefficients(&slices);
+                sig.series.coefficients.clone()
+            })
+        };
+
+        let one = reduce_direct(1);
+        let three = reduce_direct(3);
+        let sixteen = reduce_direct(16);
+        assert_bits_identical(&one, &three, "tournament 1 vs 3 threads");
+        assert_bits_identical(&one, &sixteen, "tournament 1 vs 16 threads");
+
+        assert_bits_identical(
+            &reduce_driver(3),
+            &reduce_driver(16),
+            "public driver 3 vs 16 threads",
+        );
+    }
+
+    /// The length gate selects the engine observationally. Below
+    /// `TOURNAMENT_MIN_DISPLACEMENTS` — and in any single-worker pool —
+    /// the driver must return the SEQUENTIAL engine's exact bits; at or
+    /// above the threshold in a multi-thread pool it must return the
+    /// tournament tree's exact bits. Both observables are sharp because
+    /// the engines' f64 outputs differ by reassociation dust on this data
+    /// (measured: reducing the same 15 or 16 displacements along the
+    /// tournament tree vs sequentially moves 9 coefficients at the bit
+    /// level, ~1e-13 absolute), so exact equality below the gate FAILS if
+    /// the tournament is wrongly taken, and exact equality with a direct
+    /// `tournament_reduce` call at the gate FAILS if the sequential
+    /// engine is wrongly taken:
+    /// - 0 displacements: a no-op (the accumulator stays zero).
+    /// - 1 displacement: identical to one `concatenate_assign_coefficients`.
+    /// - 15 displacements, 4-thread pool: bit-identical to per-fold
+    ///   folding (the tournament's dust would fail this).
+    /// - 16 displacements, 4-thread pool: bit-identical to a direct
+    ///   `tournament_reduce` call (the sequential engine's dust would
+    ///   fail this) and within reassociation tolerance of per-fold
+    ///   folding, with at least one coefficient bit-different — the
+    ///   measured tournament-ran observable (a bit-identical result here
+    ///   would mean the two engines coincide on this data and the data
+    ///   must be re-derived).
+    /// - 16 displacements, 1-thread pool: bit-identical to per-fold
+    ///   folding (single-worker pools never take the tournament).
+    #[test]
+    fn batch_driver_length_gate_selects_the_reduction_path() {
+        let (d, m) = (2usize, 5usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mut seed = 0xb0a_d05_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 7) as i128 - 3
+        };
+        let mk_rhss = |count: usize, seed: &mut u64| -> Vec<Vec<NotNan<f64>>> {
+            (0..count)
+                .map(|_| {
+                    (0..basis.len())
+                        .map(|k| {
+                            if k < d {
+                                NotNan::new(lcg(seed) as f64).unwrap()
+                            } else {
+                                NotNan::new(0.0).unwrap()
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let rhss = mk_rhss(17, &mut seed);
+        let fold_all = |rs: &[Vec<NotNan<f64>>]| -> Vec<NotNan<f64>> {
+            let mut sig = builder.build::<NotNan<f64>>();
+            for r in rs {
+                sig.concatenate_assign_coefficients(r);
+            }
+            sig.series.coefficients
+        };
+        let pool4 = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let pool1 = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+
+        // 0 displacements: a no-op.
+        let mut sig0 = builder.build::<NotNan<f64>>();
+        sig0.concatenate_batch_coefficients(&[]);
+        assert!(
+            sig0.series.coefficients.iter().all(|c| c.is_zero()),
+            "empty batch must not touch the accumulator"
+        );
+
+        // 1 displacement: a single fold.
+        let mut single = builder.build::<NotNan<f64>>();
+        single.concatenate_assign_coefficients(&rhss[0]);
+        let mut sig1 = builder.build::<NotNan<f64>>();
+        sig1.concatenate_batch_coefficients(&[&rhss[0]]);
+        assert_bits_identical(
+            &single.series.coefficients,
+            &sig1.series.coefficients,
+            "1 displacement must equal a single concatenate_assign_coefficients",
+        );
+
+        // 15 displacements in a multi-thread pool: sequential bits.
+        let seq15 = fold_all(&rhss[..15]);
+        let slices15: Vec<&[NotNan<f64>]> =
+            rhss[..15].iter().map(|r| r.as_slice()).collect();
+        let mut got15 = builder.build::<NotNan<f64>>();
+        pool4.install(|| got15.concatenate_batch_coefficients(&slices15));
+        assert_bits_identical(
+            &seq15,
+            &got15.series.coefficients,
+            "15 displacements must take the sequential path",
+        );
+
+        // 16 displacements in a multi-thread pool: tournament bits.
+        let seq16 = fold_all(&rhss[..16]);
+        let slices16: Vec<&[NotNan<f64>]> =
+            rhss[..16].iter().map(|r| r.as_slice()).collect();
+        let tred = builder.build::<NotNan<f64>>();
+        let torn16 = pool4.install(|| tred.tournament_reduce(&slices16));
+        let mut got16 = builder.build::<NotNan<f64>>();
+        pool4.install(|| got16.concatenate_batch_coefficients(&slices16));
+        assert_bits_identical(
+            &torn16,
+            &got16.series.coefficients,
+            "16 displacements must take the tournament path",
+        );
+        assert_within_reassociation_tolerance(
+            &seq16,
+            &got16.series.coefficients,
+            "16-displacement batch vs sequential oracle",
+        );
+        let bit_diffs = seq16
+            .iter()
+            .zip(&got16.series.coefficients)
+            .filter(|(a, b)| a.into_inner().to_bits() != b.into_inner().to_bits())
+            .count();
+        assert!(
+            bit_diffs > 0,
+            "16-displacement tournament result is bit-identical to the sequential \
+             engine on this data — the tournament-ran observable is gone; \
+             re-derive the test data"
+        );
+
+        // 16 displacements in a single-worker pool: sequential bits.
+        let mut got1 = builder.build::<NotNan<f64>>();
+        pool1.install(|| got1.concatenate_batch_coefficients(&slices16));
+        assert_bits_identical(
+            &seq16,
+            &got1.series.coefficients,
+            "16 displacements in a 1-thread pool must take the sequential path",
+        );
+    }
+
+    /// NaN-audit parity on the tournament path: a leaf's SECOND fold
+    /// overflows — the first fold from a zero accumulator is safe
+    /// (0 × MAX = 0; the result is just the degree-1 displacement), then
+    /// MAX × MAX products overflow to ±inf and the fused two-orientation
+    /// term computes inf + (−inf) = NaN — and the per-fold audit must
+    /// panic with the same message the sequential engine panics with,
+    /// propagating through rayon's task boundary (rayon re-throws the
+    /// original payload, and the tournament's DAG-pool mutex is
+    /// poison-tolerant, so no secondary poison panic can replace it).
+    #[test]
+    #[should_panic(expected = "log-signature coefficients overflowed to NaN")]
+    fn tournament_path_audits_nan_after_overflow() {
+        let (d, m) = (2usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let len = builder.build::<NotNan<f64>>().series.coefficients.len();
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..24)
+            .map(|_| {
+                (0..len)
+                    .map(|k| NotNan::new(if k < d { f64::MAX } else { 0.0 }).unwrap())
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        pool.install(|| {
+            let mut sig = builder.build::<NotNan<f64>>();
+            sig.concatenate_batch_coefficients(&slices);
+        });
+    }
+
+    /// Repeated-run determinism: identical tournament reductions in a row
+    /// must be byte-identical — nothing may leak between calls through
+    /// the shared compiled plan (Arc'd decomposition tables, source-DAG
+    /// node lists, pooled-DAG scratch). A different-shape,
+    /// different-support tournament runs in between on a signature whose
+    /// DAG shares the plan with a warmed one (clone_shallow), and the
+    /// first input then repeats twice — a stale support-keyed gate entry
+    /// or left-over pooled-DAG node lists would surface as a byte
+    /// difference on the repeats.
+    #[test]
+    fn tournament_repeated_runs_byte_identical() {
+        let (d, m) = (2usize, 5usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mk_rhss = |count: usize, seed: &mut u64, drop_letter: bool| -> Vec<Vec<NotNan<f64>>> {
+            (0..count)
+                .map(|i| {
+                    (0..basis.len())
+                        .map(|k| {
+                            let dropped = drop_letter && i % 3 == 2 && k == i % d;
+                            if k < d && !dropped {
+                                let v = {
+                                    *seed = seed
+                                        .wrapping_mul(6364136223846793005)
+                                        .wrapping_add(1);
+                                    ((*seed >> 33) % 7) as i128 - 3
+                                };
+                                NotNan::new(v as f64).unwrap()
+                            } else {
+                                NotNan::new(0.0).unwrap()
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        // A: dense letter displacements; B: mixed sparse supports.
+        let mut seed_a = 0x9eaf_u64;
+        let rhss_a = mk_rhss(24, &mut seed_a, false);
+        let slices_a: Vec<&[NotNan<f64>]> = rhss_a.iter().map(|r| r.as_slice()).collect();
+        let mut seed_b = 0x9eb0_u64;
+        let rhss_b = mk_rhss(17, &mut seed_b, true);
+        let slices_b: Vec<&[NotNan<f64>]> = rhss_b.iter().map(|r| r.as_slice()).collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let run_a = || -> Vec<NotNan<f64>> {
+            pool.install(|| {
+                let mut sig = builder.build::<NotNan<f64>>();
+                sig.concatenate_batch_coefficients(&slices_a);
+                sig.series.coefficients.clone()
+            })
+        };
+
+        let first = run_a();
+        // Interleave: a warmed signature (node lists built for A's
+        // supports) is cloned — sharing the compiled plan — and runs B's
+        // mixed-support tournament through the shared plan.
+        pool.install(|| {
+            let mut warm = builder.build::<NotNan<f64>>();
+            warm.concatenate_batch_coefficients(&slices_a);
+            let mut shared = warm.clone();
+            shared.concatenate_batch_coefficients(&slices_b);
+        });
+        let second = run_a();
+        let third = run_a();
+        assert_bits_identical(&first, &second, "repeated identical tournament runs");
+        assert_bits_identical(&first, &third, "third identical tournament run");
     }
 
     /// The raw-float fast path does not panic on per-operation overflow (see
