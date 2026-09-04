@@ -10,6 +10,16 @@ use std::ops::{AddAssign, MulAssign, Neg};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 
+/// Arc-shared immutable per-node scatter-target lists — the dag field
+/// type and the leaf steady-plan cache's snapshot type. A dag adopts a
+/// snapshot by `Arc` reference (zero copy); every mutation path is
+/// copy-on-write (replace the `Arc` wholesale, or `Arc::unwrap_or_clone`
+/// when exclusively held), so a shared snapshot is never mutated.
+pub(crate) type SharedNodeLists = Arc<Vec<Vec<usize>>>;
+/// Arc-shared immutable per-node dirty bitsets — shared exactly like
+/// [`SharedNodeLists`].
+pub(crate) type SharedDirtyLists = Arc<Vec<Vec<u64>>>;
+
 use commutator_rs::CommutatorTerm;
 use lie_rs::{
     BlockShape, ClassBatchStage, ClassOrder, ClassOrderedCommutation, GatingCache, KernelJob,
@@ -161,10 +171,18 @@ pub(crate) struct CommutatorDag<U> {
     /// supports are unchanged, and every list remains a superset of the
     /// node buffer's non-zero indices (the kernel's presence tests only
     /// need the superset: a listed zero-valued index contributes zero).
-    pub(crate) nonzeros: Vec<Vec<usize>>,
+    ///
+    /// `Arc`-shared: adoption from the leaf steady-plan cache installs the
+    /// cache's immutable snapshot by reference (zero copy), and every
+    /// mutation path is copy-on-write — the owning `Arc` is replaced
+    /// wholesale (rebuilds/re-records) or unwrapped when exclusively held
+    /// (`Arc::unwrap_or_clone`) — so a shared snapshot is never mutated
+    /// through the `Arc`.
+    pub(crate) nonzeros: SharedNodeLists,
     /// Deduplication scratch for the collecting rebuild, one bitset per
-    /// internal node sized to the basis.
-    dirty: Vec<Vec<u64>>,
+    /// internal node sized to the basis. Shared/copied exactly like
+    /// [`Self::nonzeros`].
+    dirty: SharedDirtyLists,
     /// The atom supports the current `nonzeros` were built from.
     atom_a: Vec<usize>,
     atom_b: Vec<usize>,
@@ -530,8 +548,8 @@ where
                 levels,
             }),
             buffers: Vec::new(),
-            nonzeros: Vec::new(),
-            dirty: Vec::new(),
+            nonzeros: Arc::new(Vec::new()),
+            dirty: Arc::new(Vec::new()),
             atom_a: Vec::new(),
             atom_b: Vec::new(),
             lists_built: false,
@@ -597,6 +615,12 @@ where
         let rebuild = !self.lists_built || self.atom_a != a_nonzero || self.atom_b != b_nonzero;
 
         if rebuild {
+            // Copy-on-write: a dag sharing an adopted snapshot's lists must
+            // never mutate them through the `Arc`. Unwrap when exclusively
+            // held (free), clone when shared, mutate the owned copy, and
+            // install it as this dag's own `Arc`.
+            let mut nz = Arc::unwrap_or_clone(std::mem::take(&mut self.nonzeros));
+            let mut dt = Arc::unwrap_or_clone(std::mem::take(&mut self.dirty));
             // One serial topological sweep in which the kernel re-derives
             // every node's scatter-target set: topological order guarantees
             // a node's children's lists were rebuilt earlier in the pass.
@@ -610,16 +634,18 @@ where
                 result.fill(U::default());
                 let lbuf = node_slice(left, before, &a_cls, &b_cls);
                 let rbuf = node_slice(right, before, &a_cls, &b_cls);
-                let (nz_before, nz_rest) = self.nonzeros.split_at_mut(k - 2);
+                let (nz_before, nz_rest) = nz.split_at_mut(k - 2);
                 let lnz = node_nonzeros(left, nz_before, &a_nz_cls, &b_nz_cls);
                 let rnz = node_nonzeros(right, nz_before, &a_nz_cls, &b_nz_cls);
                 let list = &mut nz_rest[0];
                 list.clear();
-                let dirty = &mut self.dirty[k - 2];
+                let dirty = &mut dt[k - 2];
                 series.class_commutation_with_nonzero_collecting(
                     order, lbuf, lnz, rbuf, rnz, result, dirty, list,
                 );
             }
+            self.nonzeros = Arc::new(nz);
+            self.dirty = Arc::new(dt);
             self.atom_a.clear();
             self.atom_a.extend_from_slice(a_nonzero);
             self.atom_b.clear();
@@ -731,7 +757,7 @@ where
         let words = inv.len();
         let words64 = words.div_ceil(64);
         let mut reach = vec![0u64; words64];
-        for list in &self.nonzeros {
+        for list in self.nonzeros.iter() {
             for &i in list {
                 reach[i / 64] |= 1 << (i % 64);
             }
@@ -898,8 +924,10 @@ where
         // function (the dispatch joins before they drop).
         // Local copies of the node lists for the jobs' operand views (the
         // lists are re-recorded from the planner's exact scatter sets
-        // below, so the jobs must not borrow `self.nonzeros`).
-        let lists_local: Vec<Vec<usize>> = self.nonzeros.clone();
+        // below, so the jobs must not borrow `self.nonzeros`). `Arc`-shared
+        // read-only: the re-record below installs a NEW Arc wholesale, so
+        // the jobs' view of the old lists stays valid without a copy.
+        let lists_local: SharedNodeLists = Arc::clone(&self.nonzeros);
         for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
             for (jj, &k) in level.iter().enumerate() {
                 let (left, right) = match self.structure.nodes[k as usize] {
@@ -961,7 +989,14 @@ where
         // point for later batches, and stay sound supersets for the per-
         // fold path's gating.
         {
-            let mut updated = std::mem::take(&mut self.nonzeros);
+            // Copy-on-write re-record: the exact scatter sets replace EVERY
+            // binary node's list (interning only creates binary internal
+            // nodes — asserted below), so a fresh shell avoids copying the
+            // old lists — crucial when they are an adopted cache snapshot
+            // shared by `Arc` (a shared snapshot must never be mutated).
+            let internal = self.structure.nodes.len() - 2;
+            let mut updated: Vec<Vec<usize>> = vec![Vec::new(); internal];
+            let mut written = 0_usize;
             for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
                 for (jj, &k) in level.iter().enumerate() {
                     if matches!(self.structure.nodes[k as usize], DagNode::Binary { .. }) {
@@ -969,10 +1004,12 @@ where
                             .iter()
                             .map(|&p| p as usize)
                             .collect();
+                        written += 1;
                     }
                 }
             }
-            self.nonzeros = updated;
+            debug_assert_eq!(written, internal, "every internal node must be re-recorded");
+            self.nonzeros = Arc::new(updated);
         }
 
         // Compact per-node scratch buffers, sized from the exact scatter
@@ -1486,13 +1523,16 @@ where
         self.lists_built = true;
     }
 
-    /// Clones the current steady-list state for plan caching: the node
+    /// Snapshots the current steady-list state for plan caching: the node
     /// scatter lists and their dirty bitsets exactly as the last
     /// collecting rebuild left them (support-determined content — the
     /// pairing with the derived plan is the caller's, see
-    /// [`Self::adopt_steady_lists`]).
-    pub(crate) fn steady_lists_snapshot(&self) -> (Vec<Vec<usize>>, Vec<Vec<u64>>) {
-        (self.nonzeros.clone(), self.dirty.clone())
+    /// [`Self::adopt_steady_lists`]). `Arc` clones: the snapshot shares
+    /// this dag's lists until the dag first mutates them (copy-on-write).
+    pub(crate) fn steady_lists_snapshot(
+        &self,
+    ) -> (SharedNodeLists, SharedDirtyLists) {
+        (Arc::clone(&self.nonzeros), Arc::clone(&self.dirty))
     }
 
     /// Adopts a support-determined steady-list snapshot: the node scatter
@@ -1510,22 +1550,24 @@ where
     /// the snapshot's shape does not fit this dag's structure (a pooled
     /// dag of a different configuration) or carries a different class
     /// order than the dag already holds — the caller falls back to a
-    /// regular collecting rebuild.
+    /// regular collecting rebuild. The snapshot's lists are installed by
+    /// `Arc` reference — zero copy — and this dag's first list mutation
+    /// thereafter copies (the shared snapshot is never mutated).
     pub(crate) fn adopt_steady_lists(
         &mut self,
         a_plan: &[usize],
         b_nonzero: &[usize],
-        nonzeros: Vec<Vec<usize>>,
-        dirty: Vec<Vec<u64>>,
+        nonzeros: Arc<Vec<Vec<usize>>>,
+        dirty: SharedDirtyLists,
         order: Arc<ClassOrder>,
     ) -> bool {
         if self.structure.nodes.len() - 2 != nonzeros.len() || dirty.len() != nonzeros.len() {
             return false;
         }
-        if let Some(existing) = self.class_order.get() {
-            if !Arc::ptr_eq(&existing, &order) {
-                return false;
-            }
+        if let Some(existing) = self.class_order.get()
+            && !Arc::ptr_eq(existing, &order)
+        {
+            return false;
         }
         self.nonzeros = nonzeros;
         self.dirty = dirty;
@@ -1592,8 +1634,12 @@ where
         // structure the batch dispatch uses. Collection is
         // support-determined: the schedule cannot change the lists.
         let d = series.coefficients.len();
-        let mut lists = std::mem::take(&mut self.nonzeros);
-        let mut dirties = std::mem::take(&mut self.dirty);
+        // Copy-on-write: a dag sharing an adopted snapshot's lists must
+        // never mutate them through the `Arc` — the level-parallel tasks
+        // below write through raw pointers into these locals. Unwrap when
+        // exclusively held (free), clone when shared.
+        let mut lists = Arc::unwrap_or_clone(std::mem::take(&mut self.nonzeros));
+        let mut dirties = Arc::unwrap_or_clone(std::mem::take(&mut self.dirty));
         {
             let nodes = &self.structure.nodes;
             let buffers = &self.buffers;
@@ -1679,8 +1725,8 @@ where
                 });
             }
         }
-        self.nonzeros = lists;
-        self.dirty = dirties;
+        self.nonzeros = Arc::new(lists);
+        self.dirty = Arc::new(dirties);
         self.atom_a.clear();
         self.atom_a.extend_from_slice(a_nonzero);
         self.atom_b.clear();
@@ -1850,7 +1896,7 @@ where
         // UnsafeCell makes that interleaving defined, and the stage
         // counters order it. The allocations live to the end of this
         // function (the dispatch joins before they drop).
-        let lists_local: Vec<Vec<usize>> = self.nonzeros.clone();
+        let lists_local: SharedNodeLists = Arc::clone(&self.nonzeros);
         for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
             for (jj, &k) in level.iter().enumerate() {
                 let (left, right) = match self.structure.nodes[k as usize] {
@@ -1905,7 +1951,14 @@ where
                 true,
             );
         {
-            let mut updated = std::mem::take(&mut self.nonzeros);
+            // Copy-on-write re-record (same fixed-point bookkeeping as
+            // `fold_batch`): the exact cohort scatter sets replace EVERY
+            // binary node's list, so a fresh shell avoids copying the old
+            // lists — crucial when they are an adopted cache snapshot
+            // shared by `Arc` (a shared snapshot must never be mutated).
+            let internal = self.structure.nodes.len() - 2;
+            let mut updated: Vec<Vec<usize>> = vec![Vec::new(); internal];
+            let mut written = 0_usize;
             for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
                 for (jj, &k) in level.iter().enumerate() {
                     if matches!(self.structure.nodes[k as usize], DagNode::Binary { .. }) {
@@ -1913,10 +1966,12 @@ where
                             .iter()
                             .map(|&p| p as usize)
                             .collect();
+                        written += 1;
                     }
                 }
             }
-            self.nonzeros = updated;
+            debug_assert_eq!(written, internal, "every internal node must be re-recorded");
+            self.nonzeros = Arc::new(updated);
         }
 
         // Compact per-node scratch buffers, SoA-interleaved (each scalar
@@ -2424,11 +2479,11 @@ where
             self.lists_built = false;
         }
         if self.nonzeros.len() != count {
-            self.nonzeros = (0..count).map(|_| Vec::new()).collect();
+            self.nonzeros = Arc::new((0..count).map(|_| Vec::new()).collect::<Vec<_>>());
         }
         let words = d.div_ceil(64);
         if self.dirty.len() != count || self.dirty.first().is_none_or(|w| w.len() != words) {
-            self.dirty = (0..count).map(|_| vec![0u64; words]).collect();
+            self.dirty = Arc::new((0..count).map(|_| vec![0u64; words]).collect::<Vec<_>>());
         }
     }
 }
@@ -2439,14 +2494,17 @@ impl<U> CommutatorDag<U> {
     pub(crate) fn clone_shallow(&self) -> Self {
         Self {
             structure: Arc::clone(&self.structure),
-            // Scratch buffers stay per-value, but the compiled target lists
-            // are inherited: a deep-copied accumulator has identical
-            // coefficients, hence identical atom supports, hence the same
-            // fixed point. The clone's first fold reuses the lists instead
-            // of paying a collecting rebuild.
+            // Scratch buffers stay per-value, but the compiled target
+            // lists are inherited by `Arc` reference — a deep-copied
+            // accumulator has identical coefficients, hence identical atom
+            // supports, hence the same fixed point, and the lists are a
+            // support-determined snapshot that the clone's first mutation
+            // copies (the original is never mutated through the shared
+            // `Arc`). The clone's first fold reuses the lists instead of
+            // paying a collecting rebuild — now without the copy.
             buffers: Vec::new(),
-            nonzeros: self.nonzeros.clone(),
-            dirty: self.dirty.clone(),
+            nonzeros: Arc::clone(&self.nonzeros),
+            dirty: Arc::clone(&self.dirty),
             atom_a: self.atom_a.clone(),
             atom_b: self.atom_b.clone(),
             lists_built: self.lists_built,
@@ -2915,8 +2973,8 @@ mod tests {
                 ],
             }),
             buffers: Vec::new(),
-            nonzeros: Vec::new(),
-            dirty: Vec::new(),
+            nonzeros: Arc::new(Vec::new()),
+            dirty: Arc::new(Vec::new()),
             atom_a: Vec::new(),
             atom_b: Vec::new(),
             lists_built: false,

@@ -21,7 +21,10 @@ use std::{
     ops::{AddAssign, Div, Index, IndexMut, MulAssign, Neg, SubAssign},
 };
 
-use crate::commutator_dag::{CohortLane, CommutatorDag, cohort_capable, cohort_type_capable};
+use crate::commutator_dag::{
+    CohortLane, CommutatorDag, SharedDirtyLists, SharedNodeLists, cohort_capable,
+    cohort_type_capable,
+};
 
 /// Process-wide cache of per-configuration series plans: the Lyndon basis
 /// and the structure-constant (`FeasibleDecompositions`) table that
@@ -213,7 +216,7 @@ mod series_plan_cache {
 /// address. Snapshot contents are letter- and coefficient-type-free
 /// (`usize`/`u64`/class order), so the map is concretely typed.
 mod leaf_steady_cache {
-    use super::{Arc, ClassOrder, HashMap, Mutex, OnceLock};
+    use super::{Arc, ClassOrder, HashMap, Mutex, OnceLock, SharedDirtyLists, SharedNodeLists};
 
     /// Key: (table identity, displacement support). The support is the
     /// exact sorted-deduped vector — never a hash — so distinct supports
@@ -224,12 +227,16 @@ mod leaf_steady_cache {
         /// The converged reachable-support plan (public basis indices).
         pub(super) a_plan: Vec<usize>,
         /// The plan dag's node scatter lists (class-contiguous indices),
-        /// exactly as the last collecting rebuild left them.
-        pub(super) nonzeros: Vec<Vec<usize>>,
+        /// exactly as the last collecting rebuild left them. `Arc`-shared:
+        /// a hit adopts these lists by reference into the group's dag —
+        /// zero copy — and the dag's first list mutation copies
+        /// (copy-on-write), so the shared snapshot is never mutated.
+        pub(super) nonzeros: SharedNodeLists,
         /// The matching per-node dirty bitsets. `class_collect_kernel`
-        /// zeroes the dirty words at entry, so the copied post-collection
-        /// state is a valid pre-state for any later collection.
-        pub(super) dirty: Vec<Vec<u64>>,
+        /// zeroes the dirty words at entry, so the post-collection
+        /// state is a valid pre-state for any later collection. Shared
+        /// exactly like [`Self::nonzeros`].
+        pub(super) dirty: SharedDirtyLists,
         /// The class order the lists are expressed in (the table's shared
         /// ordering — the same `Arc` every dag over this table installs).
         pub(super) order: Arc<ClassOrder>,
@@ -254,8 +261,8 @@ mod leaf_steady_cache {
         table_id: u64,
         b: &[usize],
         a_plan: Vec<usize>,
-        nonzeros: Vec<Vec<usize>>,
-        dirty: Vec<Vec<u64>>,
+        nonzeros: SharedNodeLists,
+        dirty: SharedDirtyLists,
         order: Arc<ClassOrder>,
     ) {
         let map = LEAF_STEADY_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -746,16 +753,16 @@ where
         + 'static,
 {
     let table_id = template.0.feasible_decompositions_handle().table_id();
-    if let Some(snap) = leaf_steady_cache::get(table_id, b) {
-        if dag.adopt_steady_lists(
+    if let Some(snap) = leaf_steady_cache::get(table_id, b)
+        && dag.adopt_steady_lists(
             &snap.a_plan,
             b,
-            snap.nonzeros.clone(),
-            snap.dirty.clone(),
+            Arc::clone(&snap.nonzeros),
+            Arc::clone(&snap.dirty),
             Arc::clone(&snap.order),
-        ) {
-            return snap.a_plan.clone();
-        }
+        )
+    {
+        return snap.a_plan.clone();
     }
     let a_plan = leaf_steady_plan(template, dag, zero_acc, first_slice, b);
     let (nonzeros, dirty) = dag.steady_lists_snapshot();
@@ -800,8 +807,8 @@ where
         Some(snap) if snap.a_plan == *a_plan => dag.adopt_steady_lists(
             &snap.a_plan,
             b,
-            snap.nonzeros.clone(),
-            snap.dirty.clone(),
+            Arc::clone(&snap.nonzeros),
+            Arc::clone(&snap.dirty),
             Arc::clone(&snap.order),
         ),
         _ => false,
@@ -3768,7 +3775,7 @@ mod test {
             let (degrees, deg_starts) = log_sig.series.debug_degree_layout();
             let mut slice_alloc = 0usize;
             let mut deg_count_sum = 0usize;
-            for nz in &dag.nonzeros {
+            for nz in dag.nonzeros.iter() {
                 let mut degs: Vec<u8> = nz.iter().map(|&p| degrees[p]).collect();
                 degs.sort_unstable();
                 degs.dedup();
@@ -4790,6 +4797,234 @@ mod test {
             v.iter().map(|r| (*r.numer(), *r.denom())).collect()
         };
         assert_eq!(bits(&series.coefficients), bits(&series_fresh.coefficients), "post-fold adoption diverged from fresh derivation");
+    }
+
+    /// Arc-level mutation isolation: a cache hit installs the snapshot's
+    /// lists by REFERENCE (`Arc::ptr_eq` — zero copy, the (d) contract at
+    /// 3x5 scale), a fold on the adopting dag replaces the dag's Arc
+    /// wholesale (never mutating through the shared one), and the
+    /// snapshot survives byte-identical for the next adopting dag — which
+    /// folds bit-identically to the first.
+    #[test]
+    fn leaf_plan_lists_adopted_by_arc_and_isolated_from_folds() {
+        leaf_steady_cache::clear_for_tests();
+        let (template, mut dag_a, basis_len) = leaf_plan_mk(3, 5);
+        let zero = vec![Ratio::<i64>::default(); basis_len];
+        let r1 = leaf_plan_rhs(basis_len, &[0, 1], 0xF61);
+        let b1 = {
+            let mut v = template.0.nonzero_coefficient_indices(&r1);
+            v.sort_unstable();
+            v
+        };
+        let table_id = template.0.feasible_decompositions_handle().table_id();
+
+        // MISS: derive + store, then drop the deriving dag so the cache is
+        // the snapshot's only holder.
+        let a_plan = leaf_steady_plan_cached(&template, &mut dag_a, &zero, &r1, &b1);
+        let snap = leaf_steady_cache::get(table_id, &b1).expect("snapshot present");
+        let snapshot_nz: Vec<Vec<usize>> = (*snap.nonzeros).clone();
+        drop(dag_a);
+
+        // HIT: adopt into a fresh dag — by reference, not by copy.
+        let (_, mut dag_b, _) = leaf_plan_mk(3, 5);
+        assert!(leaf_steady_adopt_into(&mut dag_b, table_id, &a_plan, &b1));
+        assert!(
+            Arc::ptr_eq(&dag_b.nonzeros, &snap.nonzeros),
+            "adoption must share the snapshot Arc, not copy it"
+        );
+        assert_eq!(
+            Arc::strong_count(&snap.nonzeros),
+            2,
+            "exactly the cache and the adopting dag hold the lists"
+        );
+
+        // Fold on the adopting dag: fold_batch re-records the dag's OWN
+        // lists — through a NEW Arc, never through the shared snapshot.
+        let mut series = template.0.clone();
+        series.coefficients = vec![Ratio::<i64>::default(); basis_len];
+        let slices: Vec<&[Ratio<i64>]> = vec![&r1];
+        dag_b.fold_batch(&mut series, &slices, &a_plan, &b1);
+        assert!(
+            !Arc::ptr_eq(&dag_b.nonzeros, &snap.nonzeros),
+            "the fold's re-record must replace the dag's Arc, not mutate the shared one"
+        );
+        let snap_after = leaf_steady_cache::get(table_id, &b1).expect("snapshot survives the fold");
+        assert!(Arc::ptr_eq(&snap, &snap_after), "cache entry must not be replaced");
+        assert_eq!(*snap_after.nonzeros, snapshot_nz, "fold mutated the shared snapshot");
+
+        // A post-fold adoption still shares the pristine snapshot and
+        // folds bit-identically.
+        let (_, mut dag_c, _) = leaf_plan_mk(3, 5);
+        assert!(leaf_steady_adopt_into(&mut dag_c, table_id, &a_plan, &b1));
+        assert!(Arc::ptr_eq(&dag_c.nonzeros, &snap.nonzeros));
+        let mut series_c = template.0.clone();
+        series_c.coefficients = vec![Ratio::<i64>::default(); basis_len];
+        dag_c.fold_batch(&mut series_c, &slices, &a_plan, &b1);
+        let bits = |v: &[Ratio<i64>]| -> Vec<(i64, i64)> {
+            v.iter().map(|r| (*r.numer(), *r.denom())).collect()
+        };
+        assert_eq!(
+            bits(&series.coefficients),
+            bits(&series_c.coefficients),
+            "post-fold adoption diverged from the first adopting fold"
+        );
+    }
+
+    /// Concurrent adoption: 8 threads adopt the SAME snapshot into
+    /// distinct dags and fold — all bit-identical to each other and to a
+    /// sequential fold, with the shared snapshot's contents untouched
+    /// (lockless `Arc` reads; no mutation through the shared Arc).
+    #[test]
+    fn leaf_plan_lists_concurrent_adoption_bit_identical() {
+        leaf_steady_cache::clear_for_tests();
+        let (template, mut dag0, basis_len) = leaf_plan_mk(3, 5);
+        let zero = vec![Ratio::<i64>::default(); basis_len];
+        let r1 = leaf_plan_rhs(basis_len, &[0, 2], 0xF71);
+        let b1 = {
+            let mut v = template.0.nonzero_coefficient_indices(&r1);
+            v.sort_unstable();
+            v
+        };
+        let table_id = template.0.feasible_decompositions_handle().table_id();
+        let a_plan = leaf_steady_plan_cached(&template, &mut dag0, &zero, &r1, &b1);
+        let snap = leaf_steady_cache::get(table_id, &b1).expect("snapshot present");
+        let snapshot_nz: Vec<Vec<usize>> = (*snap.nonzeros).clone();
+        drop(dag0);
+
+        let bits = |v: &[Ratio<i64>]| -> Vec<(i64, i64)> {
+            v.iter().map(|r| (*r.numer(), *r.denom())).collect()
+        };
+        let mut results: Vec<Vec<(i64, i64)>> = Vec::new();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let template = &template;
+                    let a_plan = &a_plan;
+                    let r1 = &r1;
+                    let b1 = &b1;
+                    s.spawn(move || {
+                        let (_, mut dag, _) = leaf_plan_mk(3, 5);
+                        assert!(leaf_steady_adopt_into(
+                            &mut dag,
+                            table_id,
+                            a_plan,
+                            b1
+                        ));
+                        let mut series = template.0.clone();
+                        series.coefficients = vec![Ratio::<i64>::default(); basis_len];
+                        let slices: Vec<&[Ratio<i64>]> = vec![r1.as_slice()];
+                        dag.fold_batch(&mut series, &slices, a_plan, b1);
+                        bits(&series.coefficients)
+                    })
+                })
+                .collect();
+            for h in handles {
+                results.push(h.join().expect("adoption thread panicked"));
+            }
+        });
+        for r in &results[1..] {
+            assert_eq!(r, &results[0], "concurrent adoptions diverged");
+        }
+
+        // Ground truth: sequential folding of the same displacement.
+        let mut seq = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(3)
+            .with_max_degree(5)
+            .build::<Ratio<i64>>();
+        seq.concatenate_assign_coefficients(&r1);
+        assert_eq!(
+            results[0],
+            bits(&seq.series.coefficients),
+            "concurrent adoption folds diverged from sequential"
+        );
+
+        let snap_after = leaf_steady_cache::get(table_id, &b1).expect("snapshot survives");
+        assert!(Arc::ptr_eq(&snap, &snap_after));
+        assert_eq!(*snap_after.nonzeros, snapshot_nz, "snapshot mutated under concurrency");
+    }
+
+    /// Copy-on-write trigger: a dag holding ADOPTED (shared) lists that
+    /// faces a support change must rebuild onto its OWN Arc — the shared
+    /// snapshot stays pristine — and the rebuilt lists must equal a fresh
+    /// uncached derivation's fixed point.
+    #[test]
+    fn leaf_plan_lists_cow_on_support_change_leaves_snapshot_pristine() {
+        leaf_steady_cache::clear_for_tests();
+        let (template, mut dag, basis_len) = leaf_plan_mk(3, 5);
+        let zero = vec![Ratio::<i64>::default(); basis_len];
+        let r1 = leaf_plan_rhs(basis_len, &[0, 1], 0xF81);
+        let r2 = leaf_plan_rhs(basis_len, &[2], 0xF82);
+        let support = |r: &Vec<Ratio<i64>>| {
+            let mut v = template.0.nonzero_coefficient_indices(r);
+            v.sort_unstable();
+            v
+        };
+        let b1 = support(&r1);
+        let b2 = support(&r2);
+        assert_ne!(b1, b2, "test needs distinct supports");
+        let table_id = template.0.feasible_decompositions_handle().table_id();
+
+        // Adopt b1's snapshot into dag.
+        let _a1 = leaf_steady_plan_cached(&template, &mut dag, &zero, &r1, &b1);
+        let snap1 = leaf_steady_cache::get(table_id, &b1).expect("snapshot present");
+        assert!(
+            Arc::ptr_eq(&dag.nonzeros, &snap1.nonzeros),
+            "precondition: the dag must share the snapshot"
+        );
+
+        // Support change on the SAME dag: the fixed-point loop rebuilds
+        // via cow — onto the dag's own Arc, never through the shared one.
+        let a2 = leaf_steady_plan(&template, &mut dag, &zero, &r2, &b2);
+        assert!(
+            !Arc::ptr_eq(&dag.nonzeros, &snap1.nonzeros),
+            "the rebuild must install a new Arc (cow), not mutate the shared snapshot"
+        );
+        let snap1_after = leaf_steady_cache::get(table_id, &b1).expect("snapshot survives");
+        assert!(Arc::ptr_eq(&snap1, &snap1_after));
+
+        // The rebuilt lists must equal a fresh uncached derivation.
+        let (_, mut dag_f, _) = leaf_plan_mk(3, 5);
+        let a2_fresh = leaf_steady_plan(&template, &mut dag_f, &zero, &r2, &b2);
+        assert_eq!(a2, a2_fresh, "cow rebuild's plan diverged");
+        let (nz_cow, _) = dag.steady_lists_snapshot();
+        let (nz_fresh, _) = dag_f.steady_lists_snapshot();
+        assert_eq!(*nz_cow, *nz_fresh, "cow rebuild's lists diverged");
+    }
+
+    /// Memory discipline at scale: at 4x8 (the ~5MB-snapshot regime) the
+    /// adopt must be O(nodes) — the dag's lists ARE the snapshot's
+    /// allocation (`Arc::ptr_eq`), with exactly the cache and the adopting
+    /// dag holding it. A deep copy would show up as a fresh allocation
+    /// and fail the aliasing assert.
+    #[test]
+    fn leaf_plan_lists_adopt_is_zero_copy_at_scale() {
+        leaf_steady_cache::clear_for_tests();
+        let (template, mut dag, basis_len) = leaf_plan_mk(4, 8);
+        let zero = vec![Ratio::<i64>::default(); basis_len];
+        let r1 = leaf_plan_rhs(basis_len, &[0, 1, 2, 3], 0xF91);
+        let b1 = {
+            let mut v = template.0.nonzero_coefficient_indices(&r1);
+            v.sort_unstable();
+            v
+        };
+        let table_id = template.0.feasible_decompositions_handle().table_id();
+        let a_plan = leaf_steady_plan_cached(&template, &mut dag, &zero, &r1, &b1);
+        let snap = leaf_steady_cache::get(table_id, &b1).expect("snapshot present");
+        let total: usize = snap.nonzeros.iter().map(|v| v.len()).sum();
+        assert!(total > 0, "test needs a nontrivial snapshot");
+        drop(dag);
+
+        let (_, mut dag2, _) = leaf_plan_mk(4, 8);
+        assert!(leaf_steady_adopt_into(&mut dag2, table_id, &a_plan, &b1));
+        assert!(
+            Arc::ptr_eq(&dag2.nonzeros, &snap.nonzeros),
+            "adopt must not copy the lists"
+        );
+        assert_eq!(
+            Arc::strong_count(&snap.nonzeros),
+            2,
+            "exactly the cache and the adopting dag hold the lists"
+        );
     }
 
     /// Kill-switch bit identity: cached (warm) and uncached (cleared)
