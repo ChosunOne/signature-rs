@@ -42,8 +42,9 @@ use crate::commutator_dag::{CohortLane, CommutatorDag, cohort_capable, cohort_ty
 /// different table.
 mod series_plan_cache {
     use super::{
-        AddAssign, Any, Arc, FeasibleDecompositions, Generator, HashMap, Hash, LieSeries,
-        LyndonBasis, LyndonWord, MulAssign, Mutex, Neg, OnceLock, One, Sort, TypeId, Zero,
+        AddAssign, Any, Arc, BchSeriesGenerator, CommutatorDag, Div, FeasibleDecompositions,
+        FromPrimitive, Generator, HashMap, Hash, LieSeries, LieSeriesGenerator, LyndonBasis,
+        LyndonWord, MulAssign, Mutex, Neg, OnceLock, One, Sort, SubAssign, TypeId, Zero,
     };
 
     /// Everything the basis and its structure-constant table depend on.
@@ -129,6 +130,64 @@ mod series_plan_cache {
             .clone()
             .downcast::<SeriesPlan<T, U>>()
             .expect("plan type keyed by its TypeId pair")
+    }
+
+    /// The shared per-`(max_degree, U)` BCH plan: the 2-letter BCH Lie
+    /// series and a pristine template DAG. Both are pure functions of
+    /// `(max_degree, U)`; the series is cloned per build (cheap: Arc-shared
+    /// internals, fresh coefficient vector) and the DAG is cloned via
+    /// `clone_shallow` (shares the compiled structure and the node lists'
+    /// fixed point; per-value fold scratch — buffers, gating cache — stays
+    /// with each clone, and the template itself is never folded on).
+    pub(super) struct BchPlan<U> {
+        pub(super) series: LieSeries<u8, U>,
+        pub(super) dag: CommutatorDag<U>,
+    }
+
+    static BCH_PLANS: OnceLock<Mutex<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>> =
+        OnceLock::new();
+
+    pub(super) fn bch_plan<U>(max_degree: usize) -> Arc<BchPlan<U>>
+    where
+        U: Clone
+            + Default
+            + AddAssign
+            + Div<Output = U>
+            + FromPrimitive
+            + Neg<Output = U>
+            + One
+            + Ord
+            + Hash
+            + Send
+            + Sync
+            + Zero
+            + SubAssign
+            + MulAssign
+            + 'static,
+    {
+        let key = (TypeId::of::<U>(), max_degree);
+        let map = BCH_PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let guard = map.lock().expect("bch plan cache mutex");
+            if let Some(hit) = guard.get(&key) {
+                if let Ok(plan) = Arc::clone(hit).downcast::<BchPlan<U>>() {
+                    return plan;
+                }
+            }
+        }
+        let bch_basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
+        let series: LieSeries<u8, U> =
+            BchSeriesGenerator::new(bch_basis, max_degree).generate_lie_series();
+        let dag = CommutatorDag::from_bch_series(&series);
+        let plan = Arc::new(BchPlan { series, dag });
+        let mut guard = map.lock().expect("bch plan cache mutex");
+        let entry = guard
+            .entry(key)
+            .or_insert_with(|| plan as Arc<dyn Any + Send + Sync>);
+        entry
+            .clone()
+            .downcast::<BchPlan<U>>()
+            .expect("plan type keyed by its TypeId")
     }
 }
 
@@ -977,9 +1036,13 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
     {
         // The basis + structure-constant table are a pure function of the
         // builder configuration; build them once and share them across all
-        // builds (see `series_plan_cache`). The per-series state
-        // (coefficients) stays fresh per call.
+        // builds (see `series_plan_cache`). The BCH series + DAG template
+        // are likewise a pure function of (max_degree, U) — the series is
+        // cloned per build (Arc-shared internals, fresh coefficient vector)
+        // and the DAG via `clone_shallow` (compiled structure + node-list
+        // fixed point shared; fold scratch stays per instance).
         let plan = series_plan_cache::series_plan::<T, U>(&self.lyndon_basis, self.max_degree);
+        let bch = series_plan_cache::bch_plan::<U>(self.max_degree);
         let basis_len = plan.basis.len();
         let coefficients = vec![U::default(); basis_len];
         let series = LieSeries::<T, U>::with_feasible_decompositions(
@@ -987,9 +1050,8 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
             coefficients,
             Arc::clone(&plan.table),
         );
-        let bch_basis = LyndonBasis::<u8>::new(2, Sort::Lexicographical);
-        let bch_series = BchSeriesGenerator::new(bch_basis, self.max_degree).generate_lie_series();
-        let dag = CommutatorDag::from_bch_series(&bch_series);
+        let bch_series = bch.series.clone();
+        let dag = bch.dag.clone_shallow();
         LogSignature::<T, U> {
             series,
             bch_series,
