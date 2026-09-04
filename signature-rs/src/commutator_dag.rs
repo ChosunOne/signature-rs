@@ -180,7 +180,6 @@ pub(crate) struct CommutatorDag<U> {
     /// count). Pure scratch: NOT copied by `clone_shallow` — concurrent
     /// folds run on independent clones and must never share buffers (a
     /// shared buffer's term phase would race the other dispatch's reads).
-    term_pool: lie_rs::TermBufferPool<U>,
     /// The basis' class-contiguous ordering, created on the first fold and
     /// shared by every kernel call of every fold through this DAG (and by
     /// `clone_shallow` copies): the O(basis) planning is paid once.
@@ -537,7 +536,6 @@ where
             atom_b: Vec::new(),
             lists_built: false,
             gating_cache: GatingCache::default(),
-            term_pool: lie_rs::TermBufferPool::default(),
             class_order: OnceLock::new(),
         }
     }
@@ -712,7 +710,6 @@ where
             order,
             &mut levels,
             &mut self.gating_cache,
-            &mut self.term_pool,
         );
     }
 
@@ -957,7 +954,6 @@ where
                 &mut self.gating_cache,
                 true,
                 false,
-                &mut self.term_pool,
             );
 
         // Record the true scatter sets as the node lists: they bound this
@@ -1072,7 +1068,6 @@ where
                 &mut self.gating_cache,
                 true,
                 false,
-                &mut self.term_pool,
             );
 
         // Block ranges over class positions. The block count derives from
@@ -1785,7 +1780,6 @@ where
                 &mut self.gating_cache,
                 true,
                 true,
-                &mut self.term_pool,
             );
         {
             let mut updated = std::mem::take(&mut self.nonzeros);
@@ -1896,7 +1890,6 @@ where
                 &mut self.gating_cache,
                 true,
                 true,
-                &mut self.term_pool,
             );
         let sweep_stages_soa: Vec<ClassBatchStage<U>> = sweep_stages
             .iter()
@@ -2337,7 +2330,6 @@ impl<U> CommutatorDag<U> {
             gating_cache: self.gating_cache.clone(),
             // Scratch: the clone re-allocates its own term buffers on its
             // first plan (see the field doc).
-            term_pool: lie_rs::TermBufferPool::default(),
             class_order: self.class_order.clone(),
         }
     }
@@ -2806,7 +2798,6 @@ mod tests {
             atom_b: Vec::new(),
             lists_built: false,
             gating_cache: GatingCache::default(),
-            term_pool: lie_rs::TermBufferPool::default(),
             class_order: OnceLock::new(),
         };
 

@@ -23,34 +23,48 @@ pub(crate) struct Entry {
     pub(crate) decomp_start: u32,
 }
 
-/// One target word's active contributions: the kernel's atomic scheduling
-/// unit under the write-access division. All decompositions writing basis
-/// word `pos` form one class; two classes never write the same word, so
-/// concurrent sweeps of different classes are race-free by construction,
-/// and one class's contributions accumulate sequentially in table-entry
-/// order — exactly the serial sweep's per-word float summation order.
+/// One active unit's sweep range: the kernel's atomic scheduling unit
+/// under the write-access division. A unit's word set (every basis word
+/// its active entries' rows write) is owned by exactly that unit — units
+/// are unique by (target degree, content) and every entry producing word
+/// `w` lives in `w`'s one unit — so the unit word sets PARTITION the
+/// sweep's write slots: concurrent unit sweeps are race-free by
+/// construction, and a word's contributions accumulate inside its one
+/// unit, in table-entry order — exactly the serial sweep's per-word float
+/// summation order, independent of pack cuts and thread counts.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct WordClass {
-    /// The target word's position in the working layout (public basis index
-    /// for the public prologue's gating, class-contiguous position for the
-    /// class one). Classes are emitted sorted by this field, so a sweep's
-    /// stores walk the result space sequentially.
-    pub(crate) pos: u32,
-    /// The target word's Lyndon degree (the compact-buffer shift index).
+pub(crate) struct UnitRange {
+    /// The unit's target degree-slice start in the working layout (public
+    /// basis space for the public prologue's gating, class-contiguous
+    /// space for the class one — the degree-slice starts are identical in
+    /// both). A row element `rel` of the unit's entries writes result
+    /// position `rs + rel` (minus the job's compact `r_shift` for the
+    /// target degree).
+    pub(crate) rs: u32,
+    /// The unit's Lyndon target degree (the compact-buffer shift index).
     pub(crate) td: u8,
-    /// The class's contribution range in the gating's flat
-    /// `(ticket, decomp position)` list: `contribs[start .. end]`, in
-    /// table-entry order.
-    pub(crate) start: u32,
-    pub(crate) end: u32,
+    /// The unit's active-entry range in the gating's flat ticket list,
+    /// in table order.
+    pub(crate) ticket_start: u32,
+    pub(crate) ticket_end: u32,
+    /// The unit's contribution (pair) count: Σ row lengths over its
+    /// active entries — the pack planner's work weight. The unit's word
+    /// SET is recoverable from its rows (every row element of its active
+    /// entries); the gating's flat `unit_words` list holds the union in
+    /// globally ascending order (units of one degree are ordered by
+    /// content bytes, NOT by position, so per-unit concatenation is not
+    /// ascending — the union must be sorted for the sink/scatter-set
+    /// order to stay byte-identical to the per-word fan-in's).
+    pub(crate) pairs: u32,
 }
 
 /// A contiguous run of canonical pairs whose brackets land in the same
 /// letter multiset: the unit's decompositions only hit degree-`target`
 /// words of that content, so two units never write the same basis word.
 /// Units organize the table for the gating walk and the `get` lookup; the
-/// kernel's parallel work is divided one level finer, per target word
-/// (see [`WordClass`]).
+/// kernel's parallel work is divided per unit (see [`UnitRange`]) — the
+/// unit word sets partition the write slots, which is what makes the
+/// per-unit division race-free.
 #[derive(Clone, Debug)]
 pub(crate) struct UnitMeta {
     /// Bracket degree `p + q` (equal to `|gamma|`).
@@ -68,15 +82,16 @@ pub(crate) struct UnitMeta {
     pub(crate) end: u32,
 }
 
-/// The full-support gating's transposed per-word form: active word
-/// classes, their `(ticket position, decomp position)` contributions, and
-/// the flat ticket list (every entry active, both orientations). Built
-/// lazily once per table (public space) / per class order (class space)
-/// and shared by every dense-support kernel call, so the steady state's
-/// gating is an Arc clone — no walk, no transposition.
+/// The full-support gating's per-unit form: active unit ranges, the flat
+/// ticket list (every entry active, both orientations, in table order),
+/// and the flat ascending active-word position list (per-unit sets
+/// concatenated in degree order). Built lazily once per table (public
+/// space) / per class order (class space) and shared by every
+/// dense-support kernel call, so the steady state's gating is an Arc
+/// clone — no walk, no transposition.
 pub(crate) type FullSupportGating = (
-    std::sync::Arc<[WordClass]>,
-    std::sync::Arc<[(u32, u32)]>,
+    std::sync::Arc<[UnitRange]>,
+    std::sync::Arc<[u32]>,
     std::sync::Arc<[u32]>,
 );
 
@@ -133,47 +148,79 @@ pub(crate) struct FeasibleDecompositions<U> {
 /// (the write-access classes of the all-active gating). Same shape as the
 /// gating walk's transposition; the degrees come from the caller's
 /// position→degree map.
-fn transpose_full_support(
-    items: Vec<(u32, u32, u32)>,
-    tickets: Vec<u32>,
-    pos_degree: &[u8],
-) -> (
-    std::sync::Arc<[WordClass]>,
-    std::sync::Arc<[(u32, u32)]>,
-    std::sync::Arc<[u32]>,
-) {
-    let space = pos_degree.len();
-    let mut counts = vec![0u32; space + 1];
-    for &(pos, _, _) in &items {
-        debug_assert!((pos as usize) < space, "contribution target outside the result space");
-        counts[pos as usize + 1] += 1;
-    }
-    for k in 1..=space {
-        counts[k] += counts[k - 1];
-    }
-    let mut contribs = vec![(0u32, 0u32); items.len()];
-    let mut cursor = counts.clone();
-    for &(pos, ticket_idx, decomp_pos) in &items {
-        let slot = cursor[pos as usize] as usize;
-        contribs[slot] = (ticket_idx, decomp_pos);
-        cursor[pos as usize] += 1;
-    }
-    let mut words: Vec<WordClass> = Vec::new();
-    for p in 0..space {
-        let (start, end) = (counts[p], counts[p + 1]);
-        if end > start {
-            words.push(WordClass {
-                pos: p as u32,
-                td: pos_degree[p],
-                start,
-                end,
-            });
+/// Builds the full-support gating's per-unit form: every entry active
+/// with both orientations, one ticket per entry in table order, and per
+/// unit the ascending set of result positions its rows write. Shared by
+/// the public and class-space full-support paths (they differ only in the
+/// entry table / rel slice / degree-start source they view).
+fn build_full_support_gating(
+    units: &[UnitMeta],
+    entries: &[Entry],
+    decomp_rels: &[u32],
+    degree_start: impl Fn(usize) -> u32,
+) -> FullSupportGating {
+    let mut tickets: Vec<u32> = Vec::with_capacity(entries.len());
+    let mut unit_words: Vec<u32> = Vec::new();
+    let mut ranges: Vec<UnitRange> = Vec::with_capacity(units.len());
+    // Transient per-unit rel bitset (rel < the unit's degree-slice size);
+    // cleared by iterating its set bits after extraction.
+    let mut rel_bits: Vec<u64> = Vec::new();
+    for unit in units {
+        let t = unit.target as usize;
+        let rs = degree_start(t);
+        let ticket_start = tickets.len() as u32;
+        let mut pairs = 0u32;
+        rel_bits.clear();
+        rel_bits.resize(((degree_start(t + 1) - rs) as usize).div_ceil(64), 0);
+        for ei in unit.start..unit.end {
+            let entry = &entries[ei as usize];
+            tickets.push(ei | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
+            let from = entry.decomp_start as usize;
+            let to = entries[ei as usize + 1].decomp_start as usize;
+            for &rel in &decomp_rels[from..to] {
+                rel_bits[(rel / 64) as usize] |= 1u64 << (rel % 64);
+                pairs += 1;
+            }
         }
+        // Extract the unit's ascending word positions and clear the bits.
+        let mut emitted = 0u32;
+        for (w, bits) in rel_bits.iter_mut().enumerate() {
+            let mut b = *bits;
+            while b != 0 {
+                let bit = b.trailing_zeros();
+                b &= b - 1;
+                unit_words.push(rs + (w as u32) * 64 + bit);
+                emitted += 1;
+            }
+            *bits = 0;
+        }
+        // A unit with no active contributions (empty rows throughout) is
+        // omitted: it has no tickets, no words, no work.
+        if pairs == 0 {
+            tickets.truncate(ticket_start as usize);
+            debug_assert_eq!(emitted, 0);
+            continue;
+        }
+        debug_assert!(emitted > 0);
+        ranges.push(UnitRange {
+            rs,
+            td: unit.target,
+            ticket_start,
+            ticket_end: tickets.len() as u32,
+            pairs,
+        });
     }
+    // Units of one degree are ordered by CONTENT BYTES (the table's unit
+    // order), not by position — the per-unit concatenation is not
+    // ascending. Sort the union so the flat list is globally ascending:
+    // the sink/scatter-set walk order must stay byte-identical to the
+    // per-word fan-in's (which emitted active positions in ascending
+    // order).
+    unit_words.sort_unstable();
     (
-        std::sync::Arc::from(words),
-        std::sync::Arc::from(contribs),
+        std::sync::Arc::from(ranges),
         std::sync::Arc::from(tickets),
+        std::sync::Arc::from(unit_words),
     )
 }
 
@@ -266,29 +313,14 @@ impl ClassOrder {
     ) -> FullSupportGating {
         self.full_support_class
             .get_or_init(|| {
-                let degrees = &table.index_degrees;
-                let degree_cls = &self.degree_cls;
-                let mut tickets: Vec<u32> = Vec::with_capacity(table.num_entries);
-                let mut items: Vec<(u32, u32, u32)> = Vec::new();
-                for (ei, entry) in
-                    self.entries_cls[..self.entries_cls.len() - 1].iter().enumerate()
-                {
-                    let ticket_idx = tickets.len() as u32;
-                    tickets.push(ei as u32 | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
-                    let from = entry.decomp_start as usize;
-                    let to = self.entries_cls[ei + 1].decomp_start as usize;
-                    // Degree-slice starts are identical in both layouts.
-                    let rs = table.degree_start(
-                        degrees[entry.i as usize] as usize
-                            + degrees[entry.j as usize] as usize,
-                    );
-                    for (k, &rel) in self.decomp_cls[from..to].iter().enumerate() {
-                        items.push((rs as u32 + rel, ticket_idx, (from + k) as u32));
-                    }
-                }
-                let (words, contribs, tickets) =
-                    transpose_full_support(items, tickets, degree_cls);
-                (words, contribs, tickets)
+                // Degree-slice starts are identical in both layouts, so
+                // the table's degree starts index the class space too.
+                build_full_support_gating(
+                    table.units(),
+                    self.entries_cls(),
+                    self.decomp_cls(),
+                    |t| table.degree_start(t) as u32,
+                )
             })
             .clone()
     }
@@ -661,7 +693,8 @@ impl<U> FeasibleDecompositions<U> {
     }
 
     /// Per-word Lyndon degrees in basis order (the public layout's
-    /// position→degree map for the gating's per-word transposition).
+    /// position→degree map; used by gating-structure tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) fn index_degrees(&self) -> &[u8] {
         &self.index_degrees
@@ -695,28 +728,15 @@ impl<U> FeasibleDecompositions<U> {
     pub(crate) fn full_support_gating_public(&self) -> FullSupportGating {
         self.full_support_public
             .get_or_init(|| {
-                let degrees = &self.index_degrees;
                 // Every entry active, both orientations: tickets are the
-                // entry stream with both flag bits packed, items every row
-                // element (see the gating walk's same-shaped loops).
-                let mut tickets: Vec<u32> = Vec::with_capacity(self.num_entries);
-                let mut items: Vec<(u32, u32, u32)> = Vec::new();
-                for (ei, entry) in self.entries[..self.entries.len() - 1].iter().enumerate() {
-                    let ticket_idx = tickets.len() as u32;
-                    tickets.push(ei as u32 | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
-                    let from = entry.decomp_start as usize;
-                    let to = self.entries[ei + 1].decomp_start as usize;
-                    let rs = self.degree_start(
-                        degrees[entry.i as usize] as usize
-                            + degrees[entry.j as usize] as usize,
-                    );
-                    for (k, &rel) in self.decomp_indices[from..to].iter().enumerate() {
-                        items.push((rs as u32 + rel, ticket_idx, (from + k) as u32));
-                    }
-                }
-                let (words, contribs, tickets) =
-                    transpose_full_support(items, tickets, degrees);
-                (words, contribs, tickets)
+                // entry stream with both flag bits packed; per unit the
+                // ascending set of positions its rows write.
+                build_full_support_gating(
+                    &self.units,
+                    &self.entries,
+                    &self.decomp_indices,
+                    |t| self.degree_start(t) as u32,
+                )
             })
             .clone()
     }
