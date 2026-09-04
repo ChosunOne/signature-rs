@@ -38,6 +38,7 @@ use std::ops::{Div, MulAssign};
 
 // Re-export main types at crate root
 pub use bch_series_generator::{BchSeriesGenerator, Matrix2x2, MatrixTree};
+pub use feasible_decompositions::FeasibleDecompositions;
 pub use lie_series::{
     CKS_ON, BlockShape, ClassBatchStage, ClassOrder, ClassOrderedCommutation, DEBUG_AB_ACC,
     DEBUG_AB_B, DEBUG_AB_D, DEBUG_WRITES, GatingCache, KernelJob, LieSeries, raw_add_assign,

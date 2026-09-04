@@ -682,6 +682,15 @@ impl<T: Clone, U: Clone + Mul<Output = U> + MulAssign> MulAssign<U> for LieSerie
     }
 }
 
+/// Cheap deterministic per-basis setup shared by every construction path:
+/// the commutator-basis terms, their unit-hash membership set, and the
+/// unit-hash -> basis-index map.
+struct CommutatorPrologue<U, T> {
+    commutator_basis: Vec<CommutatorTerm<U, T>>,
+    commutator_basis_set: HashSet<u64>,
+    commutator_basis_index_map: HashMap<u64, usize>,
+}
+
 impl<
     T: Clone + Ord + Generator + Hash + Eq,
     U: Clone + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign + Ord,
@@ -700,14 +709,19 @@ impl<
         self.feasible_decompositions.debug_degree_layout()
     }
 
-    pub fn new(basis: Vec<LyndonWord<T>>, coefficients: Vec<U>) -> Self {
+    /// Cheap deterministic per-basis setup shared by every construction
+    /// path: the commutator-basis terms, their unit-hash membership set,
+    /// and the unit-hash -> basis-index map.
+    fn commutator_prologue(basis: &[LyndonWord<T>]) -> CommutatorPrologue<U, T> {
         let mut commutator_basis = Vec::<CommutatorTerm<U, T>>::with_capacity(basis.len());
+        // Only the tracing build reports it; kept for the debug! shorthand.
+        #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
         let max_degree = if basis.is_empty() {
             0
         } else {
             basis[basis.len() - 1].len()
         };
-        for word in &basis {
+        for word in basis {
             commutator_basis.push(CommutatorTerm::from(word));
         }
         #[cfg(feature = "tracing")]
@@ -727,7 +741,47 @@ impl<
         }
         #[cfg(feature = "tracing")]
         tracing::debug!("built commutator basis maps");
+        CommutatorPrologue {
+            commutator_basis,
+            commutator_basis_set,
+            commutator_basis_index_map,
+        }
+    }
 
+    /// Builds the feasible-decomposition (structure-constant) table for a
+    /// basis: for every feasible pair `(i, j)` the commutator `[w_i, w_j]`
+    /// is rewritten into the Lyndon basis. Deterministic — pairs are
+    /// visited in index order and each decomposition's output terms are
+    /// sorted — so the table is a pure function of the basis (plus the
+    /// coefficient type's arithmetic). This is the expensive part of
+    /// [`LieSeries::new`]; it is factored out so callers can build the
+    /// table once and share it via
+    /// [`LieSeries::with_feasible_decompositions`].
+    #[must_use]
+    pub fn build_feasible_decompositions(basis: &[LyndonWord<T>]) -> FeasibleDecompositions<U> {
+        let prologue = Self::commutator_prologue(basis);
+        Self::structure_constants(
+            basis,
+            &prologue.commutator_basis,
+            &prologue.commutator_basis_set,
+            &prologue.commutator_basis_index_map,
+        )
+    }
+
+    /// The structure-constant pass over the pair table. `basis` must be the
+    /// basis `commutator_basis` / `commutator_basis_set` /
+    /// `commutator_basis_index_map` were derived from.
+    fn structure_constants(
+        basis: &[LyndonWord<T>],
+        commutator_basis: &[CommutatorTerm<U, T>],
+        commutator_basis_set: &HashSet<u64>,
+        commutator_basis_index_map: &HashMap<u64, usize>,
+    ) -> FeasibleDecompositions<U> {
+        let max_degree = if basis.is_empty() {
+            0
+        } else {
+            basis[basis.len() - 1].len()
+        };
         // Per-word letter contents: the table is grouped by (target degree,
         // content class), which requires each word's letter multiset.
         let mut alphabet: Vec<T> = basis
@@ -832,12 +886,63 @@ impl<
         );
         #[cfg(feature = "progress")]
         pb.finish_with_message("done");
+        feasible_builder.finish()
+    }
+
+    /// Builds an empty series over `basis` with a pre-built
+    /// feasible-decomposition table, skipping the structure-constant
+    /// computation. The table must have been produced for exactly this
+    /// basis (see [`LieSeries::build_feasible_decompositions`]); sharing
+    /// one table across series over the same basis is sound because the
+    /// table is read-only after construction.
+    pub fn with_feasible_decompositions(
+        basis: Arc<Vec<LyndonWord<T>>>,
+        coefficients: Vec<U>,
+        feasible_decompositions: Arc<FeasibleDecompositions<U>>,
+    ) -> Self {
+        let prologue = Self::commutator_prologue(&basis);
+        let max_degree = if basis.is_empty() {
+            0
+        } else {
+            basis[basis.len() - 1].len()
+        };
+        Self {
+            basis,
+            commutator_basis: Arc::new(prologue.commutator_basis),
+            commutator_basis_index_map: Arc::new(prologue.commutator_basis_index_map),
+            coefficients,
+            feasible_decompositions,
+            max_degree,
+        }
+    }
+
+    /// Identity of the shared structure-constant table (diagnostics and
+    /// tests: series over the same cached plan report the same id).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn table_id(&self) -> usize {
+        Arc::as_ptr(&self.feasible_decompositions) as usize
+    }
+
+    pub fn new(basis: Vec<LyndonWord<T>>, coefficients: Vec<U>) -> Self {
+        let prologue = Self::commutator_prologue(&basis);
+        let feasible_decompositions = Self::structure_constants(
+            &basis,
+            &prologue.commutator_basis,
+            &prologue.commutator_basis_set,
+            &prologue.commutator_basis_index_map,
+        );
+        let max_degree = if basis.is_empty() {
+            0
+        } else {
+            basis[basis.len() - 1].len()
+        };
         Self {
             basis: Arc::new(basis),
-            commutator_basis: Arc::new(commutator_basis),
-            commutator_basis_index_map: Arc::new(commutator_basis_index_map),
+            commutator_basis: Arc::new(prologue.commutator_basis),
+            commutator_basis_index_map: Arc::new(prologue.commutator_basis_index_map),
             coefficients,
-            feasible_decompositions: Arc::new(feasible_builder.finish()),
+            feasible_decompositions: Arc::new(feasible_decompositions),
             max_degree,
         }
     }
