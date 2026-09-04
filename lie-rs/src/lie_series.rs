@@ -1706,6 +1706,7 @@ pub trait ClassOrderedCommutation<T, U> {
         order: &ClassOrder,
         levels: &mut [Vec<KernelJob<'_, U>>],
         cache: &mut GatingCache,
+        _term_pool: &mut TermBufferPool<U>,
     ) {
         for level in levels.iter_mut() {
             if level.len() == 1 {
@@ -1841,6 +1842,7 @@ where
         order: &ClassOrder,
         levels: &mut [Vec<KernelJob<'_, U>>],
         cache: &mut GatingCache,
+        term_pool: &mut TermBufferPool<U>,
     ) {
         // The one-dispatch pack-slot walk is the default: its packs are
         // claimed dynamically, so a waiter never blocks on runnable fold
@@ -1859,7 +1861,7 @@ where
                 self.class_commutation_batch(order, level, cache);
             }
         } else {
-            commutator_coefficients_class_fold_with_cache(self, order, levels, cache);
+            commutator_coefficients_class_fold_with_cache(self, order, levels, cache, term_pool);
         }
     }
 }
@@ -1957,6 +1959,92 @@ impl<U> TermBuffers<U> {
     }
 
 }
+
+/// Reusable per-level term buffers for the two-phase sweep stages.
+///
+/// `plan_class_sweep_stages` allocates one flat `TermBuffers` per level
+/// per call; steady-state folding (whole batches, and the tournament's
+/// per-fold chains) plans the SAME ranges fold after fold — the gateways
+/// are cached and support-driven — so the allocation + zeroing repeats
+/// identically per call (at 4x8 that is ~58 MB zeroed per planning call,
+/// a measured ~40% of the 1t concat wall). The pool memoizes the buffers
+/// per (lane count, per-job ranges) fingerprint: a hit skips both the
+/// allocation and the zeroing.
+///
+/// Soundness of skipping the zero on reuse: within one dispatch the term
+/// phase writes EVERY ticket slot of every job (its chunk tasks partition
+/// `[0, tickets)` per job) before the fan-in phase reads any of them, the
+/// two phases ordered by the stage counters — so stale values between
+/// dispatches are never observable. The pool is per-dag scratch: it is
+/// NOT copied by `CommutatorDag::clone_shallow` (concurrent folds run on
+/// independent clones, and two live dispatches must never share buffers).
+pub struct TermBufferPool<U> {
+    entries: Vec<(u64, usize, Arc<TermBuffers<U>>)>,
+}
+
+impl<U> TermBufferPool<U> {
+    /// An empty pool (no bound requirements: nothing is allocated yet).
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<U> Default for TermBufferPool<U> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Maximum memoized buffer sets per pool. A fold plan holds one set per
+/// level (plus the lane-scaled cohort variant of each), so the cap must
+/// cover a deep DAG's level count; overflowing clears the pool (the next
+/// plan re-allocates — correctness is unaffected).
+const TERM_BUFFER_POOL_CAP: usize = 32;
+
+impl<U: Clone + Default> TermBufferPool<U> {
+    /// The buffers for `(fingerprint, terms_len)`, allocated zeroed on
+    /// first use and reused (unzeroed — see the soundness note) after.
+    fn get_or_alloc(
+        &mut self,
+        fingerprint: u64,
+        terms_len: usize,
+        job_ranges: &[(u32, u32)],
+    ) -> Arc<TermBuffers<U>> {
+        if let Some((_, _, buf)) = self
+            .entries
+            .iter()
+            .find(|(k, len, _)| *k == fingerprint && *len == terms_len)
+        {
+            return Arc::clone(buf);
+        }
+        let buf = Arc::new(TermBuffers {
+            data: std::cell::UnsafeCell::new(vec![U::default(); terms_len]),
+            job_ranges: job_ranges.to_vec(),
+        });
+        if self.entries.len() >= TERM_BUFFER_POOL_CAP {
+            self.entries.clear();
+        }
+        self.entries
+            .push((fingerprint, terms_len, Arc::clone(&buf)));
+        buf
+    }
+}
+
+/// FNV-1a over the lane count and the per-job `(offset, len)` ranges —
+/// the identity of one plan's term-buffer set.
+fn term_buffer_fingerprint(lanes: usize, job_ranges: &[(u32, u32)]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (lanes as u64).rotate_left(17);
+    for &(o, l) in job_ranges {
+        h = (h ^ (o as u64 | ((l as u64) << 32))).wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// Term-buffer sets below this many elements skip the pool: their
+/// allocation + zeroing is cheaper than the pool's per-plan fingerprint
+/// and lookup (the break-even sits in the thousands of elements, where
+/// zeroing cost overtakes a few hundred ns of hashing).
+const TERM_POOL_MIN_ELEMENTS: usize = 4096;
 
 /// The per-block task/pack shape shared by every block stage of one
 /// batch: `blocks` disjoint-range tasks, one pack per task. Built once
@@ -2493,6 +2581,7 @@ pub fn plan_class_sweep_stages<'a, T, U>(
     cache: &mut GatingCache,
     want_scatter_sets: bool,
     cohort: bool,
+    term_pool: &mut TermBufferPool<U>,
 ) -> (Vec<ClassBatchStage<'a, U>>, Vec<Vec<Vec<u32>>>)
 where
     T: Clone + Ord + Generator + Hash,
@@ -2642,10 +2731,19 @@ where
             term_ranges.push((terms_len as u32, t as u32));
             terms_len += t;
         }
-        let terms = Arc::new(TermBuffers {
-            data: std::cell::UnsafeCell::new(vec![U::default(); terms_len]),
-            job_ranges: term_ranges,
-        });
+        let fingerprint = term_buffer_fingerprint(lanes, &term_ranges);
+        // Pool only buffers worth it: for small sets the allocation and
+        // zeroing are far cheaper than the fingerprint + lookup the pool
+        // adds to every plan (2x8's whole per-fold plan is ~10 µs — the
+        // pool overhead there measured +10-15% e2e at a 32t pool).
+        let terms = if terms_len >= TERM_POOL_MIN_ELEMENTS {
+            term_pool.get_or_alloc(fingerprint, terms_len, &term_ranges)
+        } else {
+            Arc::new(TermBuffers {
+                data: std::cell::UnsafeCell::new(vec![U::default(); terms_len]),
+                job_ranges: term_ranges,
+            })
+        };
         // TERM stage: (job, chunk start) tasks over ticket chunks of
         // `TERM_CHUNK` tickets — entry-atomic (distinct ticket positions,
         // disjoint writes), streamed in table order.
@@ -3034,6 +3132,7 @@ pub fn commutator_coefficients_class_fold_with_cache<T, U>(
     order: &ClassOrder,
     levels: &mut [Vec<KernelJob<'_, U>>],
     cache: &mut GatingCache,
+    term_pool: &mut TermBufferPool<U>,
 ) where
     T: Clone + Ord + Generator + Hash,
     U: Clone
@@ -3060,7 +3159,7 @@ pub fn commutator_coefficients_class_fold_with_cache<T, U>(
     // sizes compact buffers from them): skip their exact-set computation —
     // the gating and pack cuts the sweep actually reads are unchanged.
     let (stages, _scatter_sets) =
-        plan_class_sweep_stages(a_series, order, levels, cache, false, false);
+        plan_class_sweep_stages(a_series, order, levels, cache, false, false, term_pool);
     let stage_refs: Vec<&ClassBatchStage<U>> = stages.iter().collect();
     // One fold unit: the stage chain is a single fold's sweep stages, so
     // the slot policy sees the fold's own planned work.

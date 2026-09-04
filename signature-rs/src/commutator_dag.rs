@@ -176,6 +176,11 @@ pub(crate) struct CommutatorDag<U> {
     /// the (a-mask, b-mask) keys — and hence the active-unit lists — repeat
     /// fold after fold. Built for this DAG's own series/table only.
     gating_cache: GatingCache,
+    /// Reusable two-phase term buffers (one set per level per lane
+    /// count). Pure scratch: NOT copied by `clone_shallow` — concurrent
+    /// folds run on independent clones and must never share buffers (a
+    /// shared buffer's term phase would race the other dispatch's reads).
+    term_pool: lie_rs::TermBufferPool<U>,
     /// The basis' class-contiguous ordering, created on the first fold and
     /// shared by every kernel call of every fold through this DAG (and by
     /// `clone_shallow` copies): the O(basis) planning is paid once.
@@ -532,6 +537,7 @@ where
             atom_b: Vec::new(),
             lists_built: false,
             gating_cache: GatingCache::default(),
+            term_pool: lie_rs::TermBufferPool::default(),
             class_order: OnceLock::new(),
         }
     }
@@ -702,7 +708,12 @@ where
                 job.b_nonzero = b_nz;
             }
         }
-        series.class_commutation_batch_fold(order, &mut levels, &mut self.gating_cache);
+        series.class_commutation_batch_fold(
+            order,
+            &mut levels,
+            &mut self.gating_cache,
+            &mut self.term_pool,
+        );
     }
 
     /// Batch-readiness: the node lists are the built fixed point for these
@@ -939,7 +950,15 @@ where
         // before the jobs are rewired; the final plan below hits the
         // gating cache).
         let (_, scatter_sets) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, false);
+            plan_class_sweep_stages(
+                series,
+                order,
+                &levels_jobs,
+                &mut self.gating_cache,
+                true,
+                false,
+                &mut self.term_pool,
+            );
 
         // Record the true scatter sets as the node lists: they bound this
         // batch's sweeps exactly, keep the union-level eligibility fixed
@@ -1046,7 +1065,15 @@ where
         // (the support lists are unchanged); the stages reference the final
         // job table the sweeps read through.
         let (sweep_stages, _) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, false);
+            plan_class_sweep_stages(
+                series,
+                order,
+                &levels_jobs,
+                &mut self.gating_cache,
+                true,
+                false,
+                &mut self.term_pool,
+            );
 
         // Block ranges over class positions. The block count derives from
         // the SAME work-adaptive policy the walk will use (below): blocks
@@ -1751,7 +1778,15 @@ where
         // them as the node lists (same fixed-point bookkeeping as
         // `fold_batch`).
         let (_, scatter_sets) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, true);
+            plan_class_sweep_stages(
+                series,
+                order,
+                &levels_jobs,
+                &mut self.gating_cache,
+                true,
+                true,
+                &mut self.term_pool,
+            );
         {
             let mut updated = std::mem::take(&mut self.nonzeros);
             for (li, level) in self.structure.levels.iter().enumerate().skip(1) {
@@ -1854,7 +1889,15 @@ where
         // unchanged), then the SoA sweep stages over it: identical tasks,
         // packs and gateways, dispatched to the 4-lane kernel.
         let (sweep_stages, _) =
-            plan_class_sweep_stages(series, order, &levels_jobs, &mut self.gating_cache, true, true);
+            plan_class_sweep_stages(
+                series,
+                order,
+                &levels_jobs,
+                &mut self.gating_cache,
+                true,
+                true,
+                &mut self.term_pool,
+            );
         let sweep_stages_soa: Vec<ClassBatchStage<U>> = sweep_stages
             .iter()
             .map(ClassBatchStage::cohort_variant)
@@ -2292,6 +2335,9 @@ impl<U> CommutatorDag<U> {
             atom_b: self.atom_b.clone(),
             lists_built: self.lists_built,
             gating_cache: self.gating_cache.clone(),
+            // Scratch: the clone re-allocates its own term buffers on its
+            // first plan (see the field doc).
+            term_pool: lie_rs::TermBufferPool::default(),
             class_order: self.class_order.clone(),
         }
     }
@@ -2760,6 +2806,7 @@ mod tests {
             atom_b: Vec::new(),
             lists_built: false,
             gating_cache: GatingCache::default(),
+            term_pool: lie_rs::TermBufferPool::default(),
             class_order: OnceLock::new(),
         };
 
