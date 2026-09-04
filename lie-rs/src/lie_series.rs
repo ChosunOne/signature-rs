@@ -3009,15 +3009,18 @@ impl<
     ) -> KernelGating {
         let table = &a_series.feasible_decompositions;
 
-        // Full-support fast path: the nonzero lists are sorted and deduped
-        // over `0..cutoff` (the degree-`max_degree` words are filtered
-        // upstream), so covering the cutoff means covering every index the
-        // sweep can ever test. Presence is all-ones, both orientations on
-        // for every entry, and the per-unit gating is the table's
-        // lazily-built, cached full-support form — the steady state's
-        // gating is an Arc clone, not a walk.
+        // Full-support fast path: the nonzero lists must be EXACTLY the
+        // kernel-visible prefix `0..cutoff` — every index the sweep's
+        // presence tests can ever reference (entries only pair positions
+        // strictly below `max_degree`). Length alone is NOT sufficient:
+        // node support lists recorded by a batch fold legitimately contain
+        // degree-`max_degree` positions, and a same-length list that
+        // includes them would skip the presence tests and read compact
+        // slots the operand layout does not cover (wrong values — see the
+        // pooled-dag leaf-reuse regression test).
         let cutoff = table.degree_start(table.max_degree());
-        if a_nonzero.len() == cutoff && b_nonzero.len() == cutoff {
+        let full_prefix = |s: &[usize]| s.len() == cutoff && s.iter().all(|&p| p < cutoff);
+        if full_prefix(a_nonzero) && full_prefix(b_nonzero) {
             let (units, tickets, unit_words) = table.full_support_gating_public();
             return KernelGating {
                 total_pairs: units.iter().map(|u| u.pairs as usize).sum(),
@@ -3278,10 +3281,15 @@ impl<
     ) -> KernelGating {
         let table = &a_series.feasible_decompositions;
 
-        // Full-support fast path (class space): same cutoff logic as the
-        // public prologue, per-unit gating cached on the ordering.
+        // Full-support fast path (class space): same predicate and cutoff
+        // logic as the public prologue — the supports must be EXACTLY the
+        // prefix `0..cutoff` (length alone misfires on batch-recorded node
+        // lists containing degree-`max_degree` positions; see the public
+        // path's comment and the pooled-dag leaf-reuse regression test),
+        // per-unit gating cached on the ordering.
         let cutoff = table.degree_start(table.max_degree());
-        if a_nonzero_cls.len() == cutoff && b_nonzero_cls.len() == cutoff {
+        let full_prefix = |s: &[usize]| s.len() == cutoff && s.iter().all(|&p| p < cutoff);
+        if full_prefix(a_nonzero_cls) && full_prefix(b_nonzero_cls) {
             let (units, tickets, unit_words) = order.full_support_gating_class(table);
             return KernelGating {
                 total_pairs: units.iter().map(|u| u.pairs as usize).sum(),

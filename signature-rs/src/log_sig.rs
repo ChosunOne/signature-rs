@@ -1449,6 +1449,102 @@ mod test {
     use super::*;
     use crate::commutator_dag::{COHORT_ENGINE_RUNS, COHORT_LANE_FOLDS, set_cohort_off};
 
+    /// Adversarial regression test for the pooled-DAG list-reuse flake
+    /// (`tournament_rationals_exact_at_awkward_sizes::case_1`, intermittent
+    /// under CPU oversubscription). A leaf chunk's `fold_batch` records its
+    /// planner scatter sets as the DAG's node lists; those lists contain
+    /// degree-`max_degree` positions, and a later fold on the SAME pooled
+    /// dag with matching atom supports early-returns through
+    /// `ensure_lists_steady` and gates with them. The gating prologues'
+    /// full-support fast path keyed on the support LENGTH alone: a
+    /// batch-recorded list whose length happens to equal
+    /// `degree_start(max_degree)` (here node `AB`'s recorded list
+    /// `{2,3,4}` at cutoff 3) triggered the all-entries-active gating
+    /// without presence tests, reading compact slots the operand layout
+    /// does not cover — exact-rational garbage contributions. The fix
+    /// requires the fast-path supports to be exactly the prefix
+    /// `0..cutoff`; this test pins that deterministically (leaf 1 via the
+    /// pooled early-return path must equal the sequential fold chain).
+    #[test]
+    fn pooled_batch_recorded_lists_fold_bit_identically() {
+        type R = Ratio<i64>;
+        let (d, m) = (2usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis =
+            lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+                .generate_basis(m);
+        let mut seed = 0x3a11_u64.wrapping_add((d * 1007 + m * 97 + 17) as u64);
+        let lcg = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 7) as i64 - 3
+        };
+        let rhss: Vec<Vec<R>> = (0..17)
+            .map(|i| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d && !(i % 3 == 2 && k == i % d) {
+                            R::from_integer(lcg(&mut seed))
+                        } else {
+                            R::from_integer(0)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let basis_len = basis.len();
+        let zero = vec![R::default(); basis_len];
+        let mk = || {
+            let s = builder.build::<R>();
+            let LogSignature { series, bch_series: _, dag } = s;
+            (series, dag)
+        };
+        let (ref_series, mut probe) = mk();
+
+        // The leaf plan exactly as leaf_group_engine's divergent branch does:
+        // probe dag, leaf_steady_plan from (zero acc, rhs[0], b0).
+        let b0: Vec<usize> = rhss[0..8]
+            .iter()
+            .flat_map(|r| ref_series.nonzero_coefficient_indices(r))
+            .collect::<Vec<_>>();
+        let mut b0s = b0.clone();
+        b0s.sort_unstable();
+        b0s.dedup();
+        let a_star = leaf_steady_plan(&SeriesTemplate(ref_series.clone()), &mut probe, &zero, &rhss[0], &b0s);
+
+        // Leaf 0 on the probe dag itself (mimics the pool handing the probe
+        // to lane 0): atoms already match -> early-return -> fold_batch.
+        let mut series0 = ref_series.clone();
+        series0.coefficients = vec![R::default(); basis_len];
+        probe.ensure_lists_steady(&ref_series, &series0.coefficients, &a_star, &rhss[0], &b0s);
+        probe.fold_batch(&mut series0, &rhss[0..8].iter().map(|r| r.as_slice()).collect::<Vec<_>>(), &a_star, &b0s);
+        let leaf0 = series0.coefficients.clone();
+
+        // Leaf 1 on the SAME dag (pooled early-return path).
+        let mut series1p = ref_series.clone();
+        series1p.coefficients = vec![R::default(); basis_len];
+        probe.ensure_lists_steady(&ref_series, &series1p.coefficients, &a_star, &rhss[8], &b0s);
+        probe.fold_batch(&mut series1p, &rhss[8..16].iter().map(|r| r.as_slice()).collect::<Vec<_>>(), &a_star, &b0s);
+        let leaf1_pooled = series1p.coefficients.clone();
+
+        // Leaf 1 on a FRESH dag (rebuild path).
+        let (_, mut fresh) = mk();
+        let mut series1f = ref_series.clone();
+        series1f.coefficients = vec![R::default(); basis_len];
+        fresh.ensure_lists_steady(&ref_series, &series1f.coefficients, &a_star, &rhss[8], &b0s);
+        fresh.fold_batch(&mut series1f, &rhss[8..16].iter().map(|r| r.as_slice()).collect::<Vec<_>>(), &a_star, &b0s);
+        let leaf1_fresh = series1f.coefficients.clone();
+
+        // Ground truth: sequential folds of rhss[8..16] onto zero.
+        let mut seq1 = builder.build::<R>();
+        for r in &rhss[8..16] {
+            seq1.concatenate_assign_coefficients(r);
+        }
+        assert_eq!(leaf1_fresh, seq1.series.coefficients, "fresh-dag leaf1 must equal sequential");
+        assert_eq!(leaf1_pooled, seq1.series.coefficients, "pooled-dag leaf1 (early-return) diverged from sequential");
+    }
+
     #[test]
      fn dag_node_lists_cover_buffer_support() {
         use ordered_float::NotNan;
@@ -2483,6 +2579,7 @@ mod test {
     /// routing behavior those conditions select is pinned observationally
     /// by `batch_driver_length_gate_selects_the_reduction_path`.
     #[rstest]
+    #[case(2, 3, 16)]
     #[case(2, 3, 17)]
     #[case(3, 4, 31)]
     #[case(2, 5, 31)]
