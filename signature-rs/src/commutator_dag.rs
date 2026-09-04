@@ -1486,6 +1486,58 @@ where
         self.lists_built = true;
     }
 
+    /// Clones the current steady-list state for plan caching: the node
+    /// scatter lists and their dirty bitsets exactly as the last
+    /// collecting rebuild left them (support-determined content — the
+    /// pairing with the derived plan is the caller's, see
+    /// [`Self::adopt_steady_lists`]).
+    pub(crate) fn steady_lists_snapshot(&self) -> (Vec<Vec<usize>>, Vec<Vec<u64>>) {
+        (self.nonzeros.clone(), self.dirty.clone())
+    }
+
+    /// Adopts a support-determined steady-list snapshot: the node scatter
+    /// lists, dirty bitsets and atom supports produced by a previous
+    /// [`Self::ensure_lists_steady`] fixed point for the SAME supports.
+    /// Sound because collection is support-determined — the lists are a
+    /// pure function of (table, class order, atom supports) — so the
+    /// adopted state is bit-identical to what a fresh collecting rebuild
+    /// on this dag would produce, minus the kernel sweeps. The snapshot's
+    /// class order is installed too ([`Self::fold_batch`] requires a
+    /// prior steady fold's order; [`Self::fold_batch_cohort`] would
+    /// re-derive it).
+    ///
+    /// Validate-then-commit: returns `false` WITHOUT mutating `self` when
+    /// the snapshot's shape does not fit this dag's structure (a pooled
+    /// dag of a different configuration) or carries a different class
+    /// order than the dag already holds — the caller falls back to a
+    /// regular collecting rebuild.
+    pub(crate) fn adopt_steady_lists(
+        &mut self,
+        a_plan: &[usize],
+        b_nonzero: &[usize],
+        nonzeros: Vec<Vec<usize>>,
+        dirty: Vec<Vec<u64>>,
+        order: Arc<ClassOrder>,
+    ) -> bool {
+        if self.structure.nodes.len() - 2 != nonzeros.len() || dirty.len() != nonzeros.len() {
+            return false;
+        }
+        if let Some(existing) = self.class_order.get() {
+            if !Arc::ptr_eq(&existing, &order) {
+                return false;
+            }
+        }
+        self.nonzeros = nonzeros;
+        self.dirty = dirty;
+        self.atom_a.clear();
+        self.atom_a.extend_from_slice(a_plan);
+        self.atom_b.clear();
+        self.atom_b.extend_from_slice(b_nonzero);
+        self.lists_built = true;
+        let _ = self.class_order.set(order);
+        true
+    }
+
     /// Whether the node lists are the built fixed point for these atom
     /// supports — the list half of [`Self::batch_eligible`] without the
     /// accumulator-density requirement (a ONE-fold batch needs no density:

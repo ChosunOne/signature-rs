@@ -12,7 +12,14 @@
 //! Decomposition indices are stored relative to the start of the
 //! target-degree slice, with an absolute copy for [`FeasibleDecompositions::get`].
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
+
+/// Process-unique identity source for [`FeasibleDecompositions`] tables.
+/// Plan caches above the kernel key their entries by this id, so two
+/// differently-configured tables can never collide (an address would be
+/// reusable after a drop; a monotonic counter never is).
+static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A canonical pair `(i, j)` with `i < j`. Its decomposition slice is
 /// `decomp_start ..` up to the next flat entry's `decomp_start`.
@@ -146,6 +153,11 @@ pub struct FeasibleDecompositions<U> {
     /// The full-support gating's PUBLIC-space transposition (see
     /// [`FullSupportGating`]), built lazily on the first dense call.
     full_support_public: OnceLock<FullSupportGating>,
+    /// Process-unique table identity (see [`NEXT_TABLE_ID`]). A deep
+    /// `Clone` duplicates the id, but a clone's contents — and therefore
+    /// every support-derived list a cache would hand out for it — are
+    /// identical, so the duplication is unobservable.
+    table_id: u64,
 }
 
 /// Stable counting sort of full-support contributions by target position
@@ -541,6 +553,7 @@ impl<U: Clone> Builder<U> {
             num_entries,
             class_order,
             full_support_public: OnceLock::new(),
+            table_id: NEXT_TABLE_ID.fetch_add(1, AtomicOrdering::Relaxed),
         }
     }
 }
@@ -620,6 +633,14 @@ fn build_class_order(
 }
 
 impl<U> FeasibleDecompositions<U> {
+    /// The table's process-unique identity. Two tables with the same id
+    /// carry identical contents (the id is assigned once at construction
+    /// and survives only content-preserving clones), so plan caches may
+    /// key support-derived data on it without any content re-check.
+    pub fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
     /// Total number of stored feasible pairs.
     pub fn len(&self) -> usize {
         self.num_entries
