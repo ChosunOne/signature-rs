@@ -2624,6 +2624,16 @@ pub fn run_class_batch_with_work<T, U>(
         );
     }
     let walk_for_slot = |_slot: usize| {
+        // Hoisted per-stage sync references: the drain/spin loops below run
+        // per claim attempt / per spin iteration, and re-indexing the
+        // counter Vecs there cost ~7% of the wide-pool profile in bounds
+        // checks + deref chains alone (flamegraph, 4x8/32t). The Vecs are
+        // never resized during the walk, so shared references hoisted once
+        // per slot are equivalent.
+        let stage_done: Vec<&AtomicUsize> = done.iter().map(|p| &p.0).collect();
+        let stage_work: Vec<&AtomicUsize> = work.iter().map(|p| &p.0).collect();
+        let stage_claims: Vec<&AtomicUsize> = claims.iter().map(|p| &p.0).collect();
+        let stage_gates: Vec<&FutexGate> = gates.iter().collect();
         for s in 0..stages.len() {
             if s > 0 {
                 // EVERY slot waits at every stage boundary — including
@@ -2639,26 +2649,46 @@ pub fn run_class_batch_with_work<T, U>(
                 // this point every remaining pack is in flight, so the
                 // wait is bounded by real work.
                 let need = stage_pack_counts[s - 1];
+                let (prev_done, prev_work, prev_gate, prev_claim) = (
+                    stage_done[s - 1],
+                    stage_work[s - 1],
+                    stage_gates[s - 1],
+                    stage_claims[s - 1],
+                );
                 // Drain once on arrival: after this the cursor is exhausted
                 // — every pack is claimed-and-in-flight — so parking is
                 // safe (no pack waits on this slot). The cursor never
                 // grows back, so no re-drain is ever needed.
-                while walk.claim_and_run_pack(s - 1, &claims[s - 1].0) {
-                    finish_pack(&done[s - 1].0, &work[s - 1].0, &gates[s - 1], need, &|| {
+                while walk.claim_and_run_pack(s - 1, prev_claim) {
+                    finish_pack(prev_done, prev_work, prev_gate, need, &|| {
                         debug_snapshot_stage(&walk, s - 1);
                     });
                 }
                 // Poll briefly (most gates open within microseconds —
-                // polling costs the finisher nothing), then park: a parked
-                // slot frees its hardware thread, and the finisher only
-                // pays a wake syscall when a slot actually parked.
+                // polling costs the finisher nothing), then YIELD instead
+                // of parking: a parked slot BLOCKS its rayon worker, and
+                // the tournament runs many concurrent dispatches on one
+                // pool (e2e: 32 leaf-group tasks × slot tasks on 32
+                // workers) — queued sibling slot tasks sit behind the
+                // parked holder, which measured as 40% slot utilization
+                // at 32 threads (task-clock vs wall, 4x8 concat). A
+                // yielding slot re-queues its task so the worker runs the
+                // other dispatches' pack work; the drain-on-arrival rule
+                // guarantees every pack is claimed-and-in-flight, so the
+                // gate always opens from real work. Parking stays as the
+                // long-wait fallback (frees the core when a stage is
+                // genuinely slow; the finisher then pays the wake).
                 let mut spins = 0usize;
-                while done[s - 1].0.load(Ordering::Acquire) < need {
+                let mut yields = 0usize;
+                while prev_done.load(Ordering::Acquire) < need {
                     if spins < 1 << 12 {
                         std::hint::spin_loop();
                         spins += 1;
+                    } else if yields < 1 << 10 {
+                        yields += 1;
+                        rayon::yield_now();
                     } else {
-                        gates[s - 1].park();
+                        prev_gate.park();
                     }
                 }
             }
@@ -2668,16 +2698,17 @@ pub fn run_class_batch_with_work<T, U>(
             // claimed it. (A slot that finds the cursor drained reports
             // nothing, or the stage would appear complete before its work
             // is done.)
-            while walk.claim_and_run_pack(s, &claims[s].0) {
-                finish_pack(
-                    &done[s].0,
-                    &work[s].0,
-                    &gates[s],
-                    stage_pack_counts[s],
-                    &|| {
-                        debug_snapshot_stage(&walk, s);
-                    },
-                );
+            let (this_done, this_work, this_gate, this_claim) = (
+                stage_done[s],
+                stage_work[s],
+                stage_gates[s],
+                stage_claims[s],
+            );
+            let this_need = stage_pack_counts[s];
+            while walk.claim_and_run_pack(s, this_claim) {
+                finish_pack(this_done, this_work, this_gate, this_need, &|| {
+                    debug_snapshot_stage(&walk, s);
+                });
             }
         }
     };
@@ -2924,8 +2955,53 @@ impl<
     /// are class-ordered, support lists class-indexed, and the sink reports
     /// class-indexed positions. No scratch, no permutation.
     #[allow(clippy::too_many_arguments)]
+    /// Handle to the compiled feasible-decomposition table (basis-derived
+    /// integer data — no `T`). `#[doc(hidden)]` kernel-plumbing accessor
+    /// for the DAG crate's level-parallel collecting rebuild, which must
+    /// capture only Send+Sync, T-free state (see `class_collect_kernel`).
+    #[doc(hidden)]
+    pub fn feasible_decompositions_handle(&self) -> &Arc<FeasibleDecompositions<U>> {
+        &self.feasible_decompositions
+    }
+
     pub(crate) fn commutator_coefficients_class_with_nonzero_collecting(
         a_series: &LieSeries<T, U>,
+        order: &ClassOrder,
+        a_coefficients: &[U],
+        a_nonzero_cls: &[usize],
+        b_coefficients: &[U],
+        b_nonzero_cls: &[usize],
+        result_coefficients: &mut [U],
+        dirty: &mut [u64],
+        targets: &mut Vec<usize>,
+    ) {
+        Self::class_collect_kernel(
+            &a_series.feasible_decompositions,
+            a_series.basis.len(),
+            a_series.max_degree,
+            order,
+            a_coefficients,
+            a_nonzero_cls,
+            b_coefficients,
+            b_nonzero_cls,
+            result_coefficients,
+            dirty,
+            targets,
+        );
+    }
+
+    /// T-free core of
+    /// [`Self::commutator_coefficients_class_with_nonzero_collecting`]:
+    /// everything the class collect kernel touches is basis-derived
+    /// integer data (the feasible table, the class order) plus U values —
+    /// the letter type never enters the kernel. This is what lets the
+    /// collecting rebuild run level-parallel without shipping `T` across
+    /// threads (see `CommutatorDag::ensure_lists_steady`).
+    #[doc(hidden)]
+    pub fn class_collect_kernel(
+        table: &FeasibleDecompositions<U>,
+        basis_len: usize,
+        max_degree: usize,
         order: &ClassOrder,
         a_coefficients: &[U],
         a_nonzero_cls: &[usize],
@@ -2939,18 +3015,17 @@ impl<
             *word = 0;
         }
         targets.clear();
-        let cutoff = a_series
-            .feasible_decompositions
-            .degree_start(a_series.max_degree);
-        let gating = Self::kernel_prologue_cached_class(
-            a_series,
+        let cutoff = table.degree_start(max_degree);
+        let gating = Self::kernel_prologue_cached_class_core(
+            table,
+            basis_len,
             a_nonzero_cls,
             b_nonzero_cls,
             order,
             &mut GatingCache::default(),
         );
-        LieSeries::sweep_words_serial(
-            a_series,
+        Self::sweep_words_serial_core(
+            table.decomp_coeffs(),
             a_coefficients,
             b_coefficients,
             &gating,
@@ -3279,7 +3354,27 @@ impl<
         order: &ClassOrder,
         cache: &mut GatingCache,
     ) -> KernelGating {
-        let table = &a_series.feasible_decompositions;
+        Self::kernel_prologue_cached_class_core(
+            &a_series.feasible_decompositions,
+            a_series.basis.len(),
+            a_nonzero_cls,
+            b_nonzero_cls,
+            order,
+            cache,
+        )
+    }
+
+    /// T-free core of [`Self::kernel_prologue_cached_class`] (see
+    /// `sweep_words_serial_core` for why the letter type must not reach
+    /// the parallel kernels).
+    fn kernel_prologue_cached_class_core(
+        table: &FeasibleDecompositions<U>,
+        basis_len: usize,
+        a_nonzero_cls: &[usize],
+        b_nonzero_cls: &[usize],
+        order: &ClassOrder,
+        cache: &mut GatingCache,
+    ) -> KernelGating {
 
         // Full-support fast path (class space): same predicate and cutoff
         // logic as the public prologue — the supports must be EXACTLY the
@@ -3314,7 +3409,7 @@ impl<
         // Class-positioned presence bitsets (indexed by class positions)
         // and relabeled degrees; the rest of the gating walk is shared
         // with the public prologue (see `build_gating`).
-        let words = a_series.basis.len().div_ceil(64);
+        let words = basis_len.div_ceil(64);
         let mut presence = vec![0u64; 2 * words];
         let (a_present, b_present) = presence.split_at_mut(words);
         let mut a_deg = [0u64; 2];
@@ -3431,7 +3526,32 @@ impl<
         decomp_rels: &[u32],
         sink: &mut S,
     ) {
-        let decomp_coefficients = a_series.feasible_decompositions.decomp_coeffs();
+        Self::sweep_words_serial_core(
+            a_series.feasible_decompositions.decomp_coeffs(),
+            a_coefficients,
+            b_coefficients,
+            gating,
+            result_coefficients,
+            entries,
+            decomp_rels,
+            sink,
+        );
+    }
+
+    /// T-free core of [`Self::sweep_words_serial`]: everything the sweep
+    /// touches is basis-derived integer tables plus U values — the letter
+    /// type never enters the kernel (this is what lets the collecting
+    /// rebuild run level-parallel; see `CommutatorDag::ensure_lists_steady`).
+    fn sweep_words_serial_core<S: ScatterSink>(
+        decomp_coefficients: &[U],
+        a_coefficients: &[U],
+        b_coefficients: &[U],
+        gating: &KernelGating,
+        result_coefficients: &mut [U],
+        entries: &[Entry],
+        decomp_rels: &[u32],
+        sink: &mut S,
+    ) {
         // Single-phase per-unit sweep: each unit's active entries are
         // visited in table order, each term computed exactly once and its
         // row contributions added straight into the result buffer. A

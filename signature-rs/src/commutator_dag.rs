@@ -1528,36 +1528,107 @@ where
         let b_cls = series.class_coefficients(order, b);
         let a_nz_cls: Vec<usize> = a_nonzero.iter().copied().map(|i| inv[i] as usize).collect();
         let b_nz_cls: Vec<usize> = b_nonzero.iter().copied().map(|i| inv[i] as usize).collect();
-        // One scratch result buffer: the sweep's value outputs are
-        // discarded; only the collected scatter-target lists are kept.
-        let mut scratch = vec![U::default(); series.coefficients.len()];
-        // One serial topological sweep — the kernel re-derives every node's
-        // scatter-target set (children before parents), exactly as the
-        // rebuild branch of `evaluate` does.
-        for k in 2..self.structure.nodes.len() {
-            let (left, right) = match self.structure.nodes[k] {
-                DagNode::Binary { left, right } => (left, right),
-                DagNode::Atom(_) => unreachable!("atoms are the first two nodes"),
+        // Per-level PARALLEL collecting sweep. The rebuild is the fold
+        // pipeline's serial mountain otherwise: one node's collect kernel
+        // call with dense supports costs O(active entries), the DAG has as
+        // many nodes as BCH terms, and every plan derivation and
+        // support-change rebuild walks all of them node-by-node (measured
+        // ~28ms serial at 4x8 — larger than the parallel batch dispatch it
+        // feeds). A level's nodes depend only on strictly earlier levels'
+        // lists and write disjoint (scratch, dirty, list) triples, so each
+        // level is one conflict-free parallel batch — the same level
+        // structure the batch dispatch uses. Collection is
+        // support-determined: the schedule cannot change the lists.
+        let d = series.coefficients.len();
+        let mut lists = std::mem::take(&mut self.nonzeros);
+        let mut dirties = std::mem::take(&mut self.dirty);
+        {
+            let nodes = &self.structure.nodes;
+            let buffers = &self.buffers;
+            // The collect tasks capture ONLY Send+Sync data: the T-free
+            // kernel inputs (feasible table + class order + max degree +
+            // basis length — all basis-derived integer tables), the U
+            // operand buffers, and the per-node slot pointers. The letter
+            // type never crosses a thread (same contract as the batch
+            // dispatch's T-free walk). Each node appears in exactly one
+            // level and is collected exactly once per call, so the per-node
+            // slots are written by exactly one task; a task reads only its
+            // nodes' children's slots (strictly earlier levels — already
+            // final). This mirrors the SeriesTemplate safety contract in
+            // signature-rs, minus the T exposure: no T-bearing value is
+            // reachable from the tasks at all.
+            struct NodeSlots {
+                lists: Vec<*mut Vec<usize>>,
+                dirty: Vec<*mut Vec<u64>>,
+            }
+            unsafe impl Send for NodeSlots {}
+            unsafe impl Sync for NodeSlots {}
+            let slots = NodeSlots {
+                lists: lists.iter_mut().map(|l| l as *mut Vec<usize>).collect(),
+                dirty: dirties.iter_mut().map(|x| x as *mut Vec<u64>).collect(),
             };
-            let lbuf = node_slice(left, &self.buffers, &a_cls, &b_cls);
-            let rbuf = node_slice(right, &self.buffers, &a_cls, &b_cls);
-            let (nz_before, nz_rest) = self.nonzeros.split_at_mut(k - 2);
-            let lnz = node_nonzeros(left, nz_before, &a_nz_cls, &b_nz_cls);
-            let rnz = node_nonzeros(right, nz_before, &a_nz_cls, &b_nz_cls);
-            let list = &mut nz_rest[0];
-            list.clear();
-            let dirty = &mut self.dirty[k - 2];
-            series.class_commutation_with_nonzero_collecting(
-                order,
-                lbuf,
-                lnz,
-                rbuf,
-                rnz,
-                &mut scratch,
-                dirty,
-                list,
-            );
+            // Bind through a shared reference so the task closures capture
+            // `&NodeSlots` (Sync via the unsafe impl above) instead of the
+            // per-field `&Vec<*mut _>` borrows, whose element raw pointers
+            // are not Sync.
+            let slots = &slots;
+            let table = series.feasible_decompositions_handle().clone();
+            let basis_len = series.basis.len();
+            let max_degree = series.max_degree;
+            use rayon::prelude::*;
+            for level in self.structure.levels.iter().skip(1) {
+                level.par_iter().for_each(|&k| {
+                    let (left, right) = match nodes[k as usize] {
+                        DagNode::Binary { left, right } => (left, right),
+                        DagNode::Atom(_) => unreachable!("atoms are the first two nodes"),
+                    };
+                    let lbuf = node_slice(left, buffers, &a_cls, &b_cls);
+                    let rbuf = node_slice(right, buffers, &a_cls, &b_cls);
+                    let child_list = |id: u32| -> &[usize] {
+                        if id < 2 {
+                            if id == 0 { &a_nz_cls } else { &b_nz_cls }
+                        } else {
+                            // SAFETY: the child's slot was published by an
+                            // earlier level (the level ordering is the
+                            // serial walk's topological order) and is not
+                            // written again this call.
+                            unsafe { &*slots.lists[id as usize - 2] }
+                        }
+                    };
+                    let lnz = child_list(left);
+                    let rnz = child_list(right);
+                    // SAFETY: this node's slot is written only here (one
+                    // task per node per call — levels partition the nodes).
+                    // The raw pointers are copied to locals first: `&mut *`
+                    // through the shared `slots` place would demand a
+                    // mutable borrow of it.
+                    let list_ptr = slots.lists[k as usize - 2];
+                    let list = unsafe { &mut *list_ptr };
+                    let dirty_ptr = slots.dirty[k as usize - 2];
+                    let dirty = unsafe { &mut *dirty_ptr };
+                    list.clear();
+                    // One scratch result buffer per node call: the sweep's
+                    // value outputs are discarded; only the collected
+                    // scatter-target list is kept.
+                    let mut scratch = vec![U::default(); d];
+                    LieSeries::<T, U>::class_collect_kernel(
+                        &table,
+                        basis_len,
+                        max_degree,
+                        order,
+                        lbuf,
+                        lnz,
+                        rbuf,
+                        rnz,
+                        &mut scratch,
+                        dirty,
+                        list,
+                    );
+                });
+            }
         }
+        self.nonzeros = lists;
+        self.dirty = dirties;
         self.atom_a.clear();
         self.atom_a.extend_from_slice(a_nonzero);
         self.atom_b.clear();

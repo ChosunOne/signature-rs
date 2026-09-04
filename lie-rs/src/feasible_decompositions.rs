@@ -108,7 +108,11 @@ pub(crate) const TICKET_Q_ACTIVE: u32 = 1 << 30;
 
 /// Coefficient type is generic; decomposition indices are stored as `u32`.
 #[derive(Clone)]
-pub(crate) struct FeasibleDecompositions<U> {
+// `#[doc(hidden)] pub`: the DAG crate's level-parallel collecting rebuild
+// captures this table (basis-derived integer data, no letter type) — see
+// `LieSeries::class_collect_kernel`. Every other use stays in-crate.
+#[doc(hidden)]
+pub struct FeasibleDecompositions<U> {
     /// Per basis word: its Lyndon degree. The basis is degree-grouped, so
     /// this array is non-decreasing.
     index_degrees: Vec<u8>,

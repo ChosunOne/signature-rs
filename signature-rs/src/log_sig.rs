@@ -570,9 +570,22 @@ where
         vec![(a, b0.clone()); group_leaves]
     } else {
         let zero = vec![U::default(); basis_len];
-        let mut probe = take_pooled_dag(dag_pool, source_dag);
-        let plans = (0..group_leaves)
-            .map(|l| {
+        // Per-lane plans, derived in PARALLEL on per-lane dags. Each plan's
+        // fixed-point loop runs two collecting rebuilds of the whole DAG
+        // (serial node-by-node kernel calls — at 4x8 the dominating cost of
+        // the leaf round); deriving the group's plans on ONE probe dag
+        // serialized those chains, and at wide pools the serial planning —
+        // not the parallel dispatch — set the round's wall time. The plans
+        // are pure functions of (template, zero, first slice, union
+        // support): the dag they are derived on is interchangeable, so the
+        // parallel form is bit-identical.
+        let lanes: Vec<CommutatorDag<U>> = (0..group_leaves)
+            .map(|_| take_pooled_dag(dag_pool, source_dag))
+            .collect();
+        let plans: Vec<(Vec<usize>, Vec<usize>)> = lanes
+            .into_par_iter()
+            .enumerate()
+            .map(|(l, mut dag)| {
                 let start = (first_leaf + l) * chunk;
                 let end = (start + chunk).min(rhss.len());
                 // The chunk's union displacement support. Collected then
@@ -588,11 +601,14 @@ where
                     .collect();
                 b.sort_unstable();
                 b.dedup();
-                let a = leaf_steady_plan(template, &mut probe, &zero, rhss[start], &b);
+                let a = leaf_steady_plan(template, &mut dag, &zero, rhss[start], &b);
+                // The plan dag returns to the pool already holding this
+                // lane's atom supports and fixed-point lists, so the lane
+                // fold's own ensure_lists_steady early-returns.
+                return_pooled_dag(dag_pool, dag);
                 (a, b)
             })
             .collect();
-        return_pooled_dag(dag_pool, probe);
         plans
     };
     (0..group_leaves)
