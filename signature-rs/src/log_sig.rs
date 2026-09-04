@@ -84,6 +84,23 @@ const COHORT_WIDE_POOL_TERMS: usize = 256;
 /// no-regression gate; the big cohort wins are at 4–8 workers).
 const COHORT_MAX_THREADS: usize = 16;
 
+/// Wide-pool engagement by TABLE SIZE (the static per-fold sweep-work
+/// proxy): a fold over a decomposition table with at least this many
+/// feasible pairs forms cohort groups at ANY pool width — its engine
+/// stages fund the pool themselves, so the old worker-count protection
+/// only starved it. Measured per-fold planned work (two-phase active-entry
+/// units): 2x8 ≈ 7.4k (table 121), 3x8 ≈ 245k (table 2800), 4x8 ≈ 736k
+/// (table 26185) — the term-count rule misgated exactly the heavy end:
+/// all three DAGs have ~51 terms, so at 32 workers every round fell back
+/// to the scalar two-phase sweep, whose thread-time is 3.2–11× the SoA
+/// cohort's (+52..+257% wall, 4x8 parallel efficiency 4.4× → 1.36×).
+/// 1000 feasible pairs sits 8× above 2x8 (kept on the protected scalar
+/// path) and 2.8× below 3x8 (engaged). The proxy is static (pure function
+/// of the builder configuration) because the live work state is useless
+/// at the gate: a batch's folds run on pooled dag clones, so the source
+/// dag's gating cache never sees steady-state supports.
+const COHORT_WIDE_POOL_MIN_TABLE: usize = 1000;
+
 /// NaN audit for an arbitrary coefficient slice — the
 /// `LogSignature::audit_no_nan` check factored off `&self` so the
 /// tournament's locally owned accumulators (plain `LieSeries` values, not
@@ -1270,16 +1287,19 @@ impl<
             TOURNAMENT_LEAF_CHUNK.max(rhss.len().div_ceil(TOURNAMENT_MAX_LEAVES))
         };
 
-        // Wide-pool engagement rule (see `COHORT_WIDE_POOL_TERMS`): with a
-        // wide pool, only heavy folds form cohort groups outright; light
-        // folds need enough groups in the round to cover the pool on their
-        // own. `groups` is per round — the leaf round's group count is
+        // Wide-pool engagement rule (see `COHORT_WIDE_POOL_TERMS` and
+        // `COHORT_WIDE_POOL_MIN_TABLE`): with a wide pool, heavy folds (by
+        // table size or term count) form cohort groups outright;
+        // light folds need enough groups in the round to cover the pool on
+        // their own. `groups` is per round — the leaf round's group count is
         // `leaf_count/4`, a merge round's is `ceil(n_pairs/4)` — so the
         // round gates below re-check with their own counts.
         let threads = rayon::current_num_threads().max(1);
         let terms = source_dag.structure.terms.len();
+        let table_len = template.0.feasible_table_len();
         let cohort_round_ok = |groups: usize| {
             threads <= COHORT_MAX_THREADS
+                || table_len >= COHORT_WIDE_POOL_MIN_TABLE
                 || terms >= COHORT_WIDE_POOL_TERMS
                 || groups >= threads
         };
@@ -3779,3 +3799,4 @@ mod test {
         );
     }
 }
+

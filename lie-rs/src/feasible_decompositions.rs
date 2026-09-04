@@ -585,7 +585,7 @@ fn build_class_order(
 
 impl<U> FeasibleDecompositions<U> {
     /// Total number of stored feasible pairs.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.num_entries
     }
 

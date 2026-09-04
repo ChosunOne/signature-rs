@@ -3128,6 +3128,14 @@ impl<
             .collect()
     }
 
+    /// Total number of stored feasible decomposition pairs of this series'
+    /// table — the static per-fold sweep-work upper bound (a steady fold's
+    /// gating resolves most of the table's entries once operand supports
+    /// are dense).
+    pub fn feasible_table_len(&self) -> usize {
+        self.feasible_decompositions.len()
+    }
+
     /// Allocless [`Self::nonzero_coefficient_indices`] equality test:
     /// `true` iff `coefficients`' kernel-visible nonzero support equals
     /// `support` (both understood over `[0, cutoff)`, `support` sorted
@@ -3412,6 +3420,10 @@ impl<
     /// identical. Length is mixed in and both streams are avalanche-
     /// finished (murmur3 fmix64), so lists of different lengths or content
     /// collide with negligible probability.
+    /// The gating cache's key fingerprint for one support list (murmur3-
+    /// finish FNV pairs). Length is mixed in and both streams are
+    /// avalanche-finished, so distinct lists collide with negligible
+    /// probability.
     #[inline]
     fn support_fingerprint(list: &[usize]) -> [u64; 2] {
         let mut h1 = 0xcbf2_9ce4_8422_2325u64 ^ (list.len() as u64).rotate_left(32);
