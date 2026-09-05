@@ -62,21 +62,36 @@ log-signature performance campaign.
   require `T: 'static` (and `U: 'static`), because the process-wide plan
   caches key on `TypeId`.
 
-### Performance (approximate)
+### Performance (measured against the 0.1.1 release)
 
-- End-to-end log-signature builds at the 3x8 configuration on 8 threads are
-  roughly 55% faster cumulatively across this campaign versus the
-  pre-campaign baseline.
-- Light-fold configurations at high thread counts improved sharply: 8x3 at
-  32 threads is roughly 29% faster (1.50 ms to 1.09 ms) now that the cohort
-  engine engages there.
-- Thread scaling at 3x8 improved from 3.9x to 5.8x+ (1 thread to 8
-  threads); the per-build table reconstruction that capped scaling is now
-  cached.
-- The dense-concatenation regressions observed earlier in the campaign are
-  eliminated versus the pre-campaign baseline: the final regression floor
-  keeps every measured cell within +/-1.4% of its predecessor, and no
-  measured regime favors the scalar fallback at width.
+Methodology: the current criterion harness was ported onto unmodified 0.1.1
+library sources, so both sides run an identical benchmark driver — only the
+library under test differs. Cells run interleaved x2 with 10 samples per
+binary; end-to-end (e2e) = a 1000-point path build. Medians:
+
+| e2e cell | 0.1.1 release | this version | delta |
+|---|---|---|---|
+| 2x8, 1 thread | 197.9 ms | 10.6 ms | -94.7% |
+| 2x8, 8 threads | 199.8 ms | 3.5 ms | -98.3% |
+| 2x8, 32 threads | 199.9 ms | 4.2 ms | -97.9% |
+| 8x3, 8 threads | 11.8 ms | 1.0 ms | -91% |
+| 8x3, 32 threads | ~31.7-49.8 ms (noisy) | 12.1 ms | ~-62% |
+
+Notes:
+
+- The 0.1.1 build does not complete the 3x8 e2e cell at any thread count:
+  it hangs during warmup (no output in a 25-minute window). That cell is
+  reported as unmeasurable rather than inferred. For reference, this
+  version's absolute numbers there are 1t ~262 ms, 8t ~47 ms, 32t ~51 ms.
+- The 0.1.1 build shows ~198 ms at 2x8 regardless of thread count (1t, 8t,
+  32t) — pre-campaign code has no fold parallelism; scaling in this version
+  at 3x8-class workloads reaches ~5.8x at 8 threads (1t->8t, measured within
+  the campaign as 3.93x -> 5.83x across the plan-cache work).
+- Engine-choice A/Bs inside this version (cohort SIMD engine vs scalar
+  fallback, not a version comparison): the cohort engine wins or ties every
+  measured regime at 1-32 threads; the previous wide-pool engagement gate
+  was removed on that evidence (8x3 32t 1.54 -> 1.09 ms on the
+  counterfactual measurement).
 
 ### Fixed
 
