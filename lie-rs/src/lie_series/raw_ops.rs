@@ -95,3 +95,53 @@ where
         unsafe { (*dst) += (*src).clone() };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The raw helpers must behave bitwise like the primitive float ops and
+    /// must NOT panic where the wrapper's arithmetic would: overflow to
+    /// infinity and its NaN cancellation are the caller's audit (NaN policy
+    /// of [`raw_mul`]).
+    #[test]
+    fn raw_ops_match_primitive_semantics_without_panic() {
+        use num_rational::Ratio;
+
+        // Overflow: the wrapper's Mul panics on NaN results only; plain
+        // overflow to inf is fine in both. Check bitwise equality with the
+        // primitive for representative inputs, including the NaN-producing
+        // combination the checked path would panic on.
+        let cases = [
+            (3.0f64, 5.0f64),
+            (-2.5, 4.25),
+            (f64::MAX, f64::MAX),  // -> inf
+            (f64::MAX, -f64::MAX), // -> -inf
+        ];
+        for (x, y) in cases {
+            let a = NotNan::new(x).unwrap();
+            let b = NotNan::new(y).unwrap();
+            let raw = raw_mul(&a, &b);
+            assert_eq!(raw.into_inner().to_bits(), (x * y).to_bits());
+        }
+        // NaN cancellation: inf + (-inf) — the wrapper's AddAssign panics,
+        // the raw helper writes the NaN (audit is the caller's job).
+        let mut acc = NotNan::new(f64::INFINITY).unwrap();
+        let neg_inf = NotNan::new(f64::NEG_INFINITY).unwrap();
+        raw_add_assign(&mut acc, &neg_inf);
+        assert!(acc.into_inner().is_nan());
+
+        // f32 mirrors f64.
+        let a = NotNan::new(f32::MAX).unwrap();
+        let raw = raw_mul(&a, &a);
+        assert_eq!(raw.into_inner().to_bits(), (f32::MAX * f32::MAX).to_bits());
+
+        // The generic (non-float) path is untouched: exact multiplication.
+        let r = Ratio::new(7i128, 3);
+        let s = Ratio::new(-2i128, 5);
+        let mut acc_r = r.clone();
+        raw_add_assign(&mut acc_r, &s);
+        assert_eq!(acc_r, r + s);
+        assert_eq!(raw_mul(&r, &s), r * s);
+    }
+}

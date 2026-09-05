@@ -215,3 +215,236 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ordered_float::NotNan;
+
+    /// The trait's internal working mode (`class_commutation`) must agree
+    /// bit-for-bit with the direct kernel after one
+    /// `public_coefficients` epilogue, at every thread count; the
+    /// collecting variant must report the class-indexed image of the
+    /// direct layout's first-touch sequence.
+    #[test]
+    fn class_commutation_round_trip_is_bit_identical() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+
+        for (d, m, force) in [(2usize, 4usize, true), (3usize, 10usize, false)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let a_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i % 11 + 1) as f64) / 7.0 - 0.9).unwrap())
+                .collect();
+            let b_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i * 5 + 3) % 13) as f64 / 6.0 - 1.3).unwrap())
+                .collect();
+            let mut direct = LieSeries::new(words.clone(), a_coefficients.clone());
+            let class = LieSeries::new(words, b_coefficients.clone());
+            if force {
+                Arc::make_mut(&mut direct.feasible_decompositions).clear_class_order();
+            }
+            let order = class.class_order();
+            assert_eq!(order.inv().len(), class.coefficients.len());
+
+            let a_cls = class.class_coefficients(&order, &a_coefficients);
+            let b_cls = class.class_coefficients(&order, &b_coefficients);
+            let inv_of = |i: usize| order.inv()[i] as usize;
+            let a_nonzero = direct.nonzero_coefficient_indices(&a_coefficients);
+            let b_nonzero = direct.nonzero_coefficient_indices(&b_coefficients);
+            let a_nz_cls: Vec<usize> = a_nonzero.iter().copied().map(inv_of).collect();
+            let b_nz_cls: Vec<usize> = b_nonzero.iter().copied().map(inv_of).collect();
+
+            let run = |threads: usize, series: &LieSeries<u8, NotNan<f64>>| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool");
+                let mut out = vec![NotNan::<f64>::default(); series.coefficients.len()];
+                pool.install(|| {
+                    LieSeries::commutator_coefficients(
+                        series,
+                        &a_coefficients,
+                        &b_coefficients,
+                        &mut out,
+                    )
+                });
+                out
+            };
+
+            let reference = run(1, &direct);
+            for threads in [1usize, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool");
+                let mut result = vec![NotNan::<f64>::default(); class.coefficients.len()];
+                pool.install(|| {
+                    class.class_commutation(
+                        &order,
+                        &a_cls,
+                        &a_nz_cls,
+                        &b_cls,
+                        &b_nz_cls,
+                        &mut result,
+                        &mut GatingCache::default(),
+                    )
+                });
+                let public = class.public_coefficients(&order, &result);
+                assert_eq!(
+                    reference, public,
+                    "class round trip differs for d={d}, m={m}, threads={threads}"
+                );
+            }
+
+            // Collecting variant: class-indexed first-touch sequence.
+            let mut direct_result = vec![NotNan::<f64>::default(); direct.coefficients.len()];
+            let mut direct_dirty = vec![0u64; direct.coefficients.len() / 64 + 1];
+            let mut direct_targets = Vec::new();
+            LieSeries::commutator_coefficients_with_nonzero_collecting(
+                &direct,
+                &a_coefficients,
+                &a_nonzero,
+                &b_coefficients,
+                &b_nonzero,
+                &mut direct_result,
+                &mut direct_dirty,
+                &mut direct_targets,
+            );
+            let mut class_result = vec![NotNan::<f64>::default(); class.coefficients.len()];
+            let mut class_dirty = vec![0u64; class.coefficients.len() / 64 + 1];
+            let mut class_targets = Vec::new();
+            class.class_commutation_with_nonzero_collecting(
+                &order,
+                &a_cls,
+                &a_nz_cls,
+                &b_cls,
+                &b_nz_cls,
+                &mut class_result,
+                &mut class_dirty,
+                &mut class_targets,
+            );
+            for (k, &src) in order.inv().iter().enumerate() {
+                assert_eq!(
+                    direct_result[k], class_result[src as usize],
+                    "collecting result differs for d={d}, m={m} at public {k}"
+                );
+            }
+            // Class targets are internal positions: map them back with
+            // `perm` (internal -> public) before comparing. Under the
+            // write-access division each variant emits its targets sorted
+            // ascending in ITS OWN layout's position order (one store per
+            // word class, classes in position order), so the public
+            // sequences differ by the layout permutation — the invariant is
+            // the same target SET, each position reported exactly once
+            // (per-word accumulation order is guarded by the bit-identical
+            // result comparison above).
+            let perm = order.perm();
+            let mut relabeled: Vec<usize> = class_targets
+                .iter()
+                .copied()
+                .map(|p| perm[p] as usize)
+                .collect();
+            relabeled.sort_unstable();
+            let mut direct_sorted = direct_targets.clone();
+            direct_sorted.sort_unstable();
+            assert_eq!(direct_sorted, relabeled, "collecting targets differ");
+        }
+    }
+
+    /// The class-contiguous scatter layout must produce bit-identical
+    /// results to the direct layout, at every thread count, on both kernel
+    /// entry points: the layout is a pure relabeling of write addresses and
+    /// never reorders the per-word accumulation sequence. `(2, 4)` forces
+    /// the layout on a small table (fast build); `(3, 10)` qualifies
+    /// through the real slice-size threshold (its degree-10 slice exceeds
+    /// 4096 words).
+    #[test]
+    fn commutator_is_bit_identical_across_scatter_layouts() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+
+        for (d, m, force) in [(2usize, 4usize, true), (3usize, 10usize, false)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let a_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i % 11 + 1) as f64) / 7.0 - 0.9).unwrap())
+                .collect();
+            let b_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i * 5 + 3) % 13) as f64 / 6.0 - 1.3).unwrap())
+                .collect();
+            let mut direct = LieSeries::new(words.clone(), a_coefficients.clone());
+            let mut class = LieSeries::new(words, b_coefficients.clone());
+            if force {
+                Arc::make_mut(&mut class.feasible_decompositions).force_class_order();
+            } else {
+                // (3, 10) auto-qualifies through the threshold: strip the
+                // reference's layout so the pair compares direct vs class
+                // on the same table.
+                Arc::make_mut(&mut direct.feasible_decompositions).clear_class_order();
+            }
+            assert!(
+                direct
+                    .feasible_decompositions
+                    .cached_class_order()
+                    .is_none(),
+                "expected the reference series to run the direct layout"
+            );
+            assert!(
+                class.feasible_decompositions.cached_class_order().is_some(),
+                "expected the layout series to carry a class order"
+            );
+            let len = direct.coefficients.len();
+
+            let run = |series: &LieSeries<u8, NotNan<f64>>, threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool");
+                let mut out = vec![NotNan::<f64>::default(); len];
+                pool.install(|| {
+                    LieSeries::commutator_coefficients(
+                        series,
+                        &a_coefficients,
+                        &b_coefficients,
+                        &mut out,
+                    )
+                });
+                out
+            };
+
+            let reference = run(&direct, 1);
+            for threads in [1usize, 2, 4, 8] {
+                let out = run(&class, threads);
+                assert_eq!(
+                    reference, out,
+                    "class layout differs from direct for d={d}, m={m}, threads={threads}"
+                );
+            }
+
+            // Collecting entry point: result, nonzero set, and first-touch
+            // order must all match the direct layout exactly.
+            let collect = |series: &LieSeries<u8, NotNan<f64>>| {
+                let a_nonzero = series.nonzero_coefficient_indices(&a_coefficients);
+                let b_nonzero = series.nonzero_coefficient_indices(&b_coefficients);
+                let mut result = vec![NotNan::<f64>::default(); len];
+                let mut dirty = vec![0u64; len / 64 + 1];
+                let mut targets = Vec::new();
+                LieSeries::commutator_coefficients_with_nonzero_collecting(
+                    series,
+                    &a_coefficients,
+                    &a_nonzero,
+                    &b_coefficients,
+                    &b_nonzero,
+                    &mut result,
+                    &mut dirty,
+                    &mut targets,
+                );
+                (result, targets)
+            };
+            let (direct_result, direct_targets) = collect(&direct);
+            let (class_result, class_targets) = collect(&class);
+            assert_eq!(direct_result, class_result, "collecting result differs");
+            assert_eq!(direct_targets, class_targets, "collecting targets differ");
+        }
+    }
+}

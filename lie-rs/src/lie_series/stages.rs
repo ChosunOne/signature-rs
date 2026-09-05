@@ -1,4 +1,103 @@
 use super::*;
+use super::gating::KernelGating;
+
+/// One stage of a class-ordered fold schedule: a kernel sweep level (packs
+/// of `(job, unit)` tasks over one level's jobs) or a caller-defined block
+/// stage (one atomic claim per block index, dispatched through a shared
+/// closure — the gather/accumulate phases of a batched fold). A batch of
+/// folds is a linear chain of stages; every slot waits at every stage
+/// boundary, so a stage's reads observe exactly the writes of all earlier
+/// stages (each completion is published with `Release`, observed with
+/// `Acquire`).
+pub struct ClassBatchStage<'a, U> {
+    /// Sweep stages: `(job index within the stage, unit index in that
+    /// job's gating)` tasks in sweep order. Block stages: unused.
+    pub(super) tasks: Arc<[(u32, u32)]>,
+    /// Balanced pack ranges into `tasks` (sweep stages) or one block per
+    /// pack (block stages).
+    pub(super) packs: Arc<[(usize, usize)]>,
+    /// Sweep stages: per-job gating.
+    pub(super) gateways: Vec<KernelGating>,
+    /// Sweep stages: the stage's jobs, indexed by the tasks' job ids.
+    pub(super) jobs: &'a [KernelJob<'a, U>],
+    /// Block stages: `block(block_index, fold_index)` per claimed task.
+    /// Blocks write disjoint ranges (the caller's contract); the stage
+    /// counters order all cross-stage dependencies.
+    pub(super) block: Option<&'a (dyn Fn(usize, usize) + Send + Sync)>,
+    /// Block stages: which fold of the batch this stage serves (the
+    /// block task reads the fold's inputs through it). Sweep stages: 0.
+    pub(super) fold: usize,
+    /// Sweep stages: run the 4-lane SoA cohort sweep instead of the scalar
+    /// one. A cohort stage's jobs carry SoA-interleaved operand/result
+    /// pointers (the four lanes' values of class position `p` live at
+    /// `[p*4 .. p*4+4]`, lane `l` at `p*4 + l`), and every other plan
+    /// input (tasks, packs, gateways, support lists) is lane-invariant —
+    /// see `CommutatorDag::fold_batch_cohort` for how such a plan is
+    /// built.
+    pub(super) cohort: bool,
+}
+
+/// The per-block task/pack shape shared by every block stage of one
+/// batch: `blocks` disjoint-range tasks, one pack per task. Built once
+/// per batch, then each block stage clones the `Arc`s (refcount bump —
+/// no per-stage allocation).
+pub struct BlockShape {
+    pub(super) tasks: Arc<[(u32, u32)]>,
+    pub(super) packs: Arc<[(usize, usize)]>,
+}
+
+impl BlockShape {
+    /// The block shape over `blocks` disjoint-range tasks.
+    pub fn new(blocks: usize) -> Self {
+        Self {
+            tasks: (0..blocks as u32).map(|i| (i, 0)).collect(),
+            packs: (0..blocks).map(|i| (i, i + 1)).collect(),
+        }
+    }
+}
+
+impl<'a, U> ClassBatchStage<'a, U> {
+    /// A block stage over `shape`'s disjoint-range tasks: pack `p` runs
+    /// `task(p, fold)` exactly once.
+    pub fn block_stage(
+        shape: &BlockShape,
+        task: &'a (dyn Fn(usize, usize) + Send + Sync),
+        fold: usize,
+    ) -> Self {
+        Self {
+            tasks: Arc::clone(&shape.tasks),
+            packs: Arc::clone(&shape.packs),
+            gateways: Vec::new(),
+            jobs: &[],
+            block: Some(task),
+            fold,
+            cohort: false,
+        }
+    }
+
+    /// The cohort (SoA) sweep variant of a planned sweep stage: identical
+    /// tasks, packs, gateways and job views (all lane-invariant — see the
+    /// `cohort` field), dispatched to the 4-lane SoA kernel instead of the
+    /// scalar sweep. The stage's jobs' operand/result pointers must be
+    /// SoA-interleaved with lane stride 4 and the plan must have been
+    /// built with `cohort = true` — see `plan_class_sweep_stages`.
+    pub fn cohort_variant(stage: &Self) -> Self {
+        assert!(
+            stage.cohort,
+            "cohort_variant requires a plan built with cohort = true              (SoA-interleaved buffers)"
+        );
+        Self {
+            tasks: Arc::clone(&stage.tasks),
+            packs: Arc::clone(&stage.packs),
+            gateways: stage.gateways.clone(),
+            jobs: stage.jobs,
+            block: None,
+            fold: 0,
+            cohort: true,
+        }
+    }
+}
+
 
 /// Plans the sweep stages for the DAG's dependency levels: per-job gating
 /// from the (fixed) support lists, then ONE single-phase per-unit sweep

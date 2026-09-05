@@ -590,3 +590,37 @@ pub fn commutator_coefficients_class_fold_with_cache<T, U>(
     // the slot policy sees the fold's own planned work.
     run_class_batch(a_series, order, &stage_refs, 1);
 }
+
+#[cfg(test)]
+mod tests {
+    /// The work-adaptive slot policy must reproduce the measured regimes:
+    /// tiny folds walk serially at any pool size, mid folds land on their
+    /// measured sweet spot, wide folds fill the pool, and the pool/pack
+    /// caps still bind.
+    #[test]
+    fn work_adaptive_slots_matches_measured_regimes() {
+        use super::work_adaptive_slots;
+        // 12x2 per-fold (66 entries/fold): serial at every pool size.
+        assert_eq!(work_adaptive_slots(32, 32, 66), 1);
+        assert_eq!(work_adaptive_slots(2, 32, 66), 1);
+        // 8x3 (~700 entries/fold, + block elements in the batch path):
+        // 1-2 slots.
+        assert_eq!(work_adaptive_slots(32, 32, 700), 1);
+        assert!(work_adaptive_slots(32, 32, 2000) <= 2, "8x3 regime: 2000 entries must fund at most 2 slots");
+        // 3x8 (~74K planned entries/fold): the QUANTUM lands it near the
+        // measured 8-16t sweet spot — 19 slots at a 32t pool (74_000/3750).
+        assert_eq!(work_adaptive_slots(32, 32, 74_000), 19);
+        // ... and stays in that neighborhood across the regime's ticket
+        // variance (the real 3x8 fold's planned count wobbles around 74K).
+        let s = work_adaptive_slots(32, 32, 70_000);
+        assert!((16..=21).contains(&s), "3x8 regime: 70K entries must land in 16..=21 slots, got {s}");
+        // 2x12 (~257K entries/fold): the full pool.
+        assert_eq!(work_adaptive_slots(32, 32, 256_858), 32);
+        // Pool and pack caps bind before the work term.
+        assert_eq!(work_adaptive_slots(8, 3, 256_858), 3);
+        assert_eq!(work_adaptive_slots(1, 32, 256_858), 1);
+        assert_eq!(work_adaptive_slots(32, 1, 256_858), 1);
+        // Degenerate: no planned work → serial.
+        assert_eq!(work_adaptive_slots(32, 32, 0), 1);
+    }
+}

@@ -274,3 +274,393 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commutator_rs::CommutatorTerm;
+    use crate::LogSignatureBuilder;
+    use crate::commutator_dag::DagStructure;
+    use lie_rs::GatingCache;
+    use lyndon_rs::generators::ENotation;
+    use lyndon_rs::lyndon::{LyndonBasis, Sort};
+    use num_rational::Ratio;
+    use num_traits::{One, Zero};
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    type R = Ratio<i128>;
+
+    fn lcg(seed: &mut u64) -> i128 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*seed >> 33) % 19) as i128 - 9
+    }
+
+    fn atom(atom: u8) -> CommutatorTerm<R, u8> {
+        CommutatorTerm::Atom {
+            coefficient: R::one(),
+            atom,
+        }
+    }
+
+    fn bracket(left: CommutatorTerm<R, u8>, right: CommutatorTerm<R, u8>) -> CommutatorTerm<R, u8> {
+        let degree = left.degree() + 1;
+        CommutatorTerm::Expression {
+            coefficient: R::one(),
+            left: Box::new(left),
+            right: Box::new(right),
+            degree,
+        }
+    }
+
+    /// The pre-DAG recursive evaluator, kept as an independent oracle: same
+    /// tree walk, memoization and accumulation semantics as the old fold.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_eval(
+        term: &CommutatorTerm<R, u8>,
+        series: &LieSeries<u8, R>,
+        a: &[R],
+        a_nonzero: &[usize],
+        b: &[R],
+        b_nonzero: &[usize],
+        memo: &mut HashMap<CommutatorTerm<R, u8>, (Vec<R>, Vec<usize>)>,
+    ) -> (Vec<R>, Vec<usize>) {
+        match term {
+            CommutatorTerm::Atom { atom, .. } => {
+                if *atom == 0 {
+                    (a.to_vec(), a_nonzero.to_vec())
+                } else {
+                    (b.to_vec(), b_nonzero.to_vec())
+                }
+            }
+            CommutatorTerm::Expression { .. } => {
+                if let Some(hit) = memo.get(term) {
+                    return hit.clone();
+                }
+                let (la, lnz) = reference_eval(
+                    term.left().unwrap(),
+                    series,
+                    a,
+                    a_nonzero,
+                    b,
+                    b_nonzero,
+                    memo,
+                );
+                let (rb, rnz) = reference_eval(
+                    term.right().unwrap(),
+                    series,
+                    a,
+                    a_nonzero,
+                    b,
+                    b_nonzero,
+                    memo,
+                );
+                let mut coefficients = vec![R::from_integer(0); a.len()];
+                LieSeries::commutator_coefficients_with_nonzero(
+                    series,
+                    &la,
+                    &lnz,
+                    &rb,
+                    &rnz,
+                    &mut coefficients,
+                );
+                let nonzero = series.nonzero_coefficient_indices(&coefficients);
+                memo.insert(term.clone(), (coefficients.clone(), nonzero.clone()));
+                (coefficients, nonzero)
+            }
+        }
+    }
+
+    /// The DAG fold must reproduce the recursive evaluator exactly: same CSE,
+    /// same term weights, same accumulation order.
+    #[test]
+    fn dag_fold_matches_recursive_reference() {
+        for (d, m) in [(2usize, 4usize), (2, 5), (3, 4)] {
+            let mut seed = 0x5eed_u64.wrapping_mul(d as u64 * 31 + m as u64);
+            let builder = LogSignatureBuilder::<u8>::new()
+                .with_num_dimensions(d)
+                .with_max_degree(m);
+
+            // Accumulator: random dense coefficients.
+            let mut log_sig = builder.build::<R>();
+            let basis = LyndonBasis::<ENotation>::new(d, Sort::Lexicographical).generate_basis(m);
+            let mut acc: Vec<R> = (0..basis.len())
+                .map(|_| R::from_integer(lcg(&mut seed)))
+                .collect();
+            log_sig.series.coefficients.clone_from(&acc);
+
+            // Reference state mirrors the accumulator and the fold inputs.
+            let weights: Vec<R> = log_sig.bch_series.coefficients.clone();
+            let trees: Vec<CommutatorTerm<R, u8>> = log_sig.bch_series.commutator_basis.to_vec();
+
+            for step in 0..5 {
+                // Perturb the accumulator between folds: zero a few
+                // coefficients (support shrink) or raise a few zeros (support
+                // growth), alternating with value-only changes. This drives
+                // the DAG through both its collecting-rebuild and its
+                // fixed-point-reuse paths, including the soundness corner
+                // where a previously canceled scatter target goes non-zero.
+                if step % 2 == 0 {
+                    for _ in 0..3 {
+                        let k = (lcg(&mut seed) as usize) % acc.len();
+                        acc[k] = R::from_integer(0);
+                        log_sig.series.coefficients[k] = R::from_integer(0);
+                    }
+                } else {
+                    for _ in 0..3 {
+                        let k = d + (lcg(&mut seed) as usize) % (acc.len() - d);
+                        let v = R::from_integer(lcg(&mut seed));
+                        acc[k] = v.clone();
+                        log_sig.series.coefficients[k] = v;
+                    }
+                }
+
+                // Production-shaped displacement: full-length coefficient
+                // vector with only the degree-1 letters non-zero.
+                let displacement: Vec<R> = (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            R::from_integer(lcg(&mut seed))
+                        } else {
+                            R::from_integer(0)
+                        }
+                    })
+                    .collect();
+
+                // --- DAG fold (the code under test) ---
+                let disp_sig = builder.build::<R>();
+                let mut disp_sig = disp_sig;
+                disp_sig.series.coefficients.clone_from(&displacement);
+                log_sig.concatenate_assign(&disp_sig);
+
+                // --- recursive reference fold ---
+                // The atom-`A` input of every term is the *pre-fold*
+                // accumulator snapshot (the old evaluator's
+                // `original_coefficients`), not the mutating accumulator.
+                let snapshot = acc.clone();
+                let a_nonzero: Vec<usize> = snapshot
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.is_zero())
+                    .map(|(i, _)| i)
+                    .collect();
+                let b_nonzero: Vec<usize> = displacement
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.is_zero())
+                    .map(|(i, _)| i)
+                    .collect();
+                let mut memo = HashMap::new();
+                for (i, tree) in trees.iter().enumerate() {
+                    if i == 0 || weights[i].is_zero() {
+                        continue;
+                    }
+                    let (ct, _nz) = reference_eval(
+                        tree,
+                        &log_sig.series,
+                        &snapshot,
+                        &a_nonzero,
+                        &displacement,
+                        &b_nonzero,
+                        &mut memo,
+                    );
+                    for (acc_coeff, comm_coeff) in acc.iter_mut().zip(&ct) {
+                        *acc_coeff += comm_coeff * weights[i].clone();
+                    }
+                }
+
+                let diffs: Vec<_> = log_sig
+                    .series
+                    .coefficients
+                    .iter()
+                    .zip(&acc)
+                    .enumerate()
+                    .filter(|(_, (g, w))| g != w)
+                    .take(6)
+                    .map(|(k, (g, w))| format!("k={k} dag={g} ref={w}"))
+                    .collect();
+                assert!(
+                    diffs.is_empty(),
+                    "d={d} m={m} step={step}: DAG fold diverged: {}",
+                    diffs.join("; ")
+                );
+            }
+        }
+    }
+
+    /// Liveness of the one-dispatch fold under nested parallelism. When the
+    /// shared pool is saturated by outer tasks, a fold's slot tasks queue
+    /// behind them; a fold that blocked on a *queued* releaser's pack would
+    /// never finish (the fixed slot→pack assignment starved exactly there).
+    /// Pack claims go to whoever runs, so folds nested inside an
+    /// oversubscribed outer dispatch must complete — and match the serial
+    /// result bit for bit, since a claim relabels which slot sweeps a pack,
+    /// never the order of adds within a word.
+    #[test]
+    fn dag_fold_survives_nested_parallel_oversubscription() {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use std::sync::atomic::AtomicBool;
+
+        let d = 3usize;
+        let m = 6usize;
+        let mut seed = 0x51ea_u64;
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis = LyndonBasis::<ENotation>::new(d, Sort::Lexicographical).generate_basis(m);
+
+        // One accumulator and one displacement, folded once on the calling
+        // thread to produce the expected post-fold coefficients.
+        let acc: Vec<R> = (0..basis.len())
+            .map(|_| R::from_integer(lcg(&mut seed)))
+            .collect();
+        let displacement: Vec<R> = (0..basis.len())
+            .map(|k| {
+                if k < d {
+                    R::from_integer(lcg(&mut seed))
+                } else {
+                    R::from_integer(0)
+                }
+            })
+            .collect();
+        let mut template = builder.build::<R>();
+        template.series.coefficients.clone_from(&acc);
+        let mut disp_sig = builder.build::<R>();
+        disp_sig.series.coefficients.clone_from(&displacement);
+        let mut reference = template.clone();
+        reference.concatenate_assign(&disp_sig);
+        let expected = reference.series.coefficients.clone();
+
+        // Watchdog: a liveness bug shows up as a hang, not a wrong value —
+        // turn it into a hard failure (abort fails the test process).
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        std::thread::spawn(move || {
+            for _ in 0..600 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+            }
+            eprintln!("nested fold stress did not complete in 60s: fold walk starved");
+            std::process::abort();
+        });
+
+        // 2× oversubscription: 64 nested folds on the default pool.
+        (0..64usize).into_par_iter().for_each(|_| {
+            let mut sig = template.clone();
+            sig.concatenate_assign(&disp_sig);
+            assert_eq!(sig.series.coefficients, expected);
+        });
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The stripped hand DAG is executable: evaluating the compacted
+    /// 4-node plan (atoms + [A,B] + [[A,B],A]) through the production
+    /// rebuild path must match the recursive oracle bit for bit.
+    #[test]
+    fn strip_then_evaluate_matches_recursive_oracle() {
+        let d = 3usize;
+        let m = 3usize;
+        let mut seed = 0xdead_u64;
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis = LyndonBasis::<ENotation>::new(d, Sort::Lexicographical).generate_basis(m);
+
+        // The compacted DAG from the renumbering test: [A,B] and [[A,B],A].
+        let mut dag = CommutatorDag::<R> {
+            structure: std::sync::Arc::new(DagStructure {
+                nodes: vec![
+                    DagNode::Atom(0),
+                    DagNode::Atom(1),
+                    DagNode::Binary {
+                        left: 0,
+                        right: 1,
+                    },
+                    DagNode::Binary {
+                        left: 2,
+                        right: 0,
+                    },
+                ],
+                levels: vec![vec![0, 1], vec![2], vec![3]],
+                terms: vec![
+                    (TermSource::Node(2), R::from_integer(3)),
+                    (TermSource::Node(3), R::from_integer(-7)),
+                ],
+            }),
+            buffers: Vec::new(),
+            nonzeros: Arc::new(Vec::new()),
+            dirty: Arc::new(Vec::new()),
+            atom_a: Vec::new(),
+            atom_b: Vec::new(),
+            lists_built: false,
+            gating_cache: GatingCache::default(),
+            class_order: OnceLock::new(),
+        };
+
+        let a: Vec<R> = (0..basis.len())
+            .map(|_| R::from_integer(lcg(&mut seed)))
+            .collect();
+        let b: Vec<R> = (0..basis.len())
+            .map(|k| {
+                if k < d {
+                    R::from_integer(lcg(&mut seed))
+                } else {
+                    R::from_integer(0)
+                }
+            })
+            .collect();
+        let a_nonzero: Vec<usize> = a
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_zero())
+            .map(|(i, _)| i)
+            .collect();
+        let b_nonzero: Vec<usize> = b
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_zero())
+            .map(|(i, _)| i)
+            .collect();
+
+        dag.evaluate(&builder.build::<R>().series, &a, &a_nonzero, &b, &b_nonzero);
+
+        // Recursive oracle on the equivalent bracket trees. Node buffers
+        // live in the DAG's class-contiguous order (the public-order
+        // epilogue only runs in `accumulate_terms`), so the oracle's
+        // public-order coefficients are gathered through the same
+        // `class[inv[w]] = public[w]` map the fold's inputs use before
+        // comparing.
+        let t2 = bracket(atom(0), atom(1)); // node 2 = [A, B]
+        let t3 = bracket(t2.clone(), atom(0)); // node 3 = [[A,B], A]
+        let series = builder.build::<R>().series;
+        let inv = dag
+            .class_order
+            .get()
+            .expect("evaluate built the class order")
+            .inv();
+        let mut memo = HashMap::new();
+        for (node, tree) in [(2u32, &t2), (3, &t3)] {
+            let (ct, _nz) = reference_eval(
+                tree,
+                &series,
+                &a,
+                &a_nonzero,
+                &b,
+                &b_nonzero,
+                &mut memo,
+            );
+            let mut cls = vec![R::zero(); ct.len()];
+            for (w, value) in ct.iter().enumerate() {
+                cls[inv[w] as usize] = value.clone();
+            }
+            assert_eq!(
+                dag.buffers[node as usize - 2], cls,
+                "node {node} buffer diverged from the recursive oracle"
+            );
+        }
+    }
+}

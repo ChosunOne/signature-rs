@@ -1,4 +1,5 @@
 use super::*;
+use super::gating::KernelGating;
 
 /// Receiver for the absolute basis indices a kernel call scatters onto.
 /// The collecting implementation deduplicates through a dirty bitset.
@@ -416,5 +417,452 @@ impl<
             &mut coefficients,
         );
         self.with_coefficients(coefficients)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ordered_float::NotNan;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(2, 2, vec![1, 2, 3], vec![4, 5, 6], vec![0, 0, -3])]
+    #[case(2, 2, vec![3, 2, 1], vec![1, 2, 3], vec![0, 0, 4])]
+    #[case(2, 3, vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9, 10], vec![0, 0, -5, -10, 5])]
+    #[case(3, 3,
+        vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![5, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![0, 0, 0, -7, -14, -7, 0, 0, 0, 0, 0, 0, 0, 0])]
+    #[case(3, 3,
+        vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![0, 0, 0, -7, -14, -7, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![0, 0, 0, 0, 0, 0, -7, -14, 14, 14, 49, 42, -14, 21])]
+    #[case(3, 4,
+        vec![
+            1, 2, 3, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            5, 3, 1, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            0, 0, 0, -7, -14, -7, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+    )]
+    #[case(3, 4,
+        vec![
+            1, 2, 3, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            0, 0, 0, -7, -14, -7, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        vec![
+            0, 0, 0, 0, 0, 0, -7, -14,
+            14, 14, 49, 42, -14, 21, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    )]
+    fn test_lie_series_commutation(
+        #[case] num_generators: usize,
+        #[case] basis_depth: usize,
+        #[case] a_coefficients: Vec<i128>,
+        #[case] b_coefficients: Vec<i128>,
+        #[case] expected_coefficients: Vec<i128>,
+    ) {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use num_rational::Ratio;
+
+        let basis = LyndonBasis::<u8>::new(num_generators, Sort::Lexicographical)
+            .generate_basis(basis_depth);
+        let a_coefficients = a_coefficients
+            .into_iter()
+            .map(Ratio::<i128>::from_integer)
+            .collect::<Vec<_>>();
+        let a = LieSeries::new(basis.clone(), a_coefficients);
+
+        let b_coefficients = b_coefficients
+            .into_iter()
+            .map(Ratio::<i128>::from_integer)
+            .collect::<Vec<_>>();
+        let b = LieSeries::new(basis.clone(), b_coefficients);
+        let expected_coefficients = expected_coefficients
+            .into_iter()
+            .map(Ratio::<i128>::from_integer)
+            .collect::<Vec<_>>();
+
+        let series = comm![a, b];
+        assert_eq!(series.coefficients.len(), expected_coefficients.len());
+        dbg!(&series.coefficients);
+        for (i, c) in series.coefficients.iter().enumerate() {
+            assert_eq!(
+                *c, expected_coefficients[i],
+                "{i}: {c:?} != {:?}",
+                expected_coefficients[i]
+            );
+        }
+    }
+
+    /// The raw-float fast path (`NotNan<f64>` / `f64` dispatch) and the
+    /// generic path (`Ratio<i128>`) must agree. Integer-valued coefficients
+    /// keep every intermediate exactly representable in `f64` (magnitudes
+    /// stay far below 2^53), so the comparison is exact. (Ported from the
+    /// original raw-float fast path change.)
+    #[test]
+    fn raw_float_kernel_matches_rationals() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use num_rational::Ratio;
+        use num_traits::ToPrimitive;
+
+        for (d, m) in [(2usize, 6usize), (3, 5)] {
+            let words = LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let coeffs = |salt: usize| {
+                (0..words.len())
+                    .map(|i| ((i * 7 + salt * 13) % 21) as i128 - 10)
+                    .collect::<Vec<_>>()
+            };
+            let (a_int, b_int) = (coeffs(1), coeffs(2));
+
+            // Raw-float path.
+            let a_f = LieSeries::<u8, NotNan<f64>>::new(
+                words.clone(),
+                a_int
+                    .iter()
+                    .map(|&x| NotNan::new(x as f64).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            let b_f = LieSeries::<u8, NotNan<f64>>::new(
+                words.clone(),
+                b_int
+                    .iter()
+                    .map(|&x| NotNan::new(x as f64).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            let ab_f = a_f.commutator(&b_f);
+
+            // Generic exact path.
+            let a_r = LieSeries::<u8, Ratio<i128>>::new(
+                words.clone(),
+                a_int.iter().map(|&x| Ratio::from_integer(x)).collect(),
+            );
+            let b_r = LieSeries::<u8, Ratio<i128>>::new(
+                words.clone(),
+                b_int.iter().map(|&x| Ratio::from_integer(x)).collect(),
+            );
+            let ab_r = a_r.commutator(&b_r);
+
+            for (x, y) in ab_f.coefficients.iter().zip(&ab_r.coefficients) {
+                assert_eq!(
+                    x.into_inner(),
+                    y.to_f64().unwrap(),
+                    "d={d} m={m}: raw float vs exact rationals"
+                );
+            }
+        }
+    }
+
+    /// The fused kernel evaluates both bracket orientations of every canonical
+    /// pair, so `[A, A]` must vanish exactly — every pair contributes
+    /// `c * (a_min * a_max - a_max * a_min) = 0`.
+    #[test]
+    fn commutator_of_series_with_itself_is_zero() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+
+        for (d, m) in [(2usize, 6usize), (3, 5)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i % 7 + 1) as f64) / 3.0 - 1.1).unwrap())
+                .collect();
+            let series: LieSeries<u8, NotNan<f64>> = LieSeries::new(words, coefficients);
+            let result: LieSeries<u8, NotNan<f64>> = series.commutator(&series);
+            assert!(
+                result.coefficients.iter().all(|c| c.is_zero()),
+                "non-zero coefficient in [A, A] for d={d}, m={m}"
+            );
+        }
+    }
+
+    /// ADVERSARIAL (write-access division): the kernel sweep must equal an
+    /// INDEPENDENT per-word fan-in reference — built by walking the table's
+    /// entries in table order with presence resolved straight from the
+    /// support lists — bit for bit, across coefficient types (raw-float
+    /// fast path and exact rationals), layouts (public direct and
+    /// class-contiguous), thread counts, and adversarial inputs (all-zero,
+    /// single-hot, planted exact cancellations). Distinct failure: this
+    /// guards arithmetic and per-word accumulation order, not gating
+    /// structure (the transposition test in `gating`).
+    #[test]
+    fn write_class_sweep_matches_independent_fanin_reference() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use std::collections::BTreeMap;
+
+        use super::super::ClassOrderedCommutation;
+
+        // The reference: result[w] += c * term over the table's entries in
+        // table order, term = (p_active ? a_i*b_j : 0) - (q_active ?
+        // a_j*b_i : 0), entries with neither orientation skipped. Same add
+        // sequence per word as the kernel's write classes, derived without
+        // touching the gating.
+        fn reference<U>(
+            series: &LieSeries<u8, U>,
+            a: &[U],
+            a_present: &[bool],
+            b: &[U],
+            b_present: &[bool],
+        ) -> Vec<U>
+        where
+            U: Clone + Default + Mul<Output = U> + AddAssign + Neg<Output = U> + PartialEq,
+        {
+            let table = &series.feasible_decompositions;
+            let entries = table.entries();
+            let coeffs = table.decomp_coeffs();
+            let mut acc: BTreeMap<usize, U> = BTreeMap::new();
+            for (ei, entry) in entries[..entries.len() - 1].iter().enumerate() {
+                let (i, j) = (entry.i as usize, entry.j as usize);
+                let p_active = a_present[i] && b_present[j];
+                let q_active = a_present[j] && b_present[i];
+                if !p_active && !q_active {
+                    continue;
+                }
+                let term = if p_active {
+                    let mut t = a[i].clone() * b[j].clone();
+                    if q_active {
+                        t += -(a[j].clone() * b[i].clone());
+                    }
+                    t
+                } else {
+                    -(a[j].clone() * b[i].clone())
+                };
+                let from = entry.decomp_start as usize;
+                let to = entries[ei + 1].decomp_start as usize;
+                let rs = table.degree_start(
+                    table.degree_of(i) + table.degree_of(j),
+                );
+                for dp in from..to {
+                    // Absolute decomp position -> the row's target: the
+                    // relative array is stored per entry in row order.
+                    let rel = table.decomp_indices_rel()[dp];
+                    let w = rs + rel as usize;
+                    let contrib = coeffs[dp].clone() * term.clone();
+                    *acc.entry(w).or_insert_with(U::default) += contrib;
+                }
+            }
+            let mut out = vec![U::default(); series.coefficients.len()];
+            for (w, v) in acc {
+                out[w] = v;
+            }
+            out
+        }
+
+        for (d, m) in [(2usize, 4usize), (3usize, 6usize)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let len = words.len();
+            let table_deg = |i: usize| words[i].len();
+            let _ = table_deg;
+
+            // Adversarial value sets: zeros (support holes), signed values
+            // that plant exact cancellations between entries feeding the
+            // same word, and asymmetric magnitudes.
+            let mk = |f: &dyn Fn(usize) -> f64| {
+                (0..len)
+                    .map(|i| NotNan::new(f(i)).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let a_sets = [
+                mk(&|_| 0.0),
+                mk(&|i| if i == 0 { 1.0 } else { 0.0 }),
+                mk(&|i| ((i % 5 + 1) as f64) / 3.0 - 1.0),
+                mk(&|i| if i % 2 == 0 { 1.0 } else { -1.0 }),
+            ];
+            let b_sets = [
+                mk(&|_| 0.0),
+                mk(&|i| if i == 1 { 1.0 } else { 0.0 }),
+                mk(&|i| ((i * 3 + 2) % 7) as f64 / 2.0 - 1.5),
+                mk(&|i| if i % 3 == 0 { 2.0 } else { -0.5 }),
+            ];
+
+            let cutoff_len = len; // full lists; the kernel filters by value
+            for a_coefficients in &a_sets {
+                for b_coefficients in &b_sets {
+                    let a: LieSeries<u8, NotNan<f64>> =
+                        LieSeries::new(words.clone(), a_coefficients.clone());
+                    let b: LieSeries<u8, NotNan<f64>> =
+                        LieSeries::new(words.clone(), b_coefficients.clone());
+                    let a_nonzero = a.nonzero_coefficient_indices(a_coefficients);
+                    let b_nonzero = b.nonzero_coefficient_indices(b_coefficients);
+                    let ap = {
+                        let mut p = vec![false; cutoff_len];
+                        for &i in &a_nonzero {
+                            p[i] = true;
+                        }
+                        p
+                    };
+                    let bp = {
+                        let mut p = vec![false; cutoff_len];
+                        for &i in &b_nonzero {
+                            p[i] = true;
+                        }
+                        p
+                    };
+                    let expected =
+                        reference(&a, a_coefficients, &ap, b_coefficients, &bp);
+
+                    for threads in [1usize, 4usize] {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(threads)
+                            .build()
+                            .expect("pool");
+                        pool.install(|| {
+                            // Public direct kernel.
+                            let mut out =
+                                vec![NotNan::<f64>::default(); len];
+                            LieSeries::commutator_coefficients_with_nonzero(
+                                &a,
+                                a_coefficients,
+                                &a_nonzero,
+                                b_coefficients,
+                                &b_nonzero,
+                                &mut out,
+                            );
+                            assert_eq!(
+                                out, expected,
+                                "public kernel differs (d={d}, m={m}, t={threads}, \
+                                 a={:?}, b={:?})",
+                                a_coefficients.iter().map(|x| x.into_inner()).collect::<Vec<_>>(),
+                                b_coefficients.iter().map(|x| x.into_inner()).collect::<Vec<_>>()
+                            );
+
+                            // Class-contiguous kernel: operands class-
+                            // ordered, result mapped back through `inv`.
+                            let order = a.class_order();
+                            let a_cls = a.class_coefficients(&order, a_coefficients);
+                            let b_cls = b.class_coefficients(&order, b_coefficients);
+                            let a_nz_cls: Vec<usize> =
+                                a_nonzero.iter().map(|&i| order.inv()[i] as usize).collect();
+                            let b_nz_cls: Vec<usize> =
+                                b_nonzero.iter().map(|&i| order.inv()[i] as usize).collect();
+                            let mut out_cls =
+                                vec![NotNan::<f64>::default(); len];
+                            a.class_commutation(
+                                &order,
+                                &a_cls,
+                                &a_nz_cls,
+                                &b_cls,
+                                &b_nz_cls,
+                                &mut out_cls,
+                                &mut GatingCache::default(),
+                            );
+                            let public = a.public_coefficients(&order, &out_cls);
+                            assert_eq!(
+                                public, expected,
+                                "class kernel differs (d={d}, m={m}, t={threads})"
+                            );
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// ADVERSARIAL (write-access division): a word class stays OWNED under
+    /// total cancellation — `a == b` makes every term exactly zero, yet
+    /// every reachable word is still swept (one single-writer store of the
+    /// exact zero) and still reported by the collecting variant: the
+    /// reported targets are a WRITE-set superset, never a value-filtered
+    /// set. Distinct failure: guards target ownership and the superset
+    /// property, not arithmetic (the fan-in test above).
+    #[test]
+    fn write_class_canceled_word_stays_owned_and_reported() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+
+        for (d, m) in [(2usize, 5usize), (3usize, 4usize)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let len = words.len();
+            let coeffs: Vec<_> = (0..len)
+                .map(|i| NotNan::new(((i % 9 + 1) as f64) / 4.0 - 1.1).unwrap())
+                .collect();
+            let a: LieSeries<u8, NotNan<f64>> =
+                LieSeries::new(words.clone(), coeffs.clone());
+            let b: LieSeries<u8, NotNan<f64>> = LieSeries::new(words, coeffs);
+            let full: Vec<usize> = (0..len).collect();
+
+            // [A, A] = 0 exactly (float products are commutative), but
+            // every word with a feasible decomposition is still written.
+            let mut out = vec![NotNan::<f64>::default(); len];
+            LieSeries::commutator_coefficients_with_nonzero(
+                &a,
+                &a.coefficients,
+                &full,
+                &b.coefficients,
+                &full,
+                &mut out,
+            );
+            for (w, v) in out.iter().enumerate() {
+                assert_eq!(*v, NotNan::<f64>::default(), "word {w} not exactly zero");
+            }
+
+            // The collecting variant must still report every written word:
+            // value-filtered targets would be unsound for list reuse (a
+            // canceled target can go nonzero again when values change).
+            let mut dirty = vec![0u64; len / 64 + 1];
+            let mut targets = Vec::new();
+            LieSeries::commutator_coefficients_with_nonzero_collecting(
+                &a,
+                &a.coefficients,
+                &full,
+                &b.coefficients,
+                &full,
+                &mut out,
+                &mut dirty,
+                &mut targets,
+            );
+            // Independent expectation: every word targeted by any active
+            // contribution of any entry (full supports -> every entry).
+            let table = &a.feasible_decompositions;
+            let entries = table.entries();
+            let decomp = table.decomp_indices_rel();
+            let degrees = table.index_degrees();
+            let mut expected: Vec<usize> = Vec::new();
+            for (ei, entry) in entries[..entries.len() - 1].iter().enumerate() {
+                let (i, j) = (entry.i as usize, entry.j as usize);
+                let from = entry.decomp_start as usize;
+                let to = entries[ei + 1].decomp_start as usize;
+                let rs = table.degree_start(degrees[i] as usize + degrees[j] as usize);
+                for &rel in &decomp[from..to] {
+                    expected.push(rs + rel as usize);
+                }
+            }
+            expected.sort_unstable();
+            expected.dedup();
+            // The sink reports kernel-VISIBLE positions only: the degree-
+            // `max_degree` tail lies above the support cutoff (nothing can
+            // consume those values in a truncated BCH fold), so both sides
+            // filter at `degree_start(max_degree)`.
+            let cutoff = table.degree_start(table.max_degree());
+            expected.retain(|&w| w < cutoff);
+            targets.sort_unstable();
+            assert_eq!(
+                targets, expected,
+                "collecting targets lost canceled words (write-set superset violated)"
+            );
+        }
     }
 }

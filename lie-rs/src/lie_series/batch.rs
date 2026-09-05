@@ -1,4 +1,5 @@
 use super::*;
+use super::gating::KernelGating;
 use super::kernel::NoSink;
 
 /// Target size of a parallel bundle, in visited entries.
@@ -542,4 +543,69 @@ pub fn commutator_coefficients_class_batch_with_cache<T, U>(
         decomp_coeffs_slice,
         &bundles,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ordered_float::NotNan;
+
+    /// Bundling decides only which thread runs which anagram unit; the
+    /// per-word accumulation order is unchanged, so the result must be
+    /// bit-identical for any thread count. Guards the work-balanced bundle
+    /// builder: the parallel sweep must never reorder, duplicate, or drop
+    /// an accumulation.
+    #[test]
+    fn commutator_is_bit_identical_across_thread_counts() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+
+        for (d, m) in [(2usize, 12usize), (3, 8), (4, 6)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let a_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i % 11 + 1) as f64) / 7.0 - 0.9).unwrap())
+                .collect();
+            let b_coefficients: Vec<_> = (0..words.len())
+                .map(|i: usize| NotNan::new(((i * 5 + 3) % 13) as f64 / 6.0 - 1.3).unwrap())
+                .collect();
+            let a: LieSeries<u8, NotNan<f64>> = LieSeries::new(words.clone(), a_coefficients);
+            let b: LieSeries<u8, NotNan<f64>> = LieSeries::new(words, b_coefficients);
+
+            let serial = {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("1-thread pool");
+                let mut out = vec![NotNan::<f64>::default(); a.coefficients.len()];
+                pool.install(|| {
+                    LieSeries::commutator_coefficients(
+                        &a,
+                        &a.coefficients,
+                        &b.coefficients,
+                        &mut out,
+                    )
+                });
+                out
+            };
+            for threads in [2usize, 4usize, 8usize] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("thread pool");
+                let mut out = vec![NotNan::<f64>::default(); a.coefficients.len()];
+                pool.install(|| {
+                    LieSeries::commutator_coefficients(
+                        &a,
+                        &a.coefficients,
+                        &b.coefficients,
+                        &mut out,
+                    )
+                });
+                assert_eq!(
+                    serial, out,
+                    "parallel result differs from serial for d={d}, m={m}, threads={threads}"
+                );
+            }
+        }
+    }
 }

@@ -14,7 +14,6 @@
 //!   type, kill switch and counters.
 //! - [`steady_lists`]: the Arc copy-on-write node-list machinery.
 //! - [`pool`]: `clone_shallow` plan sharing for the dag pool.
-//! - [`tests`]: the module's test suite.
 
 mod block_work;
 mod evaluate;
@@ -23,8 +22,6 @@ mod fold_cohort;
 mod pool;
 mod steady_lists;
 mod structure;
-#[cfg(test)]
-mod tests;
 
 pub(crate) use fold_cohort::{CohortLane, cohort_capable, cohort_type_capable};
 #[cfg(test)]

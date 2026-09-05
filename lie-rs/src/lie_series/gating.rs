@@ -41,6 +41,45 @@ struct Slot {
     value: (Arc<[UnitRange]>, Arc<[u32]>, Arc<[u32]>, usize),
 }
 
+/// The kernel prologue's output: the active units of the feasible-
+/// decomposition table — each holding its active-entry ticket range, its
+/// exact word set (the result positions it writes), and its contribution
+/// (pair) count — plus the total pair count (the planner's work unit).
+///
+/// The division of parallel work is per unit: the unit word sets
+/// PARTITION the sweep's write slots (units are unique by (target degree,
+/// content) and every entry producing word `w` lives in `w`'s one unit),
+/// so any pack cut between units is race-free, and a word's contributions
+/// accumulate inside its one unit in table-entry order — exactly the
+/// serial sweep's per-word float summation order, independent of pack
+/// cuts, slot counts and claim interleaving.
+///
+/// Cloning is cheap (all hot fields are `Arc` slices) — the cohort sweep
+/// stages clone their planned stage's gateways.
+#[derive(Clone)]
+pub(super) struct KernelGating {
+    /// Active units in table order, each with its ticket range, word-set
+    /// range (into [`Self::unit_words`]) and pair weight. Units whose
+    /// active entries all have empty rows are omitted (no work).
+    pub(super) units: Arc<[UnitRange]>,
+    /// The flat active-entry ticket list, in table order (a subsequence of
+    /// the entry stream — the entry table's natural locality). Each unit's
+    /// `ticket_start .. ticket_end` slices this list; a unit's sweep
+    /// streams its slice sequentially, computing each term once and adding
+    /// its row contributions straight into the result buffer.
+    pub(super) tickets: Arc<[u32]>,
+    /// The flat ascending active-word position list: the union of the
+    /// units' word sets, sorted (units of one degree are ordered by
+    /// content bytes, not position, so the union must be sorted for the
+    /// sink/scatter-set walk order to stay byte-identical to the per-word
+    /// fan-in's). Exactly the set of positions the sweep writes — the
+    /// batch scatter sets are this list.
+    pub(super) unit_words: Arc<[u32]>,
+    /// Total active contribution (pair) count: the sweep's work unit (one
+    /// multiply-add each), used for pack balancing and the slot policy.
+    pub(super) total_pairs: usize,
+}
+
 impl GatingCache {
     /// Looks up the support fingerprint pair, returning the memoized
     /// `(active units, flat tickets, active word positions, pair count)`.
@@ -577,6 +616,339 @@ impl<
             for &rel in &decomp_tbl[from..to] {
                 rel_bits[(rel / 64) as usize] |= 1u64 << (rel % 64);
                 *pairs += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADVERSARIAL (per-unit division): the gating's per-unit structure
+    /// must be LOSSLESS and ORDERED against an independent walk of the
+    /// table with presence resolved straight from the support lists:
+    /// (a) the unit ticket ranges partition the flat ticket list without
+    /// overlap, (b) each unit's orientation flags match the independent
+    /// presence resolution per entry, (c) the unit word sets PARTITION the
+    /// active word positions — pairwise disjoint, ascending per unit, and
+    /// their concatenation ascending (so CollectSink order is unchanged) —
+    /// and equal the set of positions the independent walk produces, (d)
+    /// each unit's contribution sequence — its tickets expanded in order,
+    /// each entry's row (rel, dp) pairs — is exactly the independent
+    /// walk's subsequence for that unit's words, in table-entry order (the
+    /// bit-exactness contract), and (e) total_pairs matches. A
+    /// misbucketed, lost, duplicated, or reordered contribution fails
+    /// here with a distinct message per invariant.
+    #[test]
+    fn write_class_gating_transposition_is_lossless_and_ordered() {
+        use lyndon_rs::lyndon::{LyndonBasis, Sort};
+        use ordered_float::NotNan;
+
+        use super::ClassOrderedCommutation;
+
+        for (d, m) in [(2usize, 4usize), (3usize, 5usize), (3usize, 8usize)] {
+            let words: Vec<LyndonWord<u8>> =
+                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
+            let len = words.len();
+            let series: LieSeries<u8, NotNan<f64>> = LieSeries::new(
+                words.clone(),
+                (0..len)
+                    .map(|i| NotNan::new(((i % 7 + 1) as f64) / 5.0 - 0.7).unwrap())
+                    .collect(),
+            );
+            let table = &series.feasible_decompositions;
+            let entries = table.entries();
+            let decomp = table.decomp_indices_rel();
+            let degrees = table.index_degrees();
+            let order = series.class_order();
+
+            // Independent support pairs: full, one-sided, random halves,
+            // single letters, empty.
+            let cutoff = table.degree_start(table.max_degree());
+            let mut support_sets: Vec<Vec<usize>> = vec![Vec::new()];
+            support_sets.push((0..cutoff).collect());
+            support_sets.push((0..cutoff).filter(|i| i % 2 == 0).collect());
+            support_sets.push((0..cutoff).filter(|i| i % 3 != 1).collect());
+            support_sets.push((0..cutoff).filter(|i| degrees[*i] == 1).collect());
+            support_sets.push(vec![0]);
+
+            for a_support in &support_sets {
+                for b_support in &support_sets {
+                    // Independent active-contribution walk over the table,
+                    // in table-entry order: presence straight from the
+                    // support lists (degree-mask gating is implied by
+                    // membership).
+                    let present = |s: &[usize]| {
+                        let mut p = vec![false; len];
+                        for &i in s {
+                            p[i] = true;
+                        }
+                        p
+                    };
+                    let (ap, bp) = (present(a_support), present(b_support));
+                    // (pos, entry, dp) in table-entry order.
+                    let mut expected: Vec<(usize, usize, usize)> = Vec::new();
+                    for (ei, entry) in entries[..entries.len() - 1].iter().enumerate() {
+                        let (i, j) = (entry.i as usize, entry.j as usize);
+                        let p_active = ap[i] && bp[j];
+                        let q_active = ap[j] && bp[i];
+                        if !p_active && !q_active {
+                            continue;
+                        }
+                        let from = entry.decomp_start as usize;
+                        let to = entries[ei + 1].decomp_start as usize;
+                        let rs = table.degree_start(degrees[i] as usize + degrees[j] as usize);
+                        for (k, &rel) in decomp[from..to].iter().enumerate() {
+                            expected.push((rs + rel as usize, ei, from + k));
+                        }
+                    }
+                    // Active entries with orientation, table order (the
+                    // tickets must be exactly this list).
+                    let mut expected_tickets: Vec<(usize, bool, bool)> = Vec::new();
+                    for (ei, entry) in entries[..entries.len() - 1].iter().enumerate() {
+                        let (i, j) = (entry.i as usize, entry.j as usize);
+                        let p_active = ap[i] && bp[j];
+                        let q_active = ap[j] && bp[i];
+                        if p_active || q_active {
+                            expected_tickets.push((ei, p_active, q_active));
+                        }
+                    }
+
+                    // Public-mode gating: positions are public basis
+                    // indices.
+                    let mut cache = GatingCache::default();
+                    let gating = LieSeries::<u8, NotNan<f64>>::kernel_prologue_cached(
+                        &series,
+                        a_support,
+                        b_support,
+                        &mut cache,
+                    );
+                    let ctx = "public";
+
+                    // (a) Ticket-range partition: consecutive, ordered,
+                    // non-overlapping, covering the ticket list.
+                    let mut cursor = 0usize;
+                    for (ui, u) in gating.units.iter().enumerate() {
+                        assert_eq!(
+                            u.ticket_start as usize, cursor,
+                            "{ctx}: unit {ui} ticket range not contiguous"
+                        );
+                        assert!(
+                            u.ticket_end > u.ticket_start,
+                            "{ctx}: unit {ui} emitted with no tickets"
+                        );
+                        assert_eq!(
+                            degrees[u.rs as usize], u.td,
+                            "{ctx}: unit {ui} rs/td degree mismatch"
+                        );
+                        cursor = u.ticket_end as usize;
+                    }
+                    assert_eq!(
+                        cursor,
+                        gating.tickets.len(),
+                        "{ctx}: ticket ranges do not cover the ticket list"
+                    );
+
+                    // (b) Orientation flags match the independent walk,
+                    // ticket list = expected active entries in table order.
+                    assert_eq!(
+                        gating.tickets.len(),
+                        expected_tickets.len(),
+                        "{ctx}: active-entry count mismatch"
+                    );
+                    for (tp, &(ei, want_p, want_q)) in
+                        expected_tickets.iter().enumerate()
+                    {
+                        let ticket = gating.tickets[tp];
+                        assert_eq!(
+                            (ticket & TICKET_INDEX_MASK) as usize, ei,
+                            "{ctx}: ticket {tp} entry mismatch"
+                        );
+                        assert_eq!(
+                            ticket & TICKET_P_ACTIVE != 0, want_p,
+                            "{ctx}: p_active flag mismatch at entry {ei}"
+                        );
+                        assert_eq!(
+                            ticket & TICKET_Q_ACTIVE != 0, want_q,
+                            "{ctx}: q_active flag mismatch at entry {ei}"
+                        );
+                    }
+
+                    // (c)+(d) Word-set partition AND per-unit sequence:
+                    // reconstruct each unit's word set and contribution
+                    // sequence from its rows; sets must be pairwise
+                    // disjoint, within the unit's degree slice, and their
+                    // union must equal both the gating's flat `unit_words`
+                    // list and the independent walk's positions; each
+                    // unit's (entry, dp) sequence must be exactly the
+                    // independent walk's subsequence for the unit's words,
+                    // in table-entry order (the bit-exactness contract).
+                    let mut all_positions: Vec<usize> = Vec::new();
+                    let mut seen_pairs: Vec<(usize, usize)> = Vec::new();
+                    for (ui, u) in gating.units.iter().enumerate() {
+                        let mut set: Vec<usize> = Vec::new();
+                        let mut unit_pairs: Vec<(usize, usize)> = Vec::new();
+                        for tp in u.ticket_start as usize..u.ticket_end as usize {
+                            let ei = (gating.tickets[tp] & TICKET_INDEX_MASK) as usize;
+                            let entry = entries[ei];
+                            let from = entry.decomp_start as usize;
+                            let to = entries[ei + 1].decomp_start as usize;
+                            for (k, &rel) in decomp[from..to].iter().enumerate() {
+                                let pos = u.rs as usize + rel as usize;
+                                set.push(pos);
+                                unit_pairs.push((ei, from + k));
+                            }
+                        }
+                        set.sort_unstable();
+                        set.dedup();
+                        assert!(
+                            set.iter().all(|&p| {
+                                degrees[p] == u.td
+                                    && (u.rs as usize..table.degree_start(u.td as usize + 1))
+                                        .contains(&p)
+                            }),
+                            "{ctx}: unit {ui} word set outside its degree slice"
+                        );
+                        for &p in &set {
+                            assert!(
+                                !all_positions.contains(&p),
+                                "{ctx}: position {p} written by two units"
+                            );
+                        }
+                        all_positions.extend_from_slice(&set);
+                        seen_pairs.extend_from_slice(&unit_pairs);
+                        // The unit's sequence must contain only its own
+                        // words, in table-entry order.
+                        let mut last_ei = None::<usize>;
+                        for &(ei, dp) in &unit_pairs {
+                            let rel = decomp[dp];
+                            assert!(
+                                set.binary_search(&(u.rs as usize + rel as usize)).is_ok(),
+                                "{ctx}: unit {ui} contributes to a word outside its set"
+                            );
+                            assert!(
+                                last_ei.is_none_or(|prev| prev <= ei),
+                                "{ctx}: unit {ui} contributions out of table order"
+                            );
+                            last_ei = Some(ei);
+                        }
+                    }
+                    let mut sorted_all = all_positions.clone();
+                    sorted_all.sort_unstable();
+                    let got_flat: Vec<usize> =
+                        gating.unit_words.iter().map(|&p| p as usize).collect();
+                    assert_eq!(
+                        sorted_all, got_flat,
+                        "{ctx}: flat unit_words list differs from the union of the rows' positions"
+                    );
+                    let mut want_positions: Vec<usize> =
+                        expected.iter().map(|&(p, _, _)| p).collect();
+                    want_positions.sort_unstable();
+                    want_positions.dedup();
+                    assert_eq!(
+                        got_flat, want_positions,
+                        "{ctx}: unit word-set partition differs from the independent walk's positions"
+                    );
+                    // (d) global sequence: every unit's contributions
+                    // concatenated = the independent walk's (entry, dp)
+                    // pairs in table-entry order.
+                    let mut want_pairs: Vec<(usize, usize)> = expected
+                        .iter()
+                        .map(|&(_, ei, dp)| (ei, dp))
+                        .collect();
+                    assert_eq!(
+                        seen_pairs, want_pairs,
+                        "{ctx}: unit contribution sequences differ from the independent walk"
+                    );
+                    let _ = &mut want_pairs;
+
+                    // (e) Pair count.
+                    assert_eq!(
+                        gating.total_pairs,
+                        expected.len(),
+                        "{ctx}: contribution count mismatch (supports {a_support:?}/{b_support:?})"
+                    );
+
+                    // Class-mode gating: positions are class positions; the
+                    // same invariants must hold against the class-space
+                    // image of the expected list.
+                    let inv = order.inv();
+                    let a_cls: Vec<usize> = a_support.iter().map(|&i| inv[i] as usize).collect();
+                    let b_cls: Vec<usize> = b_support.iter().map(|&i| inv[i] as usize).collect();
+                    let gating_cls = LieSeries::<u8, NotNan<f64>>::kernel_prologue_cached_class(
+                        &series,
+                        &a_cls,
+                        &b_cls,
+                        &order,
+                        &mut cache,
+                    );
+                    let degree_cls = order.degree_cls();
+                    let decomp_cls = order.decomp_cls();
+                    let entries_cls = order.entries_cls();
+                    // Class-space image of the expected walk: map public
+                    // positions through inv, keep table-entry order.
+                    let mut expected_cls: Vec<(usize, usize, usize)> = Vec::new();
+                    let perm = order.perm();
+                    for (ei, entry) in entries_cls[..entries_cls.len() - 1].iter().enumerate() {
+                        let (i, j) = (entry.i as usize, entry.j as usize);
+                        // entries_cls endpoints are CLASS positions; the
+                        // presence vectors are indexed by PUBLIC position
+                        // (perm: class -> public).
+                        let p_active = ap[perm[i] as usize] && bp[perm[j] as usize];
+                        let q_active = ap[perm[j] as usize] && bp[perm[i] as usize];
+                        if !p_active && !q_active {
+                            continue;
+                        }
+                        let from = entry.decomp_start as usize;
+                        let to = entries_cls[ei + 1].decomp_start as usize;
+                        let rs = table.degree_start(
+                            degree_cls[i] as usize + degree_cls[j] as usize,
+                        );
+                        for &rel in decomp_cls[from..to].iter() {
+                            expected_cls.push((rs + rel as usize, ei, from as usize));
+                        }
+                    }
+                    // (a)+(c) for class space: ticket ranges cover the
+                    // list; the flat word list is globally ascending and
+                    // equals the independent class-space walk's positions.
+                    let mut cursor_cls = 0usize;
+                    for (ui, u) in gating_cls.units.iter().enumerate() {
+                        assert_eq!(
+                            u.ticket_start as usize, cursor_cls,
+                            "class: unit {ui} ticket range not contiguous"
+                        );
+                        cursor_cls = u.ticket_end as usize;
+                    }
+                    assert_eq!(cursor_cls, gating_cls.tickets.len(), "class: ticket ranges do not cover the list");
+                    let mut want_cls: Vec<usize> =
+                        expected_cls.iter().map(|&(p, _, _)| p).collect();
+                    want_cls.sort_unstable();
+                    want_cls.dedup();
+                    let got_cls: Vec<usize> = gating_cls
+                        .unit_words
+                        .iter()
+                        .map(|&p| p as usize)
+                        .collect();
+                    let mut last_cls = None::<usize>;
+                    for &p in &got_cls {
+                        assert!(
+                            last_cls.is_none_or(|prev| prev < p),
+                            "class: unit word list not globally ascending at {p}"
+                        );
+                        last_cls = Some(p);
+                    }
+                    assert_eq!(
+                        got_cls, want_cls,
+                        "class: unit word-set partition differs from the independent walk"
+                    );
+                    // (e) Pair count.
+                    assert_eq!(
+                        gating_cls.total_pairs,
+                        expected_cls.len(),
+                        "class: class-mode contribution count mismatch"
+                    );
+                }
             }
         }
     }

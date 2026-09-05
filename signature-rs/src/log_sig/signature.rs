@@ -500,3 +500,165 @@ impl<
         self.concatenate_batch_coefficients(&coeffs);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array2, array};
+    use num_rational::Ratio;
+    use rstest::rstest;
+
+    #[test]
+    fn test_log_sig_concat() {
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(2)
+            .with_max_degree(3);
+        let mut a = builder.build();
+        let mut b = builder.build();
+        a.series.coefficients = [1, 2, 3, 4, 5].map(Ratio::from_integer).to_vec();
+        b.series.coefficients = [6, 7, 8, 9, 10].map(Ratio::from_integer).to_vec();
+        let c = a.concatenate(&b);
+        let expected_coefficients = [
+            Ratio::new(7, 1),
+            Ratio::new(9, 1),
+            Ratio::new(17, 2),
+            Ratio::new(121, 12),
+            Ratio::new(185, 12),
+        ];
+        assert_eq!(c.series.coefficients, expected_coefficients);
+    }
+
+    #[rstest]
+    #[case(5, 5, array![
+        [1., 2., 3., 4., 5.],
+        [6., 7., 8., 9., 10.],
+        [11., 12., 13., 14., 15.],
+        [16., 17., 18., 19., 20.],
+    ])]
+    fn test_log_sig_concat_from_path(
+        #[case] num_dimensions: usize,
+        #[case] max_degree: usize,
+        #[case] path: Array2<f64>,
+    ) {
+        use ndarray::s;
+        use ordered_float::NotNan;
+
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(num_dimensions)
+            .with_max_degree(max_degree);
+        let path = path.mapv(|v| NotNan::new(v).expect("value to be a number"));
+
+        dbg!(&path.slice(s![0..2, ..]));
+
+        let mut concatenated_log_sig = builder.build_from_path(&path.slice(s![0..=1, ..]));
+        let log_sig_2 = builder.build_from_path(&path.slice(s![1.., ..]));
+
+        concatenated_log_sig.concatenate_assign(&log_sig_2);
+
+        let log_sig = builder.build_from_path(&path.slice(s![.., ..]));
+
+        for (concat_c, full_path_c) in concatenated_log_sig
+            .series
+            .coefficients
+            .iter()
+            .zip(log_sig.series.coefficients.iter())
+        {
+            assert_eq!(concat_c, full_path_c);
+        }
+    }
+
+    /// The raw-float fast path does not panic on per-operation overflow (see
+    /// `lie_rs::raw_mul`'s NaN policy); the fold audits the accumulator once
+    /// per step and fails loudly instead of persisting a NaN through the
+    /// `NotNan` invariant. All-`MAX` accumulator and letter displacement:
+    /// every product overflows to `inf`, and the fused two-orientation term
+    /// computes `inf + (-inf) = NaN` deterministically.
+    #[test]
+    #[should_panic(expected = "log-signature coefficients overflowed to NaN")]
+    fn fold_audits_nan_after_overflow() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (2usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let mut log_sig = builder.build::<NotNan<f64>>();
+        log_sig.series.coefficients =
+            vec![NotNan::new(f64::MAX).unwrap(); log_sig.series.coefficients.len()];
+        let mut seg = builder.build::<NotNan<f64>>();
+        seg.series.coefficients = (0..seg.series.coefficients.len())
+            .map(|k| {
+                NotNan::new(if k < d { f64::MAX } else { 0.0 }).unwrap()
+            })
+            .collect();
+        log_sig.concatenate_assign(&seg);
+    }
+
+use crate::LogSignatureBuilder;
+use lyndon_rs::lyndon::LyndonWord;
+use ordered_float::NotNan;
+
+/// Every internal node's non-zero list must cover its result buffer's
+/// non-zero positions: after each fold (collecting rebuild first, then
+/// fixed-point reuse), every listed index set is duplicate-free and
+/// every non-zero buffer position within the degree cutoff is listed.
+#[test]
+fn dag_node_lists_cover_buffer_support() {
+    let (d, m) = (3usize, 5usize);
+    let builder: LogSignatureBuilder<u8> = LogSignatureBuilder::<u8>::new()
+        .with_num_dimensions(d)
+        .with_max_degree(m);
+    let mut log_sig: LogSignature<u8, NotNan<f64>> = builder.build::<NotNan<f64>>();
+
+    // Dense accumulator, then several letter-displacement folds: the
+    // first fold goes through the collecting rebuild, later folds reuse
+    // the fixed-point lists.
+    let basis: Vec<LyndonWord<u8>> =
+        lyndon_rs::lyndon::LyndonBasis::<u8>::new(d, lyndon_rs::lyndon::Sort::Lexicographical)
+            .generate_basis(m);
+    let mut seed: u64 = 0xabcd_u64;
+    let lcg = |seed: &mut u64| {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((*seed >> 33) as i64) as f64
+    };
+    let acc: Vec<NotNan<f64>> = (0..basis.len())
+        .map(|_| NotNan::new(lcg(&mut seed)).unwrap())
+        .collect();
+    log_sig.series.coefficients.clone_from(&acc);
+
+    for _ in 0..4 {
+        let disp: Vec<NotNan<f64>> = (0..basis.len())
+            .map(|k| NotNan::new(if k < d { lcg(&mut seed) } else { 0.0 }).unwrap())
+            .collect();
+        let mut disp_sig: LogSignature<u8, NotNan<f64>> = builder.build::<NotNan<f64>>();
+        disp_sig.series.coefficients.clone_from(&disp);
+        log_sig.concatenate_assign(&disp_sig);
+
+        let dag: &CommutatorDag<NotNan<f64>> = &log_sig.dag;
+        let cutoff: usize = log_sig
+            .series
+            .commutator_basis
+            .iter()
+            .take_while(|w| w.degree() != m)
+            .count();
+        for k in 2..dag.structure.nodes.len() {
+            let buffer: &Vec<NotNan<f64>> = &dag.buffers[k - 2];
+            let list: &Vec<usize> = &dag.nonzeros[k - 2];
+            let mut sorted: Vec<usize> = list.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                list.len(),
+                "node {k}: list contains duplicate indices"
+            );
+            for (i, c) in buffer.iter().enumerate().take(cutoff) {
+                assert!(
+                    c.is_zero() || list.contains(&i),
+                    "node {k}: index {i} is non-zero but not listed"
+                );
+            }
+        }
+    }
+}
+}

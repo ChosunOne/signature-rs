@@ -33,7 +33,7 @@ pub use self::fold_walk::{
     run_class_batch_with_work, work_adaptive_slots,
 };
 pub use self::gating::GatingCache;
-pub use self::stages::plan_class_sweep_stages;
+pub use self::stages::{BlockShape, ClassBatchStage, plan_class_sweep_stages};
 
 mod batch;
 pub mod cohort;
@@ -44,13 +44,6 @@ mod gating;
 mod kernel;
 mod raw_ops;
 mod stages;
-
-#[cfg(test)]
-mod anagram;
-#[cfg(test)]
-mod obj1_probe;
-#[cfg(test)]
-mod test;
 
 /// Represents a formal power series in the free Lie algebra.
 ///
@@ -295,142 +288,6 @@ impl<T: Clone, U: Clone + Mul<Output = U> + MulAssign> MulAssign<U> for LieSerie
     fn mul_assign(&mut self, rhs: U) {
         for c in &mut self.coefficients {
             *c *= rhs.clone();
-        }
-    }
-}
-
-/// The kernel prologue's output: the active units of the feasible-
-/// decomposition table — each holding its active-entry ticket range, its
-/// exact word set (the result positions it writes), and its contribution
-/// (pair) count — plus the total pair count (the planner's work unit).
-///
-/// The division of parallel work is per unit: the unit word sets
-/// PARTITION the sweep's write slots (units are unique by (target degree,
-/// content) and every entry producing word `w` lives in `w`'s one unit),
-/// so any pack cut between units is race-free, and a word's contributions
-/// accumulate inside its one unit in table-entry order — exactly the
-/// serial sweep's per-word float summation order, independent of pack
-/// cuts, slot counts and claim interleaving.
-///
-/// Cloning is cheap (all hot fields are `Arc` slices) — the cohort sweep
-/// stages clone their planned stage's gateways.
-#[derive(Clone)]
-struct KernelGating {
-    /// Active units in table order, each with its ticket range, word-set
-    /// range (into [`Self::unit_words`]) and pair weight. Units whose
-    /// active entries all have empty rows are omitted (no work).
-    units: Arc<[UnitRange]>,
-    /// The flat active-entry ticket list, in table order (a subsequence of
-    /// the entry stream — the entry table's natural locality). Each unit's
-    /// `ticket_start .. ticket_end` slices this list; a unit's sweep
-    /// streams its slice sequentially, computing each term once and adding
-    /// its row contributions straight into the result buffer.
-    tickets: Arc<[u32]>,
-    /// The flat ascending active-word position list: the union of the
-    /// units' word sets, sorted (units of one degree are ordered by
-    /// content bytes, not position, so the union must be sorted for the
-    /// sink/scatter-set walk order to stay byte-identical to the per-word
-    /// fan-in's). Exactly the set of positions the sweep writes — the
-    /// batch scatter sets are this list.
-    unit_words: Arc<[u32]>,
-    /// Total active contribution (pair) count: the sweep's work unit (one
-    /// multiply-add each), used for pack balancing and the slot policy.
-    total_pairs: usize,
-}
-
-/// One stage of a class-ordered fold schedule: a kernel sweep level (packs
-/// of `(job, unit)` tasks over one level's jobs) or a caller-defined block
-/// stage (one atomic claim per block index, dispatched through a shared
-/// closure — the gather/accumulate phases of a batched fold). A batch of
-/// folds is a linear chain of stages; every slot waits at every stage
-/// boundary, so a stage's reads observe exactly the writes of all earlier
-/// stages (each completion is published with `Release`, observed with
-/// `Acquire`).
-pub struct ClassBatchStage<'a, U> {
-    /// Sweep stages: `(job index within the stage, unit index in that
-    /// job's gating)` tasks in sweep order. Block stages: unused.
-    tasks: Arc<[(u32, u32)]>,
-    /// Balanced pack ranges into `tasks` (sweep stages) or one block per
-    /// pack (block stages).
-    packs: Arc<[(usize, usize)]>,
-    /// Sweep stages: per-job gating.
-    gateways: Vec<KernelGating>,
-    /// Sweep stages: the stage's jobs, indexed by the tasks' job ids.
-    jobs: &'a [KernelJob<'a, U>],
-    /// Block stages: `block(block_index, fold_index)` per claimed task.
-    /// Blocks write disjoint ranges (the caller's contract); the stage
-    /// counters order all cross-stage dependencies.
-    block: Option<&'a (dyn Fn(usize, usize) + Send + Sync)>,
-    /// Block stages: which fold of the batch this stage serves (the
-    /// block task reads the fold's inputs through it). Sweep stages: 0.
-    fold: usize,
-    /// Sweep stages: run the 4-lane SoA cohort sweep instead of the scalar
-    /// one. A cohort stage's jobs carry SoA-interleaved operand/result
-    /// pointers (the four lanes' values of class position `p` live at
-    /// `[p*4 .. p*4+4]`, lane `l` at `p*4 + l`), and every other plan
-    /// input (tasks, packs, gateways, support lists) is lane-invariant —
-    /// see `CommutatorDag::fold_batch_cohort` for how such a plan is
-    /// built.
-    cohort: bool,
-}
-
-/// The per-block task/pack shape shared by every block stage of one
-/// batch: `blocks` disjoint-range tasks, one pack per task. Built once
-/// per batch, then each block stage clones the `Arc`s (refcount bump —
-/// no per-stage allocation).
-pub struct BlockShape {
-    tasks: Arc<[(u32, u32)]>,
-    packs: Arc<[(usize, usize)]>,
-}
-
-impl BlockShape {
-    /// The block shape over `blocks` disjoint-range tasks.
-    pub fn new(blocks: usize) -> Self {
-        Self {
-            tasks: (0..blocks as u32).map(|i| (i, 0)).collect(),
-            packs: (0..blocks).map(|i| (i, i + 1)).collect(),
-        }
-    }
-}
-
-impl<'a, U> ClassBatchStage<'a, U> {
-    /// A block stage over `shape`'s disjoint-range tasks: pack `p` runs
-    /// `task(p, fold)` exactly once.
-    pub fn block_stage(
-        shape: &BlockShape,
-        task: &'a (dyn Fn(usize, usize) + Send + Sync),
-        fold: usize,
-    ) -> Self {
-        Self {
-            tasks: Arc::clone(&shape.tasks),
-            packs: Arc::clone(&shape.packs),
-            gateways: Vec::new(),
-            jobs: &[],
-            block: Some(task),
-            fold,
-            cohort: false,
-        }
-    }
-
-    /// The cohort (SoA) sweep variant of a planned sweep stage: identical
-    /// tasks, packs, gateways and job views (all lane-invariant — see the
-    /// `cohort` field), dispatched to the 4-lane SoA kernel instead of the
-    /// scalar sweep. The stage's jobs' operand/result pointers must be
-    /// SoA-interleaved with lane stride 4 and the plan must have been
-    /// built with `cohort = true` — see `plan_class_sweep_stages`.
-    pub fn cohort_variant(stage: &Self) -> Self {
-        assert!(
-            stage.cohort,
-            "cohort_variant requires a plan built with cohort = true              (SoA-interleaved buffers)"
-        );
-        Self {
-            tasks: Arc::clone(&stage.tasks),
-            packs: Arc::clone(&stage.packs),
-            gateways: stage.gateways.clone(),
-            jobs: stage.jobs,
-            block: None,
-            fold: 0,
-            cohort: true,
         }
     }
 }

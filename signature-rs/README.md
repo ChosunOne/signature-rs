@@ -82,7 +82,7 @@ for (word, coeff) in log_sig.series.basis.iter().zip(log_sig.series.coefficients
 
 The computation engine is built for parallel hardware, and its speedups are structural rather than tuned hot spots:
 
-- **Tournament reduction across the path**: concatenating 1000 path segments runs as a balanced reduction tree over chunks (associativity of BCH concatenation), instead of 1000 sequential folds.
+- **Tournament reduction across the path**: concatenating a path's segments runs as a balanced reduction tree over chunks (associativity of BCH concatenation), instead of one sequential fold per concatenation.
 - **SIMD cohort fold engine**: groups of 2–4 folds execute as one 4-lane SIMD walk sharing a single plan (bit-identical to scalar execution; capability-gated, with an environment kill switch).
 - **Process-wide plan caches**: structure-constant tables, BCH series/DAG templates, and derived support plans are computed once per configuration and shared, so repeated computations on one builder skip straight to folding.
 

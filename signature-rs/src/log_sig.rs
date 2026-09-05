@@ -73,8 +73,5 @@ mod engine;
 mod builder;
 mod signature;
 
-#[cfg(test)]
-mod test;
-
 pub use builder::LogSignatureBuilder;
 pub use signature::LogSignature;

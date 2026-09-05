@@ -16,7 +16,7 @@ categories = ["data-structures", "mathematics", "science", "algorithms"]
 commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
 lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
 num-traits = "^0.2.19"
-ordered-float = "^5.4.0"
+ordered-float = "^5.5.0"
 rayon = "^1.12.0"
 indicatif = {version = "^0.18.6", optional = true}
 tracing = {version = "^0.1", optional = true}
@@ -27,7 +27,7 @@ libc = "0.2.189"
 [dev-dependencies]
 rstest = "^0.26.1"
 num-rational = "^0.4.2"
-ordered-float = "^5.4.0"
+ordered-float = "^5.5.0"
 tracing-test = "^0.2"
 tracing = "^0.1"
 tracing-subscriber = { version = "^0.3.23", features = ["env-filter"] }
