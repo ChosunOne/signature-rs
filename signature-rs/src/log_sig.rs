@@ -338,40 +338,6 @@ const TOURNAMENT_LEAF_CHUNK: usize = 8;
 /// bit) stays reproducible at any pool size.
 const TOURNAMENT_MAX_LEAVES: usize = 32;
 
-/// Cohort engagement cap for narrow folds: above this many rayon workers,
-/// a fold with few commutator terms does not form cohort groups. The
-/// cohort's top-level parallelism is its group count (each group runs one
-/// 4-lane engine whose stages ramp up internally), while the scalar
-/// tournament keeps one task per leaf/pair. Measured crossover on the
-/// e2e matrix at n=1000 (32 leaves → 8 groups): at 32 workers the
-/// 533-term 2x12 fold still wins (−12.5%) because its engine stages fill
-/// the pool, but the 52-term 3x8 fold regresses (+7.5%) — the 8 groups
-/// cannot feed 32 workers through ~4-wide per-step stage batches. 256
-/// terms sits 5× below and 5× above the two measured data points.
-const COHORT_WIDE_POOL_TERMS: usize = 256;
-
-/// Below [`COHORT_WIDE_POOL_TERMS`] terms, cohort groups form only up to
-/// this many workers (every measured combo at ≤16 workers passes the
-/// no-regression gate; the big cohort wins are at 4–8 workers).
-const COHORT_MAX_THREADS: usize = 16;
-
-/// Wide-pool engagement by TABLE SIZE (the static per-fold sweep-work
-/// proxy): a fold over a decomposition table with at least this many
-/// feasible pairs forms cohort groups at ANY pool width — its engine
-/// stages fund the pool themselves, so the old worker-count protection
-/// only starved it. Measured per-fold planned work (two-phase active-entry
-/// units): 2x8 ≈ 7.4k (table 121), 3x8 ≈ 245k (table 2800), 4x8 ≈ 736k
-/// (table 26185) — the term-count rule misgated exactly the heavy end:
-/// all three DAGs have ~51 terms, so at 32 workers every round fell back
-/// to the scalar two-phase sweep, whose thread-time is 3.2–11× the SoA
-/// cohort's (+52..+257% wall, 4x8 parallel efficiency 4.4× → 1.36×).
-/// 1000 feasible pairs sits 8× above 2x8 (kept on the protected scalar
-/// path) and 2.8× below 3x8 (engaged). The proxy is static (pure function
-/// of the builder configuration) because the live work state is useless
-/// at the gate: a batch's folds run on pooled dag clones, so the source
-/// dag's gating cache never sees steady-state supports.
-const COHORT_WIDE_POOL_MIN_TABLE: usize = 1000;
-
 /// NaN audit for an arbitrary coefficient slice — the
 /// `LogSignature::audit_no_nan` check factored off `&self` so the
 /// tournament's locally owned accumulators (plain `LieSeries` values, not
@@ -1694,22 +1660,21 @@ impl<
             TOURNAMENT_LEAF_CHUNK.max(rhss.len().div_ceil(TOURNAMENT_MAX_LEAVES))
         };
 
-        // Wide-pool engagement rule (see `COHORT_WIDE_POOL_TERMS` and
-        // `COHORT_WIDE_POOL_MIN_TABLE`): with a wide pool, heavy folds (by
-        // table size or term count) form cohort groups outright;
-        // light folds need enough groups in the round to cover the pool on
-        // their own. `groups` is per round — the leaf round's group count is
-        // `leaf_count/4`, a merge round's is `ceil(n_pairs/4)` — so the
-        // round gates below re-check with their own counts.
-        let threads = rayon::current_num_threads().max(1);
-        let terms = source_dag.structure.terms.len();
-        let table_len = template.0.feasible_table_len();
-        let cohort_round_ok = |groups: usize| {
-            threads <= COHORT_MAX_THREADS
-                || table_len >= COHORT_WIDE_POOL_MIN_TABLE
-                || terms >= COHORT_WIDE_POOL_TERMS
-                || groups >= threads
-        };
+        // Cohort engagement is unconditional (capability-gated only, see
+        // `cohort_capable`): the post-F2 single-phase per-unit sweep made the
+        // 4-lane SoA engine the LIGHT path — one shared plan walk per group
+        // and SIMD-4 math — so it wins or ties at every measured pool width,
+        // including the regime the former wide-pool gate protected. The old
+        // gate (`threads <= 16 || terms >= 256 || table >= 1000 || groups >=
+        // threads`, consts COHORT_WIDE_POOL_*) dated to the pre-F2 two-phase
+        // engine whose stage chains serialized at width; re-measured after
+        // F2 (prof_concat e2e driver, 3 interleaved reps) it only misgated:
+        // forcing the cohort past the old gate at 32 workers measured
+        // 8x3 −29% (1.50→1.09ms), 2x8 −18% (4.87→3.99ms), 3x8 −30%
+        // (scalar counterfactual 63→48ms), 2x12 −46% (322→216ms), 4x6 −8%;
+        // no cell favored the scalar fallback. The lone-pair merge task
+        // below stays scalar by construction (a 1-lane cohort is the scalar
+        // engine).
 
         // A leaf folded through the sequential batch engine (the scalar
         // leaf task body — also the partial group's path).
@@ -1723,7 +1688,7 @@ impl<
         // unavailable — folds its lanes through the scalar batch engine
         // under the same plans, bit-identically.
         let leaf_count = rhss.len().div_ceil(chunk);
-        let cohort_leaf = cohort_on && cohort_round_ok(leaf_count.div_ceil(4));
+        let cohort_leaf = cohort_on;
         let mut level: Vec<Vec<U>> = (0..leaf_count.div_ceil(4))
             .into_par_iter()
             .flat_map_iter(|g| {
@@ -1765,7 +1730,7 @@ impl<
                 None
             };
             let n_pairs = level.len() / 2;
-            level = if cohort_on && cohort_round_ok(n_pairs.div_ceil(4)) {
+            level = if cohort_on {
                 (0..n_pairs.div_ceil(4))
                     .into_par_iter()
                     .flat_map_iter(|g| {
@@ -1926,7 +1891,13 @@ mod test {
         series0.coefficients = vec![R::default(); basis_len];
         probe.ensure_lists_steady(&ref_series, &series0.coefficients, &a_star, &rhss[0], &b0s);
         probe.fold_batch(&mut series0, &rhss[0..8].iter().map(|r| r.as_slice()).collect::<Vec<_>>(), &a_star, &b0s);
-        let leaf0 = series0.coefficients.clone();
+        // Leaf 0's fold must land on the sequential ground truth too — the
+        // pooled early-return path has no room to diverge on the first leaf.
+        let mut seq0 = builder.build::<R>();
+        for r in &rhss[0..8] {
+            seq0.concatenate_assign_coefficients(r);
+        }
+        assert_eq!(series0.coefficients, seq0.series.coefficients, "leaf0 (early-return) diverged from sequential");
 
         // Leaf 1 on the SAME dag (pooled early-return path).
         let mut series1p = ref_series.clone();
@@ -4301,6 +4272,215 @@ mod test {
             &scalar,
             &cohort,
             "1-thread pool cohort routing must be bit-identical to the scalar tournament",
+        );
+    }
+
+    /// Wide-pool engagement for LIGHT folds: an 8x3-class config (tiny
+    /// table ~252 pairs, 4-term DAG) at a 32-thread pool must still route
+    /// its folds through the cohort engine. This pins the DELETION of the
+    /// wide-pool gate (`threads <= 16 || terms >= 256 || table >= 1000 ||
+    /// groups >= threads`): post-F2 the single-phase per-unit sweep made
+    /// the cohort the light engine, and the measured counterfactual showed
+    /// scalar fallback at 32 workers costs +18..30% wall (plus a ~73%-of-
+    /// cycles steal-probe storm) precisely in the regime the old gate
+    /// protected. If a width-based gate ever returns, this fails first.
+    #[test]
+    fn cohort_engages_at_32_thread_pools_for_light_folds() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (8usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+            d,
+            lyndon_rs::lyndon::Sort::Lexicographical,
+        )
+        .generate_basis(m);
+        let mut seed = 0x8d3_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*seed >> 33) % 19) as i128 - 9
+        };
+        let n = 64usize;
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..n)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .expect("pool");
+
+        let run = |off: bool| -> (Vec<NotNan<f64>>, usize, usize) {
+            let sig = builder.build::<NotNan<f64>>();
+            set_cohort_off(off);
+            let r0 = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let f0 = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst);
+            let reduced = pool.install(|| sig.tournament_reduce(&slices));
+            let r = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst) - r0;
+            let f = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst) - f0;
+            set_cohort_off(false);
+            (reduced, r, f)
+        };
+
+        let (scalar, sruns, _) = run(true);
+        assert_eq!(sruns, 0, "kill switch must silence the cohort engine");
+        let (cohort, cruns, cfolds) = run(false);
+        assert!(
+            cruns > 0 && cfolds > 0,
+            "32-thread pool, light 8x3-class fold: the cohort engine never \
+             engaged — a width-based gate is back"
+        );
+        assert_bits_identical(
+            &scalar,
+            &cohort,
+            "32-thread light-fold cohort routing must be bit-identical to scalar",
+        );
+    }
+
+    /// Kill-switch bit-identity at wide-pool width for the same light
+    /// config: the scalar tournament (switch off) and the cohort tournament
+    /// (switch on) must agree bit for bit at 32 threads — the switch swaps
+    /// engines, never the association tree.
+    #[test]
+    fn cohort_kill_switch_bit_identity_at_32_thread_light_folds() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (8usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+            d,
+            lyndon_rs::lyndon::Sort::Lexicographical,
+        )
+        .generate_basis(m);
+        let mut seed = 0x8d4_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*seed >> 33) % 13) as i128 - 6
+        };
+        let n = 40usize;
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..n)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .expect("pool");
+
+        let run = |off: bool| -> Vec<NotNan<f64>> {
+            let sig = builder.build::<NotNan<f64>>();
+            set_cohort_off(off);
+            let reduced = pool.install(|| sig.tournament_reduce(&slices));
+            set_cohort_off(false);
+            reduced
+        };
+        let scalar = run(true);
+        let cohort = run(false);
+        assert_bits_identical(
+            &scalar,
+            &cohort,
+            "8x3 kill-switch states must be bit-identical at 32 threads",
+        );
+    }
+
+    /// Degenerate light config with the cohort engine UNAVAILABLE (kill
+    /// switch): the tournament must stay fully scalar (zero engagement
+    /// counters) and still match the sequential left-fold reference
+    /// bit-for-bit — scalar fallback remains the correct engine whenever
+    /// the cohort cannot run, independent of pool width.
+    #[test]
+    fn degenerate_light_config_stays_scalar_when_cohort_unavailable() {
+        use ordered_float::NotNan;
+
+        let (d, m) = (8usize, 3usize);
+        let builder = LogSignatureBuilder::<u8>::new()
+            .with_num_dimensions(d)
+            .with_max_degree(m);
+        let basis = lyndon_rs::lyndon::LyndonBasis::<u8>::new(
+            d,
+            lyndon_rs::lyndon::Sort::Lexicographical,
+        )
+        .generate_basis(m);
+        let mut seed = 0x8d5_u64;
+        let lcg = |seed: &mut u64| {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*seed >> 33) % 17) as i128 - 8
+        };
+        let n = 24usize;
+        let rhss: Vec<Vec<NotNan<f64>>> = (0..n)
+            .map(|_| {
+                (0..basis.len())
+                    .map(|k| {
+                        if k < d {
+                            NotNan::new(lcg(&mut seed) as f64).unwrap()
+                        } else {
+                            NotNan::new(0.0).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[NotNan<f64>]> = rhss.iter().map(|r| r.as_slice()).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .expect("pool");
+
+        // Sequential association differs from the tournament tree for
+        // floats (only exact arithmetic is association-independent — see
+        // `tournament_rationals_exact_at_awkward_sizes`), so the reference
+        // here is the scalar tournament at a NARROW width: same tree, same
+        // bits, different scheduling.
+        set_cohort_off(true);
+        let r0 = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+        let f0 = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst);
+        let scalar_tournament_32t = pool
+            .install(|| builder.build::<NotNan<f64>>().tournament_reduce(&slices));
+        let runs = COHORT_ENGINE_RUNS.load(std::sync::atomic::Ordering::SeqCst) - r0;
+        let folds = COHORT_LANE_FOLDS.load(std::sync::atomic::Ordering::SeqCst) - f0;
+        let narrow = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("narrow pool");
+        let scalar_tournament_4t =
+            narrow.install(|| builder.build::<NotNan<f64>>().tournament_reduce(&slices));
+        set_cohort_off(false);
+        assert_eq!(runs, 0, "kill switch: no cohort runs");
+        assert_eq!(folds, 0, "kill switch: no cohort lane-folds");
+        assert_bits_identical(
+            &scalar_tournament_4t,
+            &scalar_tournament_32t,
+            "scalar tournament must be bit-identical across pool widths at 8x3",
         );
     }
 
