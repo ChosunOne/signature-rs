@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+};
 use ndarray::Array2;
 use ordered_float::NotNan;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -8,9 +10,14 @@ use signature_rs::LogSignatureBuilder;
 
 type S = NotNan<f64>;
 
+/// Kernel calls per timed iteration: amortizes the once-per-install
+/// park/unpark handshake (`pool.install` from a non-member thread) below
+/// measurement noise. Reported times are per call via `Throughput`.
+const KERNEL_CALLS_PER_ITER: usize = 64;
+
 fn grid() -> Vec<(usize, usize)> {
     std::env::var("BENCH_GRID")
-        .unwrap_or_else(|_| "2x8,3x8,4x8".to_owned())
+        .unwrap_or_else(|_| "2x12,3x8,4x6,5x5,6x4,8x3,12x2".to_owned())
         .split(',')
         .map(|tok| {
             let (d, m) = tok.split_once('x').expect("grid entries are `dxm`");
@@ -21,11 +28,22 @@ fn grid() -> Vec<(usize, usize)> {
 
 fn e2e_grid() -> Vec<(usize, usize)> {
     std::env::var("BENCH_E2E_GRID")
-        .unwrap_or_else(|_| "2x8,3x8".to_owned())
+        .unwrap_or_else(|_| "2x12,3x8,4x6,5x5,6x4,8x3,12x2".to_owned())
         .split(',')
         .map(|tok| {
             let (d, m) = tok.split_once('x').expect("grid entries are `dxm`");
             (d.parse().unwrap(), m.parse().unwrap())
+        })
+        .collect()
+}
+
+fn threads() -> Vec<usize> {
+    std::env::var("BENCH_THREADS")
+        .unwrap_or_else(|_| "1,2,4,8,16,32".to_owned())
+        .split(',')
+        .map(|t| {
+            t.parse()
+                .expect("thread counts are comma-separated integers")
         })
         .collect()
 }
@@ -80,14 +98,24 @@ fn bench_e2e(c: &mut Criterion) {
     for (d, m) in e2e_grid() {
         let b = builder(d, m);
         let path = synthetic_path(d, n);
-        group.bench_with_input(
-            BenchmarkId::new("dxmxn", format!("{d}x{m}x{n}")),
-            &(d, m, n),
-            |bencher, _| {
-                let view = path.view();
-                bencher.iter(|| std::hint::black_box(b.build_from_path(&view)));
-            },
-        );
+        for t in threads() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(t)
+                .build()
+                .expect("failed to build rayon thread pool");
+            group.bench_with_input(
+                BenchmarkId::new("dxmxn", format!("{d}x{m}x{n}/{t}t")),
+                &(d, m, n),
+                |bencher, _| {
+                    let view = path.view();
+                    // Per-iteration install: a full path build makes thousands
+                    // of pool dispatches, so the single install handshake is
+                    // negligible.
+                    bencher
+                        .iter(|| pool.install(|| std::hint::black_box(b.build_from_path(&view))));
+                },
+            );
+        }
     }
     group.finish();
 }
@@ -103,20 +131,37 @@ fn bench_concat_single(c: &mut Criterion) {
                 .slice(ndarray::s![WARM_SEGMENTS..=WARM_SEGMENTS + 1, ..])
                 .view(),
         );
-        group.bench_with_input(
-            BenchmarkId::new("dxm", format!("{d}x{m}")),
-            &(d, m),
-            |bencher, _| {
-                bencher.iter_batched(
-                    || acc.clone(),
-                    |mut acc| {
-                        acc.concatenate_assign(&seg);
-                        std::hint::black_box(acc)
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        // The batch's displacement set: the same segment folded K times
+        // (the steady-state concat workload).
+        let segs: Vec<_> = std::iter::repeat(seg.clone())
+            .take(KERNEL_CALLS_PER_ITER)
+            .collect();
+        for t in threads() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(t)
+                .build()
+                .expect("failed to build rayon thread pool");
+            group.throughput(Throughput::Elements(KERNEL_CALLS_PER_ITER as u64));
+            group.bench_with_input(
+                BenchmarkId::new("dxm", format!("{d}x{m}/{t}t")),
+                &(d, m),
+                |bencher, _| {
+                    bencher.iter_batched(
+                        || acc.clone(),
+                        |mut acc| {
+                            // The production fold shape: one continuous
+                            // batch dispatch over all K displacements
+                            // (same batch driver as build_from_path).
+                            pool.install(|| {
+                                acc.concatenate_batch(&segs);
+                            });
+                            std::hint::black_box(acc)
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
     }
     group.finish();
 }

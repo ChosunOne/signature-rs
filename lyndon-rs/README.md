@@ -45,7 +45,7 @@ use lyndon_rs::prelude::*;
 struct Letter(char);
 
 impl Generator for Letter {
-    fn generate_set(size: usize) -> Vec<Self> {
+    fn alphabet(size: usize) -> Vec<Self> {
         (0..size).map(|i| Letter((b'a' + i as u8) as char)).collect()
     }
 }
@@ -64,8 +64,9 @@ for word in words {
 ```rust
 use lyndon_rs::prelude::*;
 
-// Create a specific Lyndon word
-let word = LyndonWord::try_from(vec![ENotation::new(1), ENotation::new(2), ENotation::new(1)])
+// Create a specific Lyndon word (generators come from the `Generator::alphabet`)
+let e = ENotation::alphabet(3);
+let word = LyndonWord::try_from(vec![e[0].clone(), e[1].clone(), e[0].clone()])
     .expect("Valid Lyndon word");
 
 // Factor it into right factors
@@ -92,12 +93,12 @@ if word.len() > 1 {
 use lyndon_rs::prelude::*;
 
 // Check if a word is Lyndon
-let generators = vec![ENotation::new(1), ENotation::new(2), ENotation::new(1), ENotation::new(3)];
+let e = ENotation::alphabet(4);
+let generators = vec![e[0].clone(), e[1].clone(), e[0].clone(), e[2].clone()];
 match LyndonWord::try_from(generators.clone()) {
     Ok(lyndon_word) => {
         println!("{:?} is a valid Lyndon word", lyndon_word);
-        println!("Length: {}", lyndon_word.len());
-        println!("Degree: {}", lyndon_word.degree());
+        println!("Length (= degree): {}", lyndon_word.len());
     }
     Err(e) => {
         println!("{:?} is not a Lyndon word: {}", generators, e);
@@ -105,8 +106,9 @@ match LyndonWord::try_from(generators.clone()) {
 }
 
 // Concatenate two Lyndon words (may not result in a valid Lyndon word)
-let word1 = LyndonWord::try_from(vec![ENotation::new(1)]).unwrap();
-let word2 = LyndonWord::try_from(vec![ENotation::new(2), ENotation::new(3)]).unwrap();
+let e = ENotation::alphabet(3);
+let word1 = LyndonWord::try_from(vec![e[0].clone()]).unwrap();
+let word2 = LyndonWord::try_from(vec![e[1].clone(), e[2].clone()]).unwrap();
 
 match word1 * word2 {
     Ok(concatenated) => println!("Concatenated word: {:?}", concatenated),

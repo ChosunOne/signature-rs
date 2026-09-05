@@ -1,184 +1,396 @@
-use std::cmp::Ordering;
+//! Feasible-pair decomposition table: a compact, CSR-style replacement for
+//! the O(D²) `commutator_basis_map` / `commutator_basis_map_coefficients`
+//! tables.
+//!
+//! Only *canonical* pairs `(i, j)` with `i < j` and
+//! `deg(i) + deg(j) <= max_degree` are stored. Entries are grouped into
+//! *anagram units*: all pairs whose brackets land in the same letter
+//! multiset are contiguous, sorted by `(target degree, content class)`.
+//! Two different units never scatter onto the same basis word, so units
+//! are conflict-free write regions for a parallel kernel.
+//!
+//! Decomposition indices are stored relative to the start of the
+//! target-degree slice, with an absolute copy for [`FeasibleDecompositions::get`].
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
+
+/// Process-unique identity source for [`FeasibleDecompositions`] tables.
+/// Plan caches above the kernel key their entries by this id, so two
+/// differently-configured tables can never collide (an address would be
+/// reusable after a drop; a monotonic counter never is).
+static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A canonical pair `(i, j)` with `i < j`. Its decomposition slice is
 /// `decomp_start ..` up to the next flat entry's `decomp_start`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Entry {
-    pub(crate) i: u16,
-    pub(crate) j: u16,
+    pub(crate) i: u32,
+    pub(crate) j: u32,
     pub(crate) decomp_start: u32,
 }
 
-/// A contiguous run of canonical pairs with `deg(i) = p`, `deg(j) = q`.
+/// One active unit's sweep range: the kernel's atomic scheduling unit
+/// under the write-access division. A unit's word set (every basis word
+/// its active entries' rows write) is owned by exactly that unit — units
+/// are unique by (target degree, content) and every entry producing word
+/// `w` lives in `w`'s one unit — so the unit word sets PARTITION the
+/// sweep's write slots: concurrent unit sweeps are race-free by
+/// construction, and a word's contributions accumulate inside its one
+/// unit, in table-entry order — exactly the serial sweep's per-word float
+/// summation order, independent of pack cuts and thread counts.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BlockMeta {
-    /// Degree of the smaller index of every pair in the block.
-    pub(crate) p: u8,
-    /// Degree of the larger index of every pair in the block.
-    pub(crate) q: u8,
-    /// Bracket degree `p + q`: every decomposition of the block
-    /// scatters into the result's degree-`target` slice only.
+pub(crate) struct UnitRange {
+    /// The unit's target degree-slice start in the working layout (public
+    /// basis space for the public prologue's gating, class-contiguous
+    /// space for the class one — the degree-slice starts are identical in
+    /// both). A row element `rel` of the unit's entries writes result
+    /// position `rs + rel` (minus the job's compact `r_shift` for the
+    /// target degree).
+    pub(crate) rs: u32,
+    /// The unit's Lyndon target degree (the compact-buffer shift index).
+    pub(crate) td: u8,
+    /// The unit's active-entry range in the gating's flat ticket list,
+    /// in table order.
+    pub(crate) ticket_start: u32,
+    pub(crate) ticket_end: u32,
+    /// The unit's contribution (pair) count: Σ row lengths over its
+    /// active entries — the pack planner's work weight. The unit's word
+    /// SET is recoverable from its rows (every row element of its active
+    /// entries); the gating's flat `unit_words` list holds the union in
+    /// globally ascending order (units of one degree are ordered by
+    /// content bytes, NOT by position, so per-unit concatenation is not
+    /// ascending — the union must be sorted for the sink/scatter-set
+    /// order to stay byte-identical to the per-word fan-in's).
+    pub(crate) pairs: u32,
+}
+
+/// A contiguous run of canonical pairs whose brackets land in the same
+/// letter multiset: the unit's decompositions only hit degree-`target`
+/// words of that content, so two units never write the same basis word.
+/// Units organize the table for the gating walk and the `get` lookup; the
+/// kernel's parallel work is divided per unit (see [`UnitRange`]) — the
+/// unit word sets partition the write slots, which is what makes the
+/// per-unit division race-free.
+#[derive(Clone, Debug)]
+pub(crate) struct UnitMeta {
+    /// Bracket degree `p + q` (equal to `|gamma|`).
     pub(crate) target: u8,
-    /// Entry range `entries[start .. end]`, sorted by `(i, j)`.
+    /// The unit's letter multiset (counts per alphabet letter). Two units
+    /// with the same `target` differ in `gamma` and vice versa.
+    pub(crate) gamma: Vec<u8>,
+    /// Bit `p` set iff the unit contains pairs whose smaller index has
+    /// degree `p`.
+    pub(crate) p_mask: [u64; 2],
+    /// Entry range `entries[start .. end]`, sorted by `(p, q, i, j)`.
     /// The decomposition slice of entry `k` is
-    /// `entries[k].decomp_start .. entries[k + 1].decomp_start`
+    /// `entries[k].decomp_start .. entries[k + 1].decomp_start`.
     pub(crate) start: u32,
     pub(crate) end: u32,
 }
 
-/// A compact, CSR-style storage for coefficient pairs.
+/// The full-support gating's per-unit form: active unit ranges, the flat
+/// ticket list (every entry active, both orientations, in table order),
+/// and the flat ascending active-word position list (per-unit sets
+/// concatenated in degree order). Built lazily once per table (public
+/// space) / per class order (class space) and shared by every
+/// dense-support kernel call, so the steady state's gating is an Arc
+/// clone — no walk, no transposition.
+pub(crate) type FullSupportGating = (
+    std::sync::Arc<[UnitRange]>,
+    std::sync::Arc<[u32]>,
+    std::sync::Arc<[u32]>,
+);
+
+/// Packed active-entry ticket (the gating's per-entry resolution product): bits
+/// 0..30 hold the entry's flat table index, bit 31 the `p_active`
+/// orientation (`a = i, b = j`) and bit 30 the mirrored `q_active`. Table
+/// sizes are debug-asserted below 2^30 entries at gating build time, so the
+/// index never reaches the flag bits. Tickets ride inside the gating's
+/// `(ticket, decomp position)` contributions — the sweeps read them, never
+/// re-test presence.
+pub(crate) const TICKET_INDEX_MASK: u32 = 0x3fff_ffff;
+pub(crate) const TICKET_P_ACTIVE: u32 = 1 << 31;
+pub(crate) const TICKET_Q_ACTIVE: u32 = 1 << 30;
+
+/// The structure-constant table of a Lyndon basis: for every feasible
+/// commutator pair `(i, j)` (basis words with `i < j` whose degrees sum to
+/// at most the table's max degree) it stores the pair's decomposition into
+/// basis terms — the data the commutation kernel sweeps per fold.
 ///
-/// Only *canonical* pairs `(i, j)` with `i != j` and `deg(i) + deg(j) <= max_degree`
-/// are stored in ascending `j` order per row.
+/// The table is a pure function of the basis (plus the coefficient type's
+/// arithmetic), it is read-only after construction, and it is safe to
+/// share: every consumer over one basis can hold the same
+/// `Arc<FeasibleDecompositions<U>>` (see
+/// [`crate::lie_series::LieSeries::build_feasible_decompositions`] and
+/// [`crate::lie_series::LieSeries::with_feasible_decompositions`]). Most users never touch
+/// this type directly — [`crate::lie_series::LieSeries::new`] builds it — but
+/// sharing one table across many series over the same basis avoids
+/// re-paying the O(basis²) structure-constant pass.
+///
+/// Coefficient type is generic; decomposition indices are stored as `u32`.
 #[derive(Clone)]
-pub(crate) struct FeasibleDecompositions<U> {
-    /// Per basis word: its Lyndon degree. The basis is degree-grouped
-    /// so this array is non-decreasing.
+// The DAG crate's level-parallel collecting rebuild captures this table
+// (basis-derived integer data, no letter type) — see
+// `LieSeries::class_collect_kernel`. Every other use stays in-crate.
+pub struct FeasibleDecompositions<U> {
+    /// Per basis word: its Lyndon degree. The basis is degree-grouped, so
+    /// this array is non-decreasing.
     index_degrees: Vec<u8>,
-    /// For each degree `d`, the basis index where degree-`d` words
-    /// start. `degree_range(target)` slices the result vector into
-    /// the per-degree write regions used by the commutation kernel.
+    /// Per basis word: its letter content (counts per alphabet letter).
+    index_contents: Vec<Vec<u8>>,
+    /// For each degree `d`, the basis index where degree-`d` words start.
+    /// `degree_range(target)` slices the result vector into the per-degree
+    /// write regions used by the commutation kernel.
     degree_starts: Vec<u32>,
-    /// Degree blocks, sorted by `(target, p, q)`; entry ranges are
-    /// `entries[start .. end]`.
-    blocks: Vec<BlockMeta>,
-    /// Per block contiguous entries, sorted by `(i, j)` within a
-    /// block.
+    /// Anagram units, sorted by `(target, content class)`; entry ranges
+    /// are `entries[start .. end]`.
+    units: Vec<UnitMeta>,
+    /// Per-block contiguous entries, sorted by `(i, j)` within a block.
     entries: Vec<Entry>,
-    /// Flat decomposition: basis indices *relative to*
-    /// `degree_starts[target of the owning block]`.
+    /// Flat decomposition: basis indices relative to the owning unit's
+    /// target-degree slice (kernel scatter path).
     decomp_indices: Vec<u32>,
-    /// Flat decomposition: basis indices (public `get` path)
+    /// Flat decomposition: absolute basis indices (`get` path).
     decomp_indices_abs: Vec<u32>,
-    /// Flat decomposition: parallel non-zero coefficients
+    /// Flat decomposition: parallel non-zero coefficients.
     decomp_coefficients: Vec<U>,
+    /// Number of real entries (the trailing sentinel entry is excluded).
     num_entries: usize,
+    /// Within-degree class-contiguous scatter layout, populated at build
+    /// time only when a degree slice outgrows L1 (see
+    /// [`CLASS_ORDER_MIN_SLICE_WORDS`]) and otherwise created on demand by
+    /// [`FeasibleDecompositions::ensure_class_order`]. Held behind an
+    /// `Arc`: every kernel call and every series over the same basis
+    /// reuses one ordering.
+    class_order: OnceLock<Arc<ClassOrder>>,
+    /// The full-support gating's PUBLIC-space transposition (see
+    /// [`FullSupportGating`]), built lazily on the first dense call.
+    full_support_public: OnceLock<FullSupportGating>,
+    /// Process-unique table identity (see [`NEXT_TABLE_ID`]). A deep
+    /// `Clone` duplicates the id, but a clone's contents — and therefore
+    /// every support-derived list a cache would hand out for it — are
+    /// identical, so the duplication is unobservable.
+    table_id: u64,
 }
 
-impl<U> FeasibleDecompositions<U> {
-    /// Total number of stored feasible pairs
-    pub(crate) fn len(&self) -> usize {
-        self.num_entries
-    }
-
-    /// The maximum basis degree
-    pub(crate) fn max_degree(&self) -> usize {
-        self.degree_starts.len() - 2
-    }
-
-    #[inline]
-    pub(crate) fn degree_of(&self, i: usize) -> usize {
-        self.index_degrees[i] as usize
-    }
-
-    #[inline]
-    pub(crate) fn blocks(&self) -> &[BlockMeta] {
-        &self.blocks
-    }
-
-    /// A block's entry slice, extended by one: `slice[k + 1]` is the
-    /// flat successor of `slice[k]`, so entry `k`'s decomposition
-    /// range is `slice[k].decomp_start .. slice[k + 1].decomp_start`.
-    /// Zip the span with itself shifted one to iterate branch-free.
-    #[inline]
-    pub(crate) fn entry_span(&self, block: &BlockMeta) -> &[Entry] {
-        &self.entries[block.start as usize..=block.end as usize]
-    }
-
-    /// The flat relative decomposition index array.
-    #[inline]
-    pub(crate) fn decomp_indices_rel(&self) -> &[u32] {
-        &self.decomp_indices
-    }
-
-    /// The flat decomposition coefficient array
-    #[inline]
-    pub(crate) fn decomp_coeffs(&self) -> &[U] {
-        &self.decomp_coefficients
-    }
-
-    #[inline]
-    pub(crate) fn degree_start(&self, degree: usize) -> usize {
-        self.degree_starts[degree] as usize
-    }
-
-    /// The result-vector range `[start, end)` holding the degree-`target`
-    /// basis words: the disjoint write region of every block with this
-    /// target.
-    #[inline]
-    pub(crate) fn degree_range(&self, target: u8) -> (usize, usize) {
-        let t = target as usize;
-        (
-            self.degree_starts[t] as usize,
-            self.degree_starts[t + 1] as usize,
-        )
-    }
-
-    /// The stored decomposition for the feasible pair `(i, j)`, if any.
-    pub(crate) fn get(&self, i: usize, j: usize) -> Option<(&[u32], &[U], bool)> {
-        let (min, max, swapped) = match i.cmp(&j) {
-            Ordering::Less => (i, j, false),
-            Ordering::Greater => (j, i, true),
-            Ordering::Equal => return None,
-        };
-
-        let (min, max) = (u16::try_from(min).ok()?, u16::try_from(max).ok()?);
-
-        let p = self.index_degrees[min as usize];
-        let q = self.index_degrees[max as usize];
-        let key = (p as u16 + q as u16, p, q);
-        let pos = self
-            .blocks
-            .partition_point(|b| (b.target as u16, b.p, b.q) < key);
-        let block = self.blocks.get(pos)?;
-        if (block.p, block.q) != (p, q) {
-            return None; // pair is infeasible
+/// Stable counting sort of full-support contributions by target position
+/// (the write-access classes of the all-active gating). Same shape as the
+/// gating walk's transposition; the degrees come from the caller's
+/// position→degree map.
+/// Builds the full-support gating's per-unit form: every entry active
+/// with both orientations, one ticket per entry in table order, and per
+/// unit the ascending set of result positions its rows write. Shared by
+/// the public and class-space full-support paths (they differ only in the
+/// entry table / rel slice / degree-start source they view).
+fn build_full_support_gating(
+    units: &[UnitMeta],
+    entries: &[Entry],
+    decomp_rels: &[u32],
+    degree_start: impl Fn(usize) -> u32,
+) -> FullSupportGating {
+    let mut tickets: Vec<u32> = Vec::with_capacity(entries.len());
+    let mut unit_words: Vec<u32> = Vec::new();
+    let mut ranges: Vec<UnitRange> = Vec::with_capacity(units.len());
+    // Transient per-unit rel bitset (rel < the unit's degree-slice size);
+    // cleared by iterating its set bits after extraction.
+    let mut rel_bits: Vec<u64> = Vec::new();
+    for unit in units {
+        let t = unit.target as usize;
+        let rs = degree_start(t);
+        let ticket_start = tickets.len() as u32;
+        let mut pairs = 0u32;
+        rel_bits.clear();
+        rel_bits.resize(((degree_start(t + 1) - rs) as usize).div_ceil(64), 0);
+        for ei in unit.start..unit.end {
+            let entry = &entries[ei as usize];
+            tickets.push(ei | TICKET_P_ACTIVE | TICKET_Q_ACTIVE);
+            let from = entry.decomp_start as usize;
+            let to = entries[ei as usize + 1].decomp_start as usize;
+            for &rel in &decomp_rels[from..to] {
+                rel_bits[(rel / 64) as usize] |= 1u64 << (rel % 64);
+                pairs += 1;
+            }
         }
-        let entries = &self.entries[block.start as usize..block.end as usize];
-        let pos = entries.partition_point(|e| (e.i, e.j) < (min, max));
-        let entry = entries.get(pos)?;
-        if (entry.i, entry.j) != (min, max) {
-            return None;
+        // Extract the unit's ascending word positions and clear the bits.
+        let mut emitted = 0u32;
+        for (w, bits) in rel_bits.iter_mut().enumerate() {
+            let mut b = *bits;
+            while b != 0 {
+                let bit = b.trailing_zeros();
+                b &= b - 1;
+                unit_words.push(rs + (w as u32) * 64 + bit);
+                emitted += 1;
+            }
+            *bits = 0;
         }
+        // A unit with no active contributions (empty rows throughout) is
+        // omitted: it has no tickets, no words, no work.
+        if pairs == 0 {
+            tickets.truncate(ticket_start as usize);
+            debug_assert_eq!(emitted, 0);
+            continue;
+        }
+        debug_assert!(emitted > 0);
+        ranges.push(UnitRange {
+            rs,
+            td: unit.target,
+            ticket_start,
+            ticket_end: tickets.len() as u32,
+            pairs,
+        });
+    }
+    // Units of one degree are ordered by CONTENT BYTES (the table's unit
+    // order), not by position — the per-unit concatenation is not
+    // ascending. Sort the union so the flat list is globally ascending:
+    // the sink/scatter-set walk order must stay byte-identical to the
+    // per-word fan-in's (which emitted active positions in ascending
+    // order).
+    unit_words.sort_unstable();
+    (
+        std::sync::Arc::from(ranges),
+        std::sync::Arc::from(tickets),
+        std::sync::Arc::from(unit_words),
+    )
+}
 
-        let from = entry.decomp_start as usize;
-        let next = self.entries[block.start as usize + pos + 1].decomp_start as usize;
-        Some((
-            &self.decomp_indices_abs[from..next],
-            &self.decomp_coefficients[from..next],
-            swapped,
-        ))
+/// Degree-slice size above which the commutation kernel's scatter writes
+/// leave L1 and the class-contiguous layout pays for its permutation
+/// epilogue. Below it the public-order scatter is already cache-resident.
+const CLASS_ORDER_MIN_SLICE_WORDS: usize = 4096;
+
+/// Within-degree class-contiguous scatter layout: the basis words of each
+/// degree are regrouped so that words of the same letter content (anagram
+/// class) are contiguous, with degree-slice boundaries preserved. A unit's
+/// decompositions only ever hit its own class (content homogeneity), so in
+/// this layout every unit's stores are dense and consecutive units write
+/// consecutive blocks.
+///
+/// The ordering depends only on the basis — every series over the same
+/// basis rearranges coefficients identically — so one handle (cheap to
+/// clone: `Arc` internally) amortizes across operand series, across every
+/// kernel call of a fold, and across batches of folds. Obtain it via
+/// [`ClassOrderedCommutation::class_order`](crate::ClassOrderedCommutation::class_order).
+#[derive(Clone)]
+pub struct ClassOrder {
+    /// Internal (class-contiguous) position -> public basis index.
+    perm: Vec<u32>,
+    /// Public basis index -> internal (class-contiguous) position. The
+    /// epilogue walks this in public order so its result writes are
+    /// sequential (full cache lines) while its scratch reads — internal
+    /// positions, just written by the sweep — stay cache-hot.
+    inv: Vec<u32>,
+    /// Decomposition scatter indices relative to the owning unit's degree
+    /// slice, expressed in the internal layout: a class-mode sweep writes
+    /// `scratch[rs + rel]` with `rel` dense over the unit's class block.
+    decomp_cls: Vec<u32>,
+    /// Entry table with `i`/`j` relabeled to internal positions, for
+    /// sweeps whose operands are class-ordered. Same order and
+    /// `decomp_start`s as the public table.
+    entries_cls: Vec<Entry>,
+    /// Lyndon degrees indexed by internal position.
+    degree_cls: Vec<u8>,
+    /// The full-support gating's CLASS-space transposition (see
+    /// [`FullSupportGating`]), built lazily on the first dense class-mode
+    /// call. The builder needs the owning table's degree starts, passed
+    /// at first use.
+    full_support_class: OnceLock<FullSupportGating>,
+}
+
+impl ClassOrder {
+    /// Internal (class-contiguous) position -> public basis index: the
+    /// final-epilogue map. `public[k] = class[inv()[k]]` translates a
+    /// class-ordered slice back to public order with sequential writes.
+    #[inline]
+    pub fn perm(&self) -> &[u32] {
+        &self.perm
+    }
+
+    /// Public basis index -> internal (class-contiguous) position: the
+    /// input-conversion map. `class[inv()[k]] = public[k]` gathers a
+    /// public-order slice into class order.
+    #[inline]
+    pub fn inv(&self) -> &[u32] {
+        &self.inv
+    }
+
+    /// Decomposition scatter indices in the internal layout.
+    #[inline]
+    pub(crate) fn decomp_cls(&self) -> &[u32] {
+        &self.decomp_cls
+    }
+
+    /// Entry table with internal-position endpoints.
+    #[inline]
+    pub(crate) fn entries_cls(&self) -> &[Entry] {
+        &self.entries_cls
+    }
+
+    /// Lyndon degrees indexed by internal (class) position. The positions
+    /// are degree-grouped, so this slice is non-decreasing.
+    #[inline]
+    pub fn degree_cls(&self) -> &[u8] {
+        &self.degree_cls
+    }
+
+    /// The full-support gating's per-word transposition in CLASS space:
+    /// every entry active with both orientations, transposed once against
+    /// this ordering and cached. `table` must be the series' table this
+    /// ordering was built from (degree starts and entry order).
+    pub(crate) fn full_support_gating_class(
+        &self,
+        table: &FeasibleDecompositions<impl Clone>,
+    ) -> FullSupportGating {
+        self.full_support_class
+            .get_or_init(|| {
+                // Degree-slice starts are identical in both layouts, so
+                // the table's degree starts index the class space too.
+                build_full_support_gating(
+                    table.units(),
+                    self.entries_cls(),
+                    self.decomp_cls(),
+                    |t| table.degree_start(t) as u32,
+                )
+            })
+            .clone()
     }
 }
 
 /// Incremental builder used during `LieSeries::new`: canonical pairs arrive
-/// row-major (`i` ascending, `j` ascending within a row) as the
-/// structure constants are computed.
+/// row-major (`i` ascending, `j > i` ascending within a row) as the structure
+/// constants are computed.
 pub(crate) struct Builder<U> {
-    rows: Vec<Vec<(u16, Vec<u32>, Vec<U>)>>,
+    /// Per row `i`: `(j, decomposition indices, decomposition coefficients)`.
+    rows: Vec<Vec<(u32, Vec<u32>, Vec<U>)>>,
+    /// Letter content of each basis word (counts per alphabet letter), in
+    /// basis order.
+    contents: Vec<Vec<u8>>,
+    /// Degrees of the basis words (content sums), in basis order
+    /// (non-decreasing).
     degrees: Vec<u8>,
 }
 
 impl<U: Clone> Builder<U> {
-    /// `degrees[i]` is the Lyndon degree of basis word `i`; the
-    /// basis must be degree-grouped.
-    pub(crate) fn new(degrees: &[u8]) -> Self {
+    /// `contents[i]` is the letter multiset of basis word `i`; the basis
+    /// must be degree-grouped (degrees non-decreasing along basis order).
+    pub(crate) fn new(contents: &[Vec<u8>]) -> Self {
+        let degrees: Vec<u8> = contents
+            .iter()
+            .map(|c| c.iter().copied().sum::<u8>())
+            .collect();
         Self {
-            rows: (0..degrees.len()).map(|_| Vec::new()).collect(),
-            degrees: degrees.to_vec(),
+            rows: (0..contents.len()).map(|_| Vec::new()).collect(),
+            contents: contents.to_vec(),
+            degrees,
         }
     }
 
-    /// Records the decomposition of the canonical pair `(i, j)`
-    /// with `i < j`. Callers must push pairs in row-major order
-    /// (`i` ascending, `j > i` ascending within a row) and must
-    /// not push infeasible pairs.
-    ///
-    /// The decomposition must only hit degree-`deg(i) + deg(j)`
-    /// basis words.
+    /// Records the decomposition of the canonical pair `(i, j)`. Pairs
+    /// must arrive row-major; decompositions must only hit
+    /// degree-`deg(i) + deg(j)` basis words.
     pub(crate) fn push(&mut self, i: usize, j: usize, indices: &[usize], coefficients: &[U]) {
         self.rows[i].push((
-            u16::try_from(j).expect("basis index exceeds u16"),
+            u32::try_from(j).expect("basis index exceeds u32"),
             indices
                 .iter()
                 .map(|&x| u32::try_from(x).expect("basis index exceeds u32"))
@@ -190,13 +402,17 @@ impl<U: Clone> Builder<U> {
     pub(crate) fn finish(self) -> FeasibleDecompositions<U> {
         let degrees = &self.degrees;
         assert!(
-            degrees.len() <= u16::MAX as usize,
-            "basis size exceeds u16 indices"
+            degrees.len() <= u32::MAX as usize,
+            "basis size exceeds u32 indices"
         );
 
-        let max_degree: usize = degrees.last().copied().unwrap_or(0) as usize;
-        let mut degree_starts: Vec<u32> = vec![0u32; max_degree + 2];
-        let mut d: usize = 0usize;
+        // Degree starts: for each degree, the first basis index carrying it.
+        // Absent degrees point at the next present degree (their slice is
+        // empty). The basis is degree-grouped, so a single forward scan
+        // suffices.
+        let max_degree = degrees.last().copied().unwrap_or(0) as usize;
+        let mut degree_starts = vec![0u32; max_degree + 2];
+        let mut d = 0usize;
         for (index, &g) in degrees.iter().enumerate() {
             while d < g as usize {
                 d += 1;
@@ -205,57 +421,73 @@ impl<U: Clone> Builder<U> {
         }
         degree_starts[max_degree + 1] = degrees.len() as u32;
 
-        // Flatten and sort all entries by (target, p, q, i, j): blocks in
-        // kernel iteration order, entries sorted within their block.
-        let mut flat = Vec::new();
+        // Flatten and sort by (target, content class, p, q, i, j): anagram
+        // units in kernel iteration order, entries sorted within their
+        // unit.
+        let contents = &self.contents;
+        let mut flat: Vec<(u8, Vec<u8>, u8, u8, u32, u32, Vec<u32>, Vec<U>)> = Vec::new();
         for (i, row) in self.rows.iter().enumerate() {
-            for &(ref j, ref indices, ref coefficients) in row {
+            for (j, indices, coefficients) in row {
                 let (p, q) = (degrees[i], degrees[*j as usize]);
                 debug_assert!(
                     p <= q,
                     "non-degree-grouped basis: i < j but deg(i) > deg(j)"
                 );
+                let mut gamma = contents[i].clone();
+                for k in 0..gamma.len() {
+                    gamma[k] += contents[*j as usize][k];
+                }
                 flat.push((
                     p + q,
+                    gamma,
                     p,
                     q,
-                    i as u16,
+                    i as u32,
                     *j,
                     indices.clone(),
                     coefficients.clone(),
                 ));
             }
         }
-        flat.sort_unstable_by(|a, b| (a.0, a.1, a.2, a.3, a.4).cmp(&(b.0, b.1, b.2, b.3, b.4)));
+        flat.sort_unstable_by(|a, b| {
+            (a.0, &a.1, a.2, a.3, a.4, a.5).cmp(&(b.0, &b.1, b.2, b.3, b.4, b.5))
+        });
 
         let total: usize = flat
             .iter()
-            .map(|&(_, _, _, _, _, ref idx, _)| idx.len())
+            .map(|(_, _, _, _, _, _, idx, _)| idx.len())
             .sum();
-        let mut blocks = Vec::<BlockMeta>::new();
+        let mut units: Vec<UnitMeta> = Vec::new();
         let mut entries = Vec::with_capacity(flat.len());
         let mut decomp_indices = Vec::with_capacity(total);
         let mut decomp_indices_abs = Vec::with_capacity(total);
         let mut decomp_coefficients = Vec::with_capacity(total);
 
-        for (target, p, q, i, j, indices, coefficients) in flat {
+        for (target, gamma, p, _q, i, j, indices, coefficients) in flat {
             debug_assert!(
                 target as usize <= max_degree,
                 "infeasible pair ({i}, {j}) pushed: target degree {target} > {max_degree}"
             );
-            let target_start: u32 = degree_starts[target as usize];
-            if blocks
+            let target_start = degree_starts[target as usize];
+            if units
                 .last()
-                .is_none_or(|b| (b.target, b.p, b.q) != (target, p, q))
+                .is_none_or(|u| (u.target, &u.gamma) != (target, &gamma))
             {
-                blocks.push(BlockMeta {
-                    p,
-                    q,
+                units.push(UnitMeta {
                     target,
+                    gamma: gamma.clone(),
+                    p_mask: [0, 0],
                     start: entries.len() as u32,
                     end: 0,
                 });
             }
+            let unit = units.last_mut().unwrap();
+            let mask_word = &mut unit.p_mask[(p / 64) as usize];
+            *mask_word |= 1u64 << (p % 64);
+            debug_assert!(
+                indices.iter().all(|&x| contents[x as usize] == gamma),
+                "decomposition of pair ({i}, {j}) is not content-homogeneous"
+            );
             debug_assert!(
                 indices.iter().all(|&x| degrees[x as usize] == target),
                 "decomposition of pair ({i}, {j}) is not degree-homogeneous"
@@ -275,45 +507,346 @@ impl<U: Clone> Builder<U> {
             decomp_indices_abs.extend_from_slice(&indices);
             decomp_coefficients.extend_from_slice(&coefficients);
         }
-        // Close the blocks' entry ranges (the sentinel entry appended below
+        // Close the units' entry ranges (the sentinel entry appended below
         // bounds the last real entry's decomposition slice).
-        let mut end: u32 = entries.len() as u32;
-        for block in blocks.iter_mut().rev() {
-            block.end = end;
-            end = block.start;
+        let mut end = entries.len() as u32;
+        for unit in units.iter_mut().rev() {
+            unit.end = end;
+            end = unit.start;
         }
-        let total: u32 = decomp_indices.len() as u32;
+        let total = decomp_indices.len() as u32;
 
-        let num_entries: usize = entries.len();
+        let num_entries = entries.len();
         entries.push(Entry {
             i: 0,
             j: 0,
             decomp_start: total,
         });
+        // Class-contiguous scatter layout: only worth building when some
+        // degree slice outgrows L1 — below that the public-order scatter is
+        // already cache-resident and the layout's permutation epilogue
+        // would only add work (12×2's whole kernel is smaller than one
+        // epilogue pass).
+        let max_slice = (0..=max_degree)
+            .map(|d| degree_starts[d + 1] - degree_starts[d])
+            .max()
+            .unwrap_or(0);
+        let class_order = OnceLock::new();
+        if max_slice as usize >= CLASS_ORDER_MIN_SLICE_WORDS {
+            let _ = class_order.set(Arc::new(build_class_order(
+                degrees,
+                contents,
+                &degree_starts,
+                &units,
+                &entries,
+                &decomp_indices,
+            )));
+        }
+
+        // Full-support gating flows through the same gating walk as every
+        // other support (presence bitsets all-ones, every run active): the
+        // walk's per-entry resolution runs once per distinct support pair,
+        // then the [`GatingCache`] serves it for the fold's remaining
+        // calls. The old precomputed full-support segment/ticket lists are
+        // superseded by the per-word transposition, which is cheap to
+        // rebuild and cache in the same memo.
+        debug_assert!(
+            num_entries < (1 << 30),
+            "entry indices must fit a ticket's 30 bits"
+        );
 
         FeasibleDecompositions {
             index_degrees: degrees.clone(),
+            index_contents: contents.clone(),
             degree_starts,
-            blocks,
+            units,
             entries,
             decomp_indices,
             decomp_indices_abs,
             decomp_coefficients,
             num_entries,
+            class_order,
+            full_support_public: OnceLock::new(),
+            table_id: NEXT_TABLE_ID.fetch_add(1, AtomicOrdering::Relaxed),
         }
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
+/// Builds the within-degree class-contiguous permutation and the
+/// re-indexed decomposition scatter array.
+///
+/// Within each degree, words are grouped by letter content (classes ordered
+/// by content bytes, words in public order inside a class); degree-slice
+/// boundaries are preserved, so a degree slice's start offset is valid in
+/// both layouts and only the positions inside the slice move.
+fn build_class_order(
+    degrees: &[u8],
+    contents: &[Vec<u8>],
+    degree_starts: &[u32],
+    units: &[UnitMeta],
+    entries: &[Entry],
+    decomp_rel: &[u32],
+) -> ClassOrder {
+    let len = degrees.len();
+    let mut inv: Vec<u32> = (0..len as u32).collect();
+    let max_degree = degree_starts.len() - 2;
+    for d in 0..=max_degree {
+        let lo = degree_starts[d] as usize;
+        let hi = degree_starts[d + 1] as usize;
+        if hi <= lo + 1 {
+            continue;
+        }
+        // Stable sort: equal contents (one class) keep their public order.
+        let mut order: Vec<usize> = (lo..hi).collect();
+        order.sort_by(|&a, &b| contents[a].cmp(&contents[b]));
+        for (pos, &w) in order.iter().enumerate() {
+            inv[w] = (lo + pos) as u32;
+        }
+    }
+    let mut perm: Vec<u32> = vec![0; len];
+    for (w, &p) in inv.iter().enumerate() {
+        perm[p as usize] = w as u32;
+    }
+    let inv = inv;
+    // Re-index the scatter array: `rel_cls = inv[rs + rel] - rs` per unit.
+    // The entries' sentinel-closed successor chains give each entry's
+    // decomposition range, exactly as the sweep reads it.
+    let mut decomp_cls = vec![0u32; decomp_rel.len()];
+    for unit in units {
+        let rs = degree_starts[unit.target as usize] as usize;
+        for ei in unit.start..unit.end {
+            let from = entries[ei as usize].decomp_start as usize;
+            let to = entries[ei as usize + 1].decomp_start as usize;
+            for k in from..to {
+                decomp_cls[k] = inv[rs + decomp_rel[k] as usize] - rs as u32;
+            }
+        }
+    }
+    // Entry table relabeled to internal positions (same order, same
+    // decomp_starts; the sentinel's endpoints are never read).
+    let entries_cls: Vec<Entry> = entries
+        .iter()
+        .map(|e| Entry {
+            i: inv[e.i as usize],
+            j: inv[e.j as usize],
+            decomp_start: e.decomp_start,
+        })
+        .collect();
+    let mut degree_cls = vec![0u8; degrees.len()];
+    for (w, &p) in inv.iter().enumerate() {
+        degree_cls[p as usize] = degrees[w];
+    }
+    ClassOrder {
+        perm,
+        inv,
+        decomp_cls,
+        entries_cls,
+        degree_cls,
+        full_support_class: OnceLock::new(),
+    }
+}
 
-    impl<U> FeasibleDecompositions<U> {
-        pub(crate) fn block_iter<'a>(
-            &'a self,
-            block: &'a BlockMeta,
-        ) -> impl Iterator<Item = (&'a Entry, &'a [u32], &'a [U])> + 'a {
-            let span = self.entry_span(block);
+impl<U> FeasibleDecompositions<U> {
+    /// The table's process-unique identity. Two tables with the same id
+    /// carry identical contents (the id is assigned once at construction
+    /// and survives only content-preserving clones), so plan caches may
+    /// key support-derived data on it without any content re-check.
+    pub fn table_id(&self) -> u64 {
+        self.table_id
+    }
+
+    /// Total number of stored feasible pairs.
+    pub fn len(&self) -> usize {
+        self.num_entries
+    }
+
+    /// The class-contiguous layout when it was prebuilt at table
+    /// construction (degree slice above the L1 threshold); `None` means
+    /// the default kernel paths run direct. (Test/telemetry accessor —
+    /// the write-access kernel paths read the gating's per-word classes
+    /// and no longer branch on the layout.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    pub(crate) fn cached_class_order(&self) -> Option<&Arc<ClassOrder>> {
+        self.class_order.get()
+    }
+
+    /// The class-contiguous layout, building it on first request when the
+    /// table did not prebuild one. Cheap after the first call, and shared
+    /// as an `Arc` across every consumer of this table.
+    #[inline]
+    pub(crate) fn ensure_class_order(&self) -> Arc<ClassOrder> {
+        self.class_order
+            .get_or_init(|| {
+                let units = self.units.clone();
+                let entries = self.entries.clone();
+                let decomp = self.decomp_indices.clone();
+                Arc::new(build_class_order(
+                    &self.index_degrees,
+                    &self.index_contents,
+                    &self.degree_starts,
+                    &units,
+                    &entries,
+                    &decomp,
+                ))
+            })
+            .clone()
+    }
+
+    /// Test hook: builds the class-contiguous layout regardless of the
+    /// slice-size threshold, so correctness tests can exercise the class
+    /// sweep on small (fast-to-build) shapes.
+    #[cfg(test)]
+    pub(crate) fn force_class_order(&mut self) {
+        let units = self.units.clone();
+        let entries = self.entries.clone();
+        let decomp = self.decomp_indices.clone();
+        let built = Arc::new(build_class_order(
+            &self.index_degrees,
+            &self.index_contents,
+            &self.degree_starts,
+            &units,
+            &entries,
+            &decomp,
+        ));
+        let _ = self.class_order.set(built);
+    }
+
+    /// Test hook: drops the class layout so a threshold-qualifying table
+    /// can serve as the direct-layout reference.
+    #[cfg(test)]
+    pub(crate) fn clear_class_order(&mut self) {
+        let _ = self.class_order.take();
+    }
+
+    /// The maximum basis degree.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn max_degree(&self) -> usize {
+        self.degree_starts.len() - 2
+    }
+
+    /// The Lyndon degree of basis word `i` (O(1)).
+    #[inline]
+    pub(crate) fn degree_of(&self, i: usize) -> usize {
+        self.index_degrees[i] as usize
+    }
+
+    /// Per-word Lyndon degrees in basis order (the public layout's
+    /// position→degree map; used by gating-structure tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    pub(crate) fn index_degrees(&self) -> &[u8] {
+        &self.index_degrees
+    }
+
+    /// Anagram units in kernel iteration order.
+    #[inline]
+    pub(crate) fn units(&self) -> &[UnitMeta] {
+        &self.units
+    }
+
+    /// The flat entry array in storage order.
+    #[inline]
+    pub(crate) fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// A unit's entry slice, extended by one: `slice[k + 1]` is the flat
+    /// successor of `slice[k]`, so entry `k`'s decomposition range is
+    /// `slice[k].decomp_start .. slice[k + 1].decomp_start`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    pub(crate) fn entry_span(&self, unit: &UnitMeta) -> &[Entry] {
+        &self.entries[unit.start as usize..=unit.end as usize]
+    }
+
+    /// The full-support gating's per-word transposition in PUBLIC space:
+    /// every entry active with both orientations, transposed once and
+    /// cached. The dense-support prologues short-circuit here — the
+    /// steady state's gating is this Arc clone, not a walk.
+    pub(crate) fn full_support_gating_public(&self) -> FullSupportGating {
+        self.full_support_public
+            .get_or_init(|| {
+                // Every entry active, both orientations: tickets are the
+                // entry stream with both flag bits packed; per unit the
+                // ascending set of positions its rows write.
+                build_full_support_gating(
+                    &self.units,
+                    &self.entries,
+                    &self.decomp_indices,
+                    |t| self.degree_start(t) as u32,
+                )
+            })
+            .clone()
+    }
+
+    /// The flat relative decomposition index array (kernel scatter path).
+    #[inline]
+    pub(crate) fn decomp_indices_rel(&self) -> &[u32] {
+        &self.decomp_indices
+    }
+
+    /// The flat decomposition coefficient array.
+    #[inline]
+    pub(crate) fn decomp_coeffs(&self) -> &[U] {
+        &self.decomp_coefficients
+    }
+
+    /// A unit's entries as `(entry, decomposition indices, decomposition
+    /// coefficients)`. Decomposition indices are relative to the start of
+    /// the unit's target-degree slice.
+    #[cfg(test)]
+    pub(crate) fn unit_iter<'a>(
+        &'a self,
+        unit: &'a UnitMeta,
+    ) -> impl Iterator<Item = (&'a Entry, &'a [u32], &'a [U])> + 'a {
+        let span = self.entry_span(unit);
+        span[..span.len() - 1]
+            .iter()
+            .zip(span[1..].iter())
+            .map(move |(e, next)| {
+                let from = e.decomp_start as usize;
+                let to = next.decomp_start as usize;
+                (
+                    e,
+                    &self.decomp_indices[from..to],
+                    &self.decomp_coefficients[from..to],
+                )
+            })
+    }
+
+    /// The basis index where degree-`degree` words start (see
+    /// [`FeasibleDecompositions::degree_range`]).
+    #[inline]
+    pub(crate) fn degree_start(&self, degree: usize) -> usize {
+        self.degree_starts[degree] as usize
+    }
+
+    /// The result-vector range `[start, end)` holding the degree-`target`
+    /// basis words.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    /// DEBUG/telemetry: per-position Lyndon degree + degree-slice starts.
+    #[doc(hidden)]
+    pub fn debug_degree_layout(&self) -> (Vec<u8>, Vec<u32>) {
+        (self.index_degrees.clone(), self.degree_starts.clone())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn degree_range(&self, target: u8) -> (usize, usize) {
+        let t = target as usize;
+        (
+            self.degree_starts[t] as usize,
+            self.degree_starts[t + 1] as usize,
+        )
+    }
+
+    /// All entries in storage order as
+    /// `(i, j, absolute decomposition indices, decomposition coefficients)`.
+    #[cfg(test)]
+    pub(crate) fn iter_entries(&self) -> impl Iterator<Item = (usize, usize, &[u32], &[U])> + '_ {
+        self.units.iter().flat_map(move |unit| {
+            let span = self.entry_span(unit);
             span[..span.len() - 1]
                 .iter()
                 .zip(span[1..].iter())
@@ -321,95 +854,251 @@ mod test {
                     let from = e.decomp_start as usize;
                     let to = next.decomp_start as usize;
                     (
-                        e,
-                        &self.decomp_indices[from..to],
+                        e.i as usize,
+                        e.j as usize,
+                        &self.decomp_indices_abs[from..to],
                         &self.decomp_coefficients[from..to],
                     )
                 })
-        }
-
-        pub(crate) fn iter_entries(
-            &self,
-        ) -> impl Iterator<Item = (usize, usize, &[u32], &[U])> + '_ {
-            self.blocks.iter().flat_map(move |block| {
-                let span = self.entry_span(block);
-                span[..span.len() - 1]
-                    .iter()
-                    .zip(span[1..].iter())
-                    .map(move |(e, next)| {
-                        let from = e.decomp_start as usize;
-                        let to = next.decomp_start as usize;
-                        (
-                            e.i as usize,
-                            e.j as usize,
-                            &self.decomp_indices_abs[from..to],
-                            &self.decomp_coefficients[from..to],
-                        )
-                    })
-            })
-        }
+        })
     }
 
+    /// The decomposition of the bracket `[basis[i], basis[j]]`, if stored.
+    ///
+    /// Querying with `j < i` returns the canonical data with
+    /// `swapped = true`; the caller must negate the coefficients. `i == j`
+    /// is never stored.
+    pub(crate) fn get(&self, i: usize, j: usize) -> Option<(&[u32], &[U], bool)> {
+        let (min, max, swapped) = match i.cmp(&j) {
+            std::cmp::Ordering::Less => (i, j, false),
+            std::cmp::Ordering::Greater => (j, i, true),
+            std::cmp::Ordering::Equal => return None,
+        };
+        let (min, max) = (u32::try_from(min).ok()?, u32::try_from(max).ok()?);
+        let (c_min, c_max) = (
+            &self.index_contents[min as usize],
+            &self.index_contents[max as usize],
+        );
+        let mut gamma = c_min.clone();
+        for (g, c) in gamma.iter_mut().zip(c_max) {
+            *g += c;
+        }
+        let target = gamma.iter().copied().sum::<u8>();
+        // Units are sorted by (target, content class) and the class
+        // determines the target, so the unit is found with one binary
+        // search. The target is widened: arbitrary (infeasible) queries may
+        // overflow `u8`.
+        let pos = self
+            .units
+            .partition_point(|u| (u.target as u16, &u.gamma) < (target as u16, &gamma));
+        let unit = self.units.get(pos)?;
+        if unit.gamma != gamma {
+            return None; // no unit for this content pair: infeasible pair
+        }
+        let entries = &self.entries[unit.start as usize..unit.end as usize];
+        let pos = entries.partition_point(|e| (e.i, e.j) < (min, max));
+        let entry = entries.get(pos)?;
+        if (entry.i, entry.j) != (min, max) {
+            return None;
+        }
+        let from = entry.decomp_start as usize;
+        // The flat successor bounds the slice (next unit's first entry or
+        // the trailing sentinel; both carry the right `decomp_start`).
+        let next = self.entries[unit.start as usize + pos + 1].decomp_start as usize;
+        Some((
+            &self.decomp_indices_abs[from..next],
+            &self.decomp_coefficients[from..next],
+            swapped,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// INVARIANT CHECK: within one degree-target slice, two different
+    /// units must never scatter onto the same basis word — the batch's
+    /// packs cut at unit boundaries and rely on per-word single-writer
+    /// accumulation for bit-identical results.
+    #[test]
+    fn debug_unit_word_ownership_disjoint() {
+        // Real 3-letter basis through degree 5: word contents from the
+        // Lyndon enumeration, in basis order.
+        let contents: Vec<Vec<u8>> = vec![
+            vec![1, 0, 0], // a
+            vec![0, 1, 0], // b
+            vec![0, 0, 1], // c
+            vec![1, 1, 0], // ab
+            vec![1, 0, 1], // ac
+            vec![0, 1, 1], // bc
+            vec![2, 1, 0], // aab
+            vec![1, 2, 0], // abb
+            vec![2, 0, 1], // aac
+            vec![1, 0, 2], // acc
+            vec![0, 2, 1], // bbc
+            vec![0, 1, 2], // bcc
+            vec![1, 1, 1], // abc
+            vec![3, 1, 0], // aaab
+            vec![1, 3, 0], // abbb
+            vec![1, 1, 2], // abcc
+            vec![2, 2, 1], // aabb
+        ];
+        let mut b = Builder::<f64>::new(&contents);
+        // Push every canonical pair with a decomposition into every word of
+        // the pair's content class at the target degree (row-major, as the
+        // kernel's table build does).
+        let n = contents.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut gamma = vec![0u8; 3];
+                for k in 0..3 {
+                    gamma[k] = contents[i][k] + contents[j][k];
+                }
+                let _target: u8 = gamma.iter().sum();
+                // all words of degree `target` with this content
+                let targets: Vec<usize> = (0..n).filter(|w| contents[*w] == gamma).collect();
+                if targets.is_empty() {
+                    continue; // no word of this content at this degree
+                }
+                b.push(i, j, &targets, &vec![1.0; targets.len()]);
+            }
+        }
+        let t = b.finish();
+
+        // Walk every unit; collect (target, rel) -> unit index.
+        let mut owner: std::collections::HashMap<(u8, u32), usize> =
+            std::collections::HashMap::new();
+        let mut violations = 0usize;
+        for (uid, unit) in t.units().iter().enumerate() {
+            let span = t.entry_span(unit);
+            for (entry, next) in span[..span.len() - 1].iter().zip(span[1..].iter()) {
+                let from = entry.decomp_start as usize;
+                let to = next.decomp_start as usize;
+                for &rel in &t.decomp_indices_rel()[from..to] {
+                    let key = (unit.target, rel);
+                    match owner.get(&key) {
+                        Some(prev) if *prev != uid => {
+                            violations += 1;
+                            if violations <= 8 {
+                                println!(
+                                    "VIOLATION: degree {} rel {} claimed by units {} and {}",
+                                    unit.target, rel, prev, uid
+                                );
+                            }
+                        }
+                        _ => {
+                            owner.insert(key, uid);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "units={} rels={} (target,rel) keys={} violations={}",
+            t.units().len(),
+            t.decomp_indices_rel().len(),
+            owner.len(),
+            violations
+        );
+        assert_eq!(
+            violations, 0,
+            "units share scatter words — pack-level bit-identical accumulation is unsound"
+        );
+    }
+
+    /// Five fake basis words over a 2-letter alphabet: `a`, `b` (degree 1),
+    /// `ab` (degree 2), `aab`, `abb` (degree 3). Degree-`t` decompositions
+    /// may only hit degree-`t` words whose content is the multiset union of
+    /// the pair's contents — e.g. `[a, b]` -> `ab`, `[a, ab]` -> `aab`.
     #[test]
     fn builder_round_trip() {
-        let mut b = Builder::<f64>::new(&[1, 1, 2, 2, 3, 3]);
-        b.push(0, 1, &[3, 2], &[1.5, -2.0]);
-        b.push(0, 2, &[4], &[0.25]);
+        let contents = vec![
+            vec![1, 0], // 0: a
+            vec![0, 1], // 1: b
+            vec![1, 1], // 2: ab
+            vec![2, 1], // 3: aab
+            vec![1, 2], // 4: abb
+        ];
+        let mut b = Builder::<f64>::new(&contents);
+        // Row-major pushes of canonical pairs, including an empty
+        // decomposition and a row with no feasible pairs.
+        // (0,1): a+b, target 2, class (1,1,0) -> word 2 (ab)
+        b.push(0, 1, &[2], &[1.5]);
+        // (0,2): a+ab, target 3, class (2,1,0) -> word 3 (aab)
+        b.push(0, 2, &[3], &[0.25]);
+        // (1,2): b+ab, target 3, class (1,2,0): word 4 (abb) exists but the
+        // pair's decomposition is empty here; the unit still exists.
         b.push(1, 2, &[], &[]);
         let t = b.finish();
 
         assert_eq!(t.len(), 3);
         assert_eq!(t.max_degree(), 3);
         assert_eq!(t.degree_range(1), (0, 2));
-        assert_eq!(t.degree_range(2), (2, 4));
-        assert_eq!(t.degree_range(3), (4, 6));
+        assert_eq!(t.degree_range(2), (2, 3));
+        assert_eq!(t.degree_range(3), (3, 5));
 
-        let blocks = t
-            .blocks
+        // Units sorted by (target, content class), entries sorted by (i, j).
+        let units: Vec<_> = t
+            .units()
             .iter()
-            .map(|b| (b.p, b.q, b.target))
-            .collect::<Vec<_>>();
-        assert_eq!(blocks, [(1, 1, 2), (1, 2, 3)]);
-        let block12 = t.blocks().iter().find(|b| (b.p, b.q) == (1, 2)).unwrap();
-        let entries12 = t
-            .block_iter(block12)
+            .map(|u| (u.target, u.gamma.clone()))
+            .collect();
+        assert_eq!(units, [(2, vec![1, 1]), (3, vec![1, 2]), (3, vec![2, 1])]);
+        let unit12: &UnitMeta = t
+            .units()
+            .iter()
+            .find(|u| u.target == 3 && u.gamma[0] == 1)
+            .unwrap();
+        let entries12: Vec<_> = t
+            .unit_iter(unit12)
             .map(|(e, indices, coefficients)| (e.i, e.j, indices, coefficients))
-            .collect::<Vec<_>>();
-        assert_eq!(entries12.len(), 2);
-        assert_eq!((entries12[0].0, entries12[0].1), (0, 2));
-        assert_eq!(entries12[0].2, &[0u32]); // relative to degree_start(3) = 4
-        assert_eq!(entries12[0].3, &[0.25]);
-        assert_eq!((entries12[1].0, entries12[1].1), (1, 2));
-        assert_eq!(entries12[1].2, &[] as &[u32]);
-        assert_eq!(entries12[1].3, &[] as &[f64]);
+            .collect();
+        assert_eq!(entries12.len(), 1);
+        assert_eq!((entries12[0].0, entries12[0].1), (1, 2));
+        assert_eq!(entries12[0].2, &[] as &[u32]);
+        assert_eq!(entries12[0].3, &[] as &[f64]);
 
-        assert_eq!(t.get(0, 1), Some((&[3u32, 2][..], &[1.5, -2.0][..], false)));
-        assert_eq!(t.get(1, 0), Some((&[3u32, 2][..], &[1.5, -2.0][..], true)));
+        // Canonical lookups, including the mirrored (negated) query.
+        assert_eq!(t.get(0, 1), Some((&[2u32][..], &[1.5][..], false)));
+        assert_eq!(t.get(1, 0), Some((&[2u32][..], &[1.5][..], true)));
         assert_eq!(t.get(2, 1), Some((&[] as &[u32], &[] as &[f64], true)));
         assert_eq!(t.get(0, 0), None);
         assert_eq!(t.get(1, 1), None);
-        assert_eq!(t.get(0, 3), None);
+        assert_eq!(t.get(0, 3), None); // feasible degrees, but never pushed
     }
 
     #[test]
     fn empty_table() {
-        let t = Builder::<f64>::new(&[1, 1, 2]).finish();
+        let t = Builder::<f64>::new(&[vec![1, 0], vec![0, 1], vec![2, 0]]).finish();
         assert_eq!(t.len(), 0);
-        assert_eq!(t.blocks().len(), 0);
+        assert_eq!(t.max_degree(), 2);
+        assert_eq!(t.units().len(), 0);
         assert_eq!(t.get(0, 1), None);
     }
 
+    /// The kernel scatters with indices relative to the target-degree slice;
+    /// the absolute copy used by `get` must reconstruct the same indices.
     #[test]
     fn relative_indices_match_absolute() {
-        let mut b: Builder<f64> = Builder::<f64>::new(&[1, 1, 2, 2, 3, 3]);
-        // target 2: only indices 2, 3 are degree-2 words.
-        b.push(0, 1, &[2, 3], &[1.0, 2.0]);
-        // target 3: only indices 4, 5 are degree-3 words.
-        b.push(0, 2, &[4, 5], &[-1.0, 1.0]);
-        let t: FeasibleDecompositions<f64> = b.finish();
-        for block in t.blocks() {
-            let (start, _) = t.degree_range(block.target);
-            for (e, rel, _) in t.block_iter(block) {
+        let contents = vec![
+            vec![1, 0], // 0: a
+            vec![0, 1], // 1: b
+            vec![1, 1], // 2: ab   (degree 2, class (1,1,0))
+            vec![2, 1], // 3: aab  (degree 3, class (2,1,0))
+        ];
+        let mut b = Builder::<f64>::new(&contents);
+        // target 2, class (1,1,0): word 2 is the only degree-2 word of that
+        // content.
+        b.push(0, 1, &[2], &[1.0]);
+        // target 3, class (2,1,0): word 3 is the only degree-3 word of that
+        // content.
+        b.push(0, 2, &[3], &[-1.0]);
+        let t = b.finish();
+
+        for unit in t.units() {
+            let (start, _) = t.degree_range(unit.target);
+            for (e, rel, _) in t.unit_iter(unit) {
                 let (abs, _, swapped) = t.get(e.i as usize, e.j as usize).expect("stored");
                 assert!(!swapped);
                 for (rel, abs) in rel.iter().zip(abs) {

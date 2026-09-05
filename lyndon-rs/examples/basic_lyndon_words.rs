@@ -108,7 +108,7 @@ fn explore_lyndon_properties() {
     for (i, word) in words.iter().take(8).enumerate() {
         println!("\nWord {}: {}", i + 1, word);
         println!("  Length: {}", word.letters.len());
-        println!("  Letters: {:?}", word.letters);
+        println!("  Letters: {}", letters_str(&word.letters));
 
         // Check if it's primitive (not a power of a shorter word)
         let is_primitive = check_if_primitive(word);
@@ -120,6 +120,16 @@ fn explore_lyndon_properties() {
         // Show lexicographic comparison with rotations
         demonstrate_lexicographic_property(word);
     }
+}
+
+/// Renders a letter sequence in the generators' display form (e₁ e₂ …)
+/// instead of the raw debug dump.
+fn letters_str(letters: &[ENotation]) -> String {
+    letters
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn check_if_primitive(word: &LyndonWord<ENotation>) -> bool {
@@ -182,7 +192,7 @@ fn demonstrate_lexicographic_property(word: &LyndonWord<ENotation>) {
         println!("    All rotations:");
         for (i, rot) in rotations.iter().enumerate() {
             let marker = if rot == original { " ← original" } else { "" };
-            println!("      {}: {:?}{}", i + 1, rot, marker);
+            println!("      {}: {}{}", i + 1, letters_str(rot), marker);
         }
     }
 }

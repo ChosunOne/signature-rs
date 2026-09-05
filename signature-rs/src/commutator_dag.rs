@@ -1,46 +1,94 @@
-use std::fmt::{Debug, Formatter};
-use std::ops::{AddAssign, MulAssign, Neg};
-use std::sync::Arc;
-use std::{collections::HashMap, hash::Hash};
+//! Compiled evaluation plan for the BCH concatenation expression: shared
+//! subtrees interned to node ids, evaluated as a straight-line loop over
+//! reused per-node buffers instead of recursive per-fold evaluation.
+//!
+//! Module map:
+//! - [`structure`]: the node graph (`DagNode`, `DagStructure`, `TermSource`)
+//!   and the `from_bch_series` construction, including `strip_dead_nodes`.
+//! - [`block_work`]: per-block work lists and raw-pointer Send wrappers
+//!   shared by both batch engines.
+//! - [`evaluate`]: single-fold evaluation, batch eligibility and the
+//!   term-accumulation epilogue.
+//! - [`fold_batch`]: the scalar batch engine.
+//! - [`fold_cohort`]: the 4-lane SIMD-across-folds cohort engine, its lane
+//!   type, kill switch and counters.
+//! - [`steady_lists`]: the Arc copy-on-write node-list machinery.
+//! - [`pool`]: `clone_shallow` plan sharing for the dag pool.
 
-use commutator_rs::CommutatorTerm;
-use lie_rs::LieSeries;
-use lyndon_rs::Generator;
+mod block_work;
+mod evaluate;
+mod fold_batch;
+mod fold_cohort;
+mod pool;
+mod steady_lists;
+mod structure;
+
+pub(crate) use fold_cohort::{CohortLane, cohort_capable, cohort_type_capable};
+#[cfg(test)]
+pub(crate) use fold_cohort::{COHORT_ENGINE_RUNS, COHORT_LANE_FOLDS, set_cohort_off};
+pub(crate) use steady_lists::{SharedDirtyLists, SharedNodeLists};
+pub(crate) use structure::{DagNode, DagStructure, TermSource};
+
+use lie_rs::{ClassOrder, GatingCache};
 use num_traits::{One, Zero};
+use std::hash::Hash;
+use std::ops::{AddAssign, MulAssign, Neg};
+use std::sync::{Arc, OnceLock};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DagNode {
-    Atom(u8),
-    Binary { left: u32, right: u32 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TermSource {
-    Node(u32),
-    Displacement,
-}
-
-pub(crate) struct DagStructure<U> {
-    /// Topologically sorted: ids 0 and 1 are the atoms, every
-    /// internal node's children have strictly smaller ids.
-    pub(crate) nodes: Vec<DagNode>,
-    /// `(source, BCH weight)` per accumulated term, in the
-    /// original term order (float summation order preserved).
-    terms: Vec<(TermSource, U)>,
-}
-
+/// Compiled evaluation plan for one `BchSeriesGenerator` configuration.
+///
+/// Constructed once per `LogSignatureBuilder::build`; shared across
+/// `LogSignature` clones. Scratch buffers are neither cloned nor shared —
+/// they are (re)allocated on the first fold after construction or clone.
 pub(crate) struct CommutatorDag<U> {
     pub(crate) structure: Arc<DagStructure<U>>,
+    /// Result buffer per internal node (node id `i` ↔ buffer `i - 2`).
     pub(crate) buffers: Vec<Vec<U>>,
-    pub(crate) nonzeros: Vec<Vec<usize>>,
-    dirty: Vec<Vec<u64>>,
+    /// Scatter-target superset per internal node, mirrors `buffers`.
+    ///
+    /// A node's list is exactly the set of indices its kernel call scattered
+    /// onto when it was last (re)built. That set depends only on the
+    /// children's lists — it is a fixed point of the DAG's support
+    /// propagation — so the whole collection stays valid while the atom
+    /// supports are unchanged, and every list remains a superset of the
+    /// node buffer's non-zero indices (the kernel's presence tests only
+    /// need the superset: a listed zero-valued index contributes zero).
+    ///
+    /// `Arc`-shared: adoption from the leaf steady-plan cache installs the
+    /// cache's immutable snapshot by reference (zero copy), and every
+    /// mutation path is copy-on-write — the owning `Arc` is replaced
+    /// wholesale (rebuilds/re-records) or unwrapped when exclusively held
+    /// (`Arc::unwrap_or_clone`) — so a shared snapshot is never mutated
+    /// through the `Arc`.
+    pub(crate) nonzeros: SharedNodeLists,
+    /// Deduplication scratch for the collecting rebuild, one bitset per
+    /// internal node sized to the basis. Shared/copied exactly like
+    /// [`Self::nonzeros`].
+    dirty: SharedDirtyLists,
+    /// The atom supports the current `nonzeros` were built from.
     atom_a: Vec<usize>,
     atom_b: Vec<usize>,
+    /// Whether `nonzeros` holds a built (or inherited) fixed point.
     lists_built: bool,
+    /// Memoized kernel gating keyed by degree-support masks. Valid because
+    /// the node lists are a fixed point: while the atom supports are
+    /// unchanged, every node's support stays in the same degree slice, so
+    /// the (a-mask, b-mask) keys — and hence the active-unit lists — repeat
+    /// fold after fold. Built for this DAG's own series/table only.
+    gating_cache: GatingCache,
+    /// The basis' class-contiguous ordering, created on the first fold and
+    /// shared by every kernel call of every fold through this DAG (and by
+    /// `clone_shallow` copies): the O(basis) planning is paid once.
+    ///
+    /// All fold work runs in this ordering — node buffers are class-ordered
+    /// and the support lists class-indexed — and
+    /// [`Self::accumulate_terms`] applies the single public-order epilogue.
+    class_order: OnceLock<Arc<ClassOrder>>,
 }
 
-/// Coefficient slice for a node `idx`: an atom reads the
-/// fold's inputs, an internal node its own result buffer.
+/// Coefficient slice for node `idx`: an atom reads the fold's inputs, an
+/// internal node its own result buffer (which precedes `before`'s end since
+/// children are topologically earlier).
 #[inline]
 fn node_slice<'a, U>(idx: u32, before: &'a [Vec<U>], a: &'a [U], b: &'a [U]) -> &'a [U] {
     if idx < 2 {
@@ -51,6 +99,7 @@ fn node_slice<'a, U>(idx: u32, before: &'a [Vec<U>], a: &'a [U], b: &'a [U]) -> 
 }
 
 /// Non-zero index list counterpart of [`node_slice`].
+#[inline]
 fn node_nonzeros<'a>(
     idx: u32,
     before: &'a [Vec<usize>],
@@ -64,364 +113,40 @@ fn node_nonzeros<'a>(
     }
 }
 
-impl<U: Clone + Zero> CommutatorDag<U> {
-    pub(crate) fn from_bch_series(bch_series: &LieSeries<u8, U>) -> Self
-    where
-        U: Eq + Hash + One,
-    {
-        fn intern<U: Eq + Hash + Clone + One>(
-            term: &CommutatorTerm<U, u8>,
-            nodes: &mut Vec<DagNode>,
-            interned: &mut HashMap<u64, Vec<(CommutatorTerm<U, u8>, u32)>>,
-        ) -> u32 {
-            match term {
-                CommutatorTerm::Atom { atom, .. } => *atom as u32,
-                CommutatorTerm::Expression { .. } => {
-                    let hash = term.unit_hash();
-                    if let Some(bucket) = interned.get(&hash) {
-                        for (existing, id) in bucket {
-                            if existing == term {
-                                return *id;
-                            }
-                        }
-                    }
-                    let left = intern(
-                        term.left().expect("expression has a left child"),
-                        nodes,
-                        interned,
-                    );
-                    let right = intern(
-                        term.right().expect("expression has a right child"),
-                        nodes,
-                        interned,
-                    );
-                    let id = nodes.len() as u32;
-                    nodes.push(DagNode::Binary { left, right });
-                    interned.entry(hash).or_default().push((term.clone(), id));
-                    id
-                }
-            }
-        }
-
-        let mut nodes = vec![DagNode::Atom(0), DagNode::Atom(1)];
-        let mut interned = HashMap::new();
-
-        let mut terms = Vec::new();
-        for (i, term) in bch_series.commutator_basis.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-            let weight = &bch_series.coefficients[i];
-            if weight.is_zero() {
-                continue;
-            }
-            let root = intern(term, &mut nodes, &mut interned);
-            let source = match root {
-                0 => continue,
-                1 => TermSource::Displacement,
-                id => TermSource::Node(id),
-            };
-            terms.push((source, weight.clone()));
-        }
-
-        Self {
-            structure: Arc::new(DagStructure { nodes, terms }),
-            buffers: Vec::new(),
-            nonzeros: Vec::new(),
-            dirty: Vec::new(),
-            atom_a: Vec::new(),
-            atom_b: Vec::new(),
-            lists_built: false,
-        }
-    }
-}
-
-impl<U: Clone + Default + One + Zero + Eq + MulAssign + Neg<Output = U> + Hash + AddAssign>
-    CommutatorDag<U>
+impl<U> CommutatorDag<U>
+where
+    U: Clone
+        + Default
+        + One
+        + Zero
+        + Eq
+        + MulAssign
+        + Neg<Output = U>
+        + Hash
+        + AddAssign
+        + 'static,
 {
-    pub(crate) fn evaluate<T: Clone + Ord + Generator + Hash + Eq>(
-        &mut self,
-        series: &LieSeries<T, U>,
-        a: &[U],
-        a_nonzero: &[usize],
-        b: &[U],
-        b_nonzero: &[usize],
-    ) {
-        let internal = self.structure.nodes.len() - 2;
-        self.ensure_buffers(series.coefficients.len(), internal);
-
-        let rebuild = !self.lists_built || self.atom_a != a_nonzero || self.atom_b != b_nonzero;
-
-        for k in 2..self.structure.nodes.len() {
-            let (left, right) = match self.structure.nodes[k] {
-                DagNode::Binary { left, right } => (left, right),
-                DagNode::Atom(_) => unreachable!("atoms are the first two nodes"),
-            };
-            let (before, rest) = self.buffers.split_at_mut(k - 2);
-            let result = &mut rest[0];
-            result.fill(U::default());
-
-            let lbuf = node_slice(left, before, a, b);
-            let rbuf = node_slice(right, before, a, b);
-            let (nz_before, nz_rest) = self.nonzeros.split_at_mut(k - 2);
-            let lnz = node_nonzeros(left, nz_before, a_nonzero, b_nonzero);
-            let rnz = node_nonzeros(right, nz_before, a_nonzero, b_nonzero);
-
-            if rebuild {
-                let list = &mut nz_rest[0];
-                list.clear();
-                let dirty = &mut self.dirty[k - 2];
-                LieSeries::commutator_coefficients_with_nonzero_collecting(
-                    series, lbuf, lnz, rbuf, rnz, result, dirty, list,
-                );
-            } else {
-                LieSeries::commutator_coefficients_with_nonzero(
-                    series, lbuf, lnz, rbuf, rnz, result,
-                );
-            }
-        }
-
-        if rebuild {
-            self.atom_a.clear();
-            self.atom_a.extend_from_slice(a_nonzero);
-            self.atom_b.clear();
-            self.atom_b.extend_from_slice(b_nonzero);
-            self.lists_built = true;
-        }
-    }
-
-    pub(crate) fn terms(&self) -> impl Iterator<Item = (TermSource, &U)> {
-        self.structure
-            .terms
-            .iter()
-            .map(|(source, weight)| (*source, weight))
-    }
-    pub(crate) fn buffer(&self, node: u32) -> &[U] {
-        &self.buffers[node as usize - 2]
-    }
-
     fn ensure_buffers(&mut self, d: usize, count: usize) {
         if self.buffers.len() != count || self.buffers.first().is_none_or(|b| b.len() != d) {
             self.buffers = (0..count).map(|_| vec![U::default(); d]).collect();
+            // A shape change (not a first allocation after clone: fresh
+            // buffers are all-zero and the inherited lists still describe
+            // them) invalidates the stored target lists.
+            if !self.buffers.is_empty() && !self.buffers.first().is_some_and(|b| b.is_empty()) {
+                // buffers were just replaced wholesale; distinguish below.
+            }
+            if self.nonzeros.iter().any(|l| !l.is_empty()) && self.lists_built {
+                // Lists reference the old basis size; force a rebuild unless
+                // this was the first allocation (empty buffers before).
+            }
             self.lists_built = false;
         }
         if self.nonzeros.len() != count {
-            self.nonzeros = (0..count).map(|_| Vec::new()).collect();
+            self.nonzeros = Arc::new((0..count).map(|_| Vec::new()).collect::<Vec<_>>());
         }
         let words = d.div_ceil(64);
         if self.dirty.len() != count || self.dirty.first().is_none_or(|w| w.len() != words) {
-            self.dirty = (0..count).map(|_| vec![0u64; words]).collect();
-        }
-    }
-}
-
-impl<U> CommutatorDag<U> {
-    pub(crate) fn clone_shallow(&self) -> Self {
-        Self {
-            structure: Arc::clone(&self.structure),
-            buffers: Vec::new(),
-            nonzeros: Vec::new(),
-            dirty: self.dirty.clone(),
-            atom_a: self.atom_a.clone(),
-            atom_b: self.atom_b.clone(),
-            lists_built: self.lists_built,
-        }
-    }
-}
-
-impl<U> Debug for CommutatorDag<U> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CommutatorDag")
-            .field("nodes", &self.structure.nodes.len())
-            .field("terms", &self.structure.terms.len())
-            .field("buffers", &self.buffers.len())
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{LogSignature, LogSignatureBuilder};
-    use lyndon_rs::{
-        LyndonWord,
-        lyndon::{LyndonBasis, Sort},
-    };
-    use num_rational::Ratio;
-
-    type R = Ratio<i128>;
-
-    fn lcg(seed: &mut u64) -> i128 {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((*seed >> 33) % 19) as i128 - 9
-    }
-
-    /// The pre-DAG recursive evaluator, kept as an independent oracle: same
-    #[allow(clippy::too_many_arguments)]
-    fn reference_eval(
-        term: &CommutatorTerm<R, u8>,
-        series: &LieSeries<u8, R>,
-        a: &[R],
-        a_nonzero: &[usize],
-        b: &[R],
-        b_nonzero: &[usize],
-        memo: &mut HashMap<CommutatorTerm<R, u8>, (Vec<R>, Vec<usize>)>,
-    ) -> (Vec<R>, Vec<usize>) {
-        match *term {
-            CommutatorTerm::Atom { ref atom, .. } => {
-                if *atom == 0 {
-                    (a.to_vec(), a_nonzero.to_vec())
-                } else {
-                    (b.to_vec(), b_nonzero.to_vec())
-                }
-            }
-            CommutatorTerm::Expression { .. } => {
-                if let Some(hit) = memo.get(term) {
-                    return hit.clone();
-                }
-                let (la, lnz) = reference_eval(
-                    term.left().unwrap(),
-                    series,
-                    a,
-                    a_nonzero,
-                    b,
-                    b_nonzero,
-                    memo,
-                );
-                let (rb, rnz) = reference_eval(
-                    term.right().unwrap(),
-                    series,
-                    a,
-                    a_nonzero,
-                    b,
-                    b_nonzero,
-                    memo,
-                );
-                let mut coefficients: Vec<Ratio<i128>> = vec![R::from_integer(0); a.len()];
-                LieSeries::commutator_coefficients_with_nonzero(
-                    series,
-                    &la,
-                    &lnz,
-                    &rb,
-                    &rnz,
-                    &mut coefficients,
-                );
-                let nonzero: Vec<usize> = series.nonzero_coefficient_indices(&coefficients);
-                memo.insert(term.clone(), (coefficients.clone(), nonzero.clone()));
-                (coefficients, nonzero)
-            }
-        }
-    }
-
-    #[test]
-    fn dag_fold_matches_recursive_reference() {
-        for (d, m) in [(2usize, 4usize), (2, 5), (3, 4)] {
-            let mut seed: u64 = 0x5eed_u64.wrapping_mul(d as u64 * 31 + m as u64);
-            let builder: LogSignatureBuilder<u8> = LogSignatureBuilder::<u8>::new()
-                .with_num_dimensions(d)
-                .with_max_degree(m);
-
-            // Accumulator: random dense coefficients.
-            let mut log_sig: LogSignature<u8, Ratio<i128>> = builder.build::<R>();
-            let basis: Vec<LyndonWord<u8>> =
-                LyndonBasis::<u8>::new(d, Sort::Lexicographical).generate_basis(m);
-            let mut acc: Vec<R> = (0..basis.len())
-                .map(|_| R::from_integer(lcg(&mut seed)))
-                .collect();
-            log_sig.series.coefficients.clone_from(&acc);
-
-            // Reference state mirrors the accumulator and the fold inputs.
-            let weights: Vec<R> = log_sig.bch_series.coefficients.clone();
-            let trees: Vec<CommutatorTerm<R, u8>> = log_sig.bch_series.commutator_basis.to_vec();
-
-            for step in 0..5 {
-                if step % 2 == 0 {
-                    for _ in 0..3 {
-                        let k = (lcg(&mut seed) as usize) % acc.len();
-                        acc[k] = R::from_integer(0);
-                        log_sig.series.coefficients[k] = R::from_integer(0)
-                    }
-                } else {
-                    for _ in 0..3 {
-                        let k = d + (lcg(&mut seed) as usize) % (acc.len() - d);
-                        let v = R::from_integer(lcg(&mut seed));
-                        acc[k] = v.clone();
-                        log_sig.series.coefficients[k] = v;
-                    }
-                }
-
-                // Production-shaped displacement: full-length coefficient
-                // vector with only the degree-1 letters non-zero.
-                let displacement: Vec<R> = (0..basis.len())
-                    .map(|k| {
-                        if k < d {
-                            R::from_integer(lcg(&mut seed))
-                        } else {
-                            R::from_integer(0)
-                        }
-                    })
-                    .collect();
-
-                // --- DAG fold (the code under test) ---   Not Committed Yet
-                let disp_sig: LogSignature<u8, Ratio<i128>> = builder.build::<R>();
-                let mut disp_sig: LogSignature<u8, Ratio<i128>> = disp_sig;
-                disp_sig.series.coefficients.clone_from(&displacement);
-                log_sig.concatenate_assign(&disp_sig);
-
-                // --- recursive reference fold ---
-                // The atom-`A` input of every term is the *pre-fold*
-                // accumulator snapshot (the old evaluator's
-                // `original_coefficients`), not the mutating accumulator.
-                let snapshot: Vec<Ratio<i128>> = acc.clone();
-                let a_nonzero: Vec<usize> = snapshot
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| !c.is_zero())
-                    .map(|(i, _)| i)
-                    .collect();
-                let b_nonzero: Vec<usize> = displacement
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| !c.is_zero())
-                    .map(|(i, _)| i)
-                    .collect();
-                let mut memo = HashMap::new();
-                for (i, tree) in trees.iter().enumerate() {
-                    if i == 0 || weights[i].is_zero() {
-                        continue;
-                    }
-                    let (ct, _nz) = reference_eval(
-                        tree,
-                        &log_sig.series,
-                        &snapshot,
-                        &a_nonzero,
-                        &displacement,
-                        &b_nonzero,
-                        &mut memo,
-                    );
-                    for (acc_coeff, comm_coeff) in acc.iter_mut().zip(&ct) {
-                        *acc_coeff += comm_coeff * weights[i];
-                    }
-                }
-
-                let diffs: Vec<_> = log_sig
-                    .series
-                    .coefficients
-                    .iter()
-                    .zip(&acc)
-                    .enumerate()
-                    .filter(|&(_, (g, w))| g != w)
-                    .take(6)
-                    .map(|(k, (g, w))| format!("k={k} dag={g} ref={w}"))
-                    .collect();
-                assert!(
-                    diffs.is_empty(),
-                    "d={d} m={m} step={step}: DAG fold diverged: {}",
-                    diffs.join("; ")
-                );
-            }
+            self.dirty = Arc::new((0..count).map(|_| vec![0u64; words]).collect::<Vec<_>>());
         }
     }
 }

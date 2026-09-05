@@ -48,6 +48,16 @@ fn main() {
     println!("\n=== Example Complete ===");
 }
 
+/// Renders a letter sequence in the generators' display form (e₁ e₂ …)
+/// instead of the raw debug dump.
+fn letters_str(letters: &[ENotation]) -> String {
+    letters
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn analyze_word_construction(words: &[LyndonWord<ENotation>]) {
     println!("Analyzing how Lyndon words are constructed:");
     println!();
@@ -56,7 +66,7 @@ fn analyze_word_construction(words: &[LyndonWord<ENotation>]) {
     for word in words.iter().take(12) {
         if word.letters.len() > 1 {
             println!("Word: {}", word);
-            println!("  Letters: {:?}", word.letters);
+            println!("  Letters: {}", letters_str(&word.letters));
 
             // Try to find factorization as (u,v) where word = uv and u,v are Lyndon
             analyze_factorizations(word, words);
@@ -88,7 +98,7 @@ fn analyze_factorizations(word: &LyndonWord<ENotation>, all_words: &[LyndonWord<
     } else {
         println!("  Lyndon factorizations:");
         for (i, (left, right)) in factorizations.iter().enumerate() {
-            println!("    {}: {:?} + {:?}", i + 1, left, right);
+            println!("    {}: {} + {}", i + 1, letters_str(left), letters_str(right));
         }
     }
 }

@@ -1476,6 +1476,7 @@ CommutatorTerm::from('A')
             ]
         ],
     )]
+    #[allow(clippy::erasing_op)] // deliberate zero-coefficient test cases
     fn test_commutator_term_lyndon_sorting(
         #[case] mut term: CommutatorTerm<i128, char>,
         #[case] expected_term: CommutatorTerm<i128, char>,

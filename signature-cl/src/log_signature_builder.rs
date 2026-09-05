@@ -7,7 +7,10 @@ use signature_rs::{LogSignature, LogSignatureBuilder};
 use crate::log_signature::LogSignatureCLData;
 
 pub struct LogSignatureCLBuilder<R> {
-    log_signature_structure: LogSignature<u8, NotNan<f32>>,
+    /// Precomputed signature structure for the future CL kernel; unused
+    /// until `build_from_tensor_path` is implemented (hence the
+    /// underscore: intentionally constructed, intentionally unread).
+    _log_signature_structure: LogSignature<u8, NotNan<f32>>,
     _r: PhantomData<R>,
 }
 
@@ -19,7 +22,7 @@ impl<R: Runtime> LogSignatureCLBuilder<R> {
             .with_num_dimensions(num_dimensions);
         let log_signature_structure = builder.build::<NotNan<f32>>();
         Self {
-            log_signature_structure,
+            _log_signature_structure: log_signature_structure,
             _r: PhantomData,
         }
     }
@@ -28,6 +31,7 @@ impl<R: Runtime> LogSignatureCLBuilder<R> {
         &'a self,
         path: &TensorHandle<R>,
     ) -> LogSignatureCLData<'a, R, f32, NotNan<f32>> {
+        let _ = path; // TODO(CL): kernel dispatch reads the tensor path here.
         todo!()
     }
 }

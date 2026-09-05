@@ -23,17 +23,16 @@ commutator-rs = "0.1.0"
 ```rust
 use commutator_rs::prelude::*;
 
-// Create formal indeterminates
+// Any `Clone + Mul + Sub` type has a blanket `Commutator` impl: [a, b] = ab - ba.
+// For identical elements the commutator is zero.
+let zero_result = 5.commutator(&5);
+println!("Commutator [5, 5]: {:?}", zero_result); // 0
+
+// `FormalIndeterminate` is a tensor-product symbol type: `*` concatenates
+// symbol runs (e_x ⊗ e_y = "xy"). It does not carry a commutator itself.
 let x = FormalIndeterminate::new(vec!["x"], 1.0);
 let y = FormalIndeterminate::new(vec!["y"], 1.0);
-
-// Compute commutator [x, y] using the trait
-let result = x.commutator(&y);
-println!("Commutator [x, y]: {:?}", result);
-
-// For simple types, commutator of identical elements is zero
-let zero_result = 5.commutator(&5);
-println!("Commutator [5, 5]: {:?}", zero_result); // Should be 0
+println!("x ⊗ y = {:?}", &x * &y);
 ```
 
 ### Using the `comm!` Macro
@@ -61,61 +60,52 @@ let nested = comm![comm![a, b], c]; // [[a, b], c]
 ### Working with Commutator Terms
 
 ```rust
-use commutator_rs::prelude::*;
+use commutator_rs::{comm, Commutator, CommutatorTerm};
 use lyndon_rs::generators::ENotation;
+use lyndon_rs::Generator;
 
 // Create commutator terms from generators
-let e1 = ENotation::new(1);
-let e2 = ENotation::new(2);
-let e3 = ENotation::new(3);
+let e = ENotation::alphabet(3);
 
-// Build a simple commutator term
-let term1 = CommutatorTerm::Atom { coefficient: 1, atom: e1.clone() };
-let term2 = CommutatorTerm::Atom { coefficient: 1, atom: e2.clone() };
+let term1 = CommutatorTerm::Atom { coefficient: 1, atom: e[0].clone() };
+let term2 = CommutatorTerm::Atom { coefficient: 1, atom: e[1].clone() };
+let term3 = CommutatorTerm::Atom { coefficient: 1, atom: e[2].clone() };
 
-// Create nested commutator: [[e1, e2], e3]
-let inner_comm = CommutatorTerm::Expression {
-    coefficient: 1,
-    left: Box::new(term1),
-    right: Box::new(term2),
-};
-
-let term3 = CommutatorTerm::Atom { coefficient: 1, atom: e3 };
-let outer_comm = CommutatorTerm::Expression {
-    coefficient: 1,
-    left: Box::new(inner_comm),
-    right: Box::new(term3),
-};
-
+// Nested commutator [[e1, e2], e3]; the macro tracks bracket degree.
+let outer_comm: CommutatorTerm<i32, ENotation> = comm![comm![term1, term2], term3];
 println!("Nested commutator: {:?}", outer_comm);
+
+// Manual construction is also possible; `Expression` carries the degree.
+if let CommutatorTerm::Expression { degree, .. } = &outer_comm {
+    println!("outer bracket degree: {}", degree);
+}
 ```
 
 ### Creating Complex Expressions
 
 ```rust
-use commutator_rs::prelude::*;
-use std::collections::HashMap;
+use commutator_rs::{comm, Commutator, CommutatorTerm, FormalIndeterminate};
 
-// Create a more complex example with coefficients
-let mut expression = HashMap::new();
+// FormalIndeterminates compose multiplicatively (product/tensor of symbols)...
+let x = FormalIndeterminate::new(vec!["x"], 1.0);
+let y = FormalIndeterminate::new(vec!["y"], 2.0);
+let z = FormalIndeterminate::new(vec!["z"], 0.5);
 
-// Create formal indeterminates
-let x = FormalIndeterminate::new("x", 1.0);
-let y = FormalIndeterminate::new("y", 2.0);
-let z = FormalIndeterminate::new("z", 0.5);
+let xy_product = &x * &y;
+println!("x ⊗ y = {:?}", xy_product);
+println!("x ⊗ y ⊗ z = {:?}", &xy_product * &z);
 
-// Compute various commutators
-let xy_comm = x.commutator(&y);
-let xz_comm = x.commutator(&z);
-let yz_comm = y.commutator(&z);
+// ...while commutators are taken on CommutatorTerms or plain ring elements
+// (coefficients need `Eq + Hash + Ord`: integers, rationals, or NotNan floats).
+let a = CommutatorTerm::<i32, char>::from('a');
+let b = CommutatorTerm::<i32, char>::from('b');
+let c = CommutatorTerm::<i32, char>::from('c');
 
-println!("[x, y] = {:?}", xy_comm);
-println!("[x, z] = {:?}", xz_comm);
-println!("[y, z] = {:?}", yz_comm);
+let ab_comm = a.commutator(&b);
+println!("[a, b] = {:?}", ab_comm);
 
-// These can be used in further algebraic computations
-let nested = xy_comm.commutator(&z);
-println!("[[x, y], z] = {:?}", nested);
+let nested = comm![comm![a, b], c];
+println!("[[a, b], c] = {:?}", nested);
 ```
 
 ### Integration with Lyndon Words
@@ -125,7 +115,7 @@ use commutator_rs::prelude::*;
 use lyndon_rs::prelude::*;
 
 // Create commutator terms using generators from Lyndon words
-let generators = vec![ENotation::new(1), ENotation::new(2)];
+let generators = ENotation::alphabet(2);
 
 // Try to create a Lyndon word 
 if let Ok(lyndon_word) = LyndonWord::try_from(generators) {
@@ -184,7 +174,8 @@ impl Sub for Matrix2x2 {
     }
 }
 
-impl Commutator for Matrix2x2 {}
+// No manual impl needed: any `Clone + Mul + Sub` type is covered by the
+// blanket `Commutator` implementation, [A, B] = AB - BA.
 
 // Usage
 let m1 = Matrix2x2::new(1.0, 2.0, 3.0, 4.0);

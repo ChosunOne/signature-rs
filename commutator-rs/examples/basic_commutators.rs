@@ -6,6 +6,67 @@
 use commutator_rs::comm;
 use commutator_rs::prelude::*;
 
+/// A minimal 2x2 matrix implementing `Mul`/`Add`/`Sub`, so the blanket
+/// `Commutator` impl applies and Jacobi-identity sums can be computed
+/// numerically.
+#[derive(Clone, Debug, PartialEq)]
+struct Matrix2x2 {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+}
+
+impl Matrix2x2 {
+    fn new(a: f64, b: f64, c: f64, d: f64) -> Self {
+        Self { a, b, c, d }
+    }
+
+    fn show(&self, label: &str) {
+        println!("  {label}: [{:.1} {:.1}]", self.a, self.b);
+        println!("        [{:.1} {:.1}]", self.c, self.d);
+    }
+}
+
+impl std::ops::Mul for Matrix2x2 {
+    type Output = Self;
+
+    fn mul(self, other: Self) -> Self {
+        Self {
+            a: self.a * other.a + self.b * other.c,
+            b: self.a * other.b + self.b * other.d,
+            c: self.c * other.a + self.d * other.c,
+            d: self.c * other.b + self.d * other.d,
+        }
+    }
+}
+
+impl std::ops::Add for Matrix2x2 {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            a: self.a + other.a,
+            b: self.b + other.b,
+            c: self.c + other.c,
+            d: self.d + other.d,
+        }
+    }
+}
+
+impl std::ops::Sub for Matrix2x2 {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self {
+            a: self.a - other.a,
+            b: self.b - other.b,
+            c: self.c - other.c,
+            d: self.d - other.d,
+        }
+    }
+}
+
 fn main() {
     println!("=== Basic Commutator Operations ===\n");
 
@@ -50,9 +111,9 @@ fn demonstrate_commutator_terms() {
     };
 
     println!("Created atoms:");
-    println!("  x = {x:?}");
-    println!("  y = {y:?}");
-    println!("  z = {z:?}");
+    println!("  x = {x}");
+    println!("  y = {y}");
+    println!("  z = {z}");
     println!();
 
     // Compute basic commutators
@@ -61,9 +122,9 @@ fn demonstrate_commutator_terms() {
     let yz_comm = y.commutator(&z);
 
     println!("Basic commutators:");
-    println!("  [x, y] = {xy_comm:?}");
-    println!("  [x, z] = {xz_comm:?}");
-    println!("  [y, z] = {yz_comm:?}");
+    println!("  [x, y] = {xy_comm}");
+    println!("  [x, z] = {xz_comm}");
+    println!("  [y, z] = {yz_comm}");
     println!();
 
     // Show commutator structure
@@ -76,9 +137,9 @@ fn demonstrate_commutator_terms() {
     {
         println!("Structure of [x, y]:");
         println!("  Coefficient: {coefficient}");
-        println!("  Left: {left:?}");
-        println!("  Right: {right:?}");
-        println!("  Degree: {degree:?}");
+        println!("  Left: {left}");
+        println!("  Right: {right}");
+        println!("  Degree: {degree}");
     }
 }
 
@@ -98,65 +159,18 @@ fn demonstrate_numeric_commutators() {
 }
 
 fn demonstrate_matrix_commutators() {
-    // Simple 2x2 matrix representation
-    #[derive(Clone, Debug, PartialEq)]
-    struct Matrix2x2 {
-        a: f64,
-        b: f64,
-        c: f64,
-        d: f64,
-    }
+    println!("\nMatrix-like commutators ([A,B] = AB - BA):\n");
 
-    println!("\nMatrix-like commutators:");
-    impl Matrix2x2 {
-        fn new(a: f64, b: f64, c: f64, d: f64) -> Self {
-            Self { a, b, c, d }
-        }
-    }
-
-    use std::ops::{Mul, Sub};
-
-    impl Mul for Matrix2x2 {
-        type Output = Self;
-
-        fn mul(self, other: Self) -> Self {
-            Self {
-                a: self.a * other.a + self.b * other.c,
-                b: self.a * other.b + self.b * other.d,
-                c: self.c * other.a + self.d * other.c,
-                d: self.c * other.b + self.d * other.d,
-            }
-        }
-    }
-
-    impl Sub for Matrix2x2 {
-        type Output = Self;
-
-        fn sub(self, other: Self) -> Self {
-            Self {
-                a: self.a - other.a,
-                b: self.b - other.b,
-                c: self.c - other.c,
-                d: self.d - other.d,
-            }
-        }
-    }
-
-    // Matrix2x2 automatically gets the Commutator trait from the blanket implementation
-
-    // Create example matrices
+    // Matrix2x2 automatically gets the Commutator trait from the blanket
+    // implementation over Mul + Sub types.
     let m1 = Matrix2x2::new(1.0, 2.0, 3.0, 4.0);
     let m2 = Matrix2x2::new(0.0, 1.0, -1.0, 0.0);
 
-    println!("  Matrix 1: [{:.1} {:.1}]", m1.a, m1.b);
-    println!("           [{:.1} {:.1}]", m1.c, m1.d);
-    println!("  Matrix 2: [{:.1} {:.1}]", m2.a, m2.b);
-    println!("           [{:.1} {:.1}]", m2.c, m2.d);
+    m1.show("Matrix 1");
+    m2.show("Matrix 2");
 
     let comm = m1.commutator(&m2);
-    println!("  Commutator [M1, M2]:");
-    println!("           [{:.1} {:.1}]", comm.a, comm.b);
-    println!("           [{:.1} {:.1}]", comm.c, comm.d);
+    comm.show("[M1, M2] ");
 }
 
 fn demonstrate_comm_macro() {
@@ -199,32 +213,43 @@ fn demonstrate_commutator_properties() {
     let neg_yx = -yx;
 
     println!("1. Anti-commutativity: [x,y] = -[y,x]");
-    println!("   [x,y] = {:?}", xy);
-    println!("   [y,x] = {:?}", comm![y, x]);
-    println!("  -[y,x] = {:?}", neg_yx);
+    println!("   [x,y]  = {xy}");
+    println!("   [y,x]  = {}", comm![y, x]);
+    println!("  -[y,x]  = {neg_yx}");
     println!("   Equal: {}", xy == neg_yx);
     println!();
 
     // 2. Self-commutator is zero: [x,x] = 0
     let xx = comm![x, x];
     println!("2. Self-commutator: [x,x] = 0");
-    println!("   [x,x] = {:?}", xx);
+    println!("   [x,x] = {xx}");
     println!("   Is zero: {}", xx.is_zero());
     println!();
 
-    // 3. Jacobi identity: [x,[y,z]] + [y,[z,x]] + [z,[x,y]] = 0
+    // 3. Jacobi identity: [x,[y,z]] + [y,[z,x]] + [z,[x,y]] = 0.
+    // CommutatorTerm has no Add, so the identity is verified numerically
+    // with matrices (where sums exist) via the same commutator trait.
     println!("3. Jacobi identity: [x,[y,z]] + [y,[z,x]] + [z,[x,y]] = 0");
     let term1 = comm![x, comm![y, z]];
     let term2 = comm![y, comm![z, x]];
     let term3 = comm![z, comm![x, y]];
 
-    println!("   [x,[y,z]] = {:?}", term1);
-    println!("   [y,[z,x]] = {:?}", term2);
-    println!("   [z,[x,y]] = {:?}", term3);
+    println!("   [x,[y,z]] = {term1}");
+    println!("   [y,[z,x]] = {term2}");
+    println!("   [z,[x,y]] = {term3}");
 
-    // Note: The sum would require addition operation on CommutatorTerm
-    // which would need more complex implementation
-    println!("   (Sum computation requires CommutatorTerm addition)");
+    let mx = Matrix2x2::new(0.0, 1.0, -1.0, 0.0);
+    let my = Matrix2x2::new(0.0, 0.0, 1.0, 0.0);
+    let mz = Matrix2x2::new(1.0, 0.0, 0.0, -1.0);
+    let jacobi = mx
+        .commutator(&my.commutator(&mz))
+        + my.commutator(&mz.commutator(&mx))
+        + mz.commutator(&mx.commutator(&my));
+    let is_zero = jacobi.a.abs() < 1e-12
+        && jacobi.b.abs() < 1e-12
+        && jacobi.c.abs() < 1e-12
+        && jacobi.d.abs() < 1e-12;
+    println!("   Numeric check (2x2 matrices): sum is zero: {is_zero}");
 }
 
 fn demonstrate_nested_commutators() {

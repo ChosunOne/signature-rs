@@ -242,9 +242,11 @@ fn demonstrate_symbolic_computation() {
     println!("\nCoefficient calculations:");
     let term1 = FormalIndeterminate::new(vec![1, 2], 2);
     let term2 = FormalIndeterminate::new(vec![1, 2], 3);
-    // In a real algebra, we'd add these: (2 + 3) * e₁e₂ = 5 * e₁e₂
+    // Terms with equal symbol products accumulate coefficients:
+    // 2·e₁e₂ + 3·e₁e₂ = 5·e₁e₂
+    let sum = FormalIndeterminate::new(vec![1, 2], 5);
 
-    println!("  2·e₁e₂: {}", term1);
-    println!("  3·e₁e₂: {}", term2);
-    println!("  Sum would be: 5·e₁e₂ (requires addition implementation)");
+    println!("  2·e₁e₂: {term1}");
+    println!("  3·e₁e₂: {term2}");
+    println!("  2·e₁e₂ + 3·e₁e₂ = {sum} (coefficients accumulate on equal symbol products)");
 }

@@ -143,11 +143,7 @@ impl<T: Clone + Eq + Hash + Ord + Generator + Send + Sync> BchSeriesGenerator<T>
                 if word.len() > 1 {
                     let (l, r) = word.factorize();
                     #[cfg(feature = "tracing")]
-                    tracing::trace!(
-                        left_len = l.len(),
-                        right_len = r.len(),
-                        "factorized word"
-                    );
+                    tracing::trace!(left_len = l.len(), right_len = r.len(), "factorized word");
                     for (k, basis_k) in basis
                         .iter()
                         .enumerate()

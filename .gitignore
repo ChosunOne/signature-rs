@@ -4,3 +4,5 @@ target/*
 
 # Claude Code workspace instructions
 CLAUDE.md
+perf.data
+perf.data.old

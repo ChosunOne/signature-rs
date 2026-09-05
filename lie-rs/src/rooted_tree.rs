@@ -280,7 +280,12 @@ impl<T: Clone + Eq + Hash + Ord> GraphPartitionTable<T> {
             let v_idx = tree_t_n_map[&v];
             let w_idx = tree_t_n_map[&w];
             #[cfg(feature = "tracing")]
-            tracing::trace!(i, v = v_idx, w = w_idx, "factorized tree for partition table");
+            tracing::trace!(
+                i,
+                v = v_idx,
+                w = w_idx,
+                "factorized tree for partition table"
+            );
             s[i].partitions.push((v_idx, w_idx));
 
             for p in 0..v.degree() - 1 {
