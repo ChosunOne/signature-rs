@@ -8,6 +8,10 @@
 
 == The class-contiguous parallel system — how it works, what it buys, and how to proceed
 
+#block(width: 100%, inset: 5pt, fill: rgb("#fff3cd"), radius: 2pt, stroke: 0.5pt + rgb("#c8873a"), text(size: 8pt)[
+  *Status: partially superseded (2026-09-05).* The `ClassOrder` machinery (layer 1 below) is still shipped and is now documented canonically in `parallelism-in-the-fold.typ`. What changed since: the kernel's scheduling cell is the anagram *unit* under a single-phase direct-add sweep (a per-word write-access-class scheduling revision came and went — its exactness is now achieved by the unit-partition argument), cohort execution is capability-gated with no wide-pool restriction, and per-build tables plus derived plans are process-wide caches. Numbers below are as of 2026-09-01.
+])
+
 #cap(7.2pt)[lie-rs / signature-rs — 2026-09-01. Every number is a fresh measurement of the current code; benchmarks: criterion baselines `anagram*`/`final`, fold probe (`PROF_GRID`).]
 
 === The three layers

@@ -9,6 +9,10 @@
 
 == Why two threads don't halve the commutator kernel — measured, not theorized
 
+#block(width: 100%, inset: 5pt, fill: rgb("#fff3cd"), radius: 2pt, stroke: 0.5pt + rgb("#c8873a"), text(size: 8pt)[
+  *Status: historical investigation (2026-08-31), retained for its method.* The measured lesson — small-call parallelism is decided by the serial prologue and sweep efficiency, not dependencies — still holds and is generalized in `parallelism-in-the-fold.typ` (work-adaptive scheduling). The specific mechanisms, baselines (`scratch`), and the rejected fix predate the class-contiguous layout, write-access classes, the single-phase per-unit sweep, and the caching layers; do not use its numbers to describe current code.
+])
+
 #cap(7.2pt)[lie-rs — investigation report — 2026-08-31. Every number below is a fresh measurement of the current code (criterion baseline `scratch`); a proposed fix was implemented, measured, and rejected on this evidence.]
 
 #grid(columns: (auto, 1fr), column-gutter: 8pt,

@@ -13,6 +13,10 @@
 
 == What is parallelized in the Lie-series commutation kernel
 
+#block(width: 100%, inset: 5pt, fill: rgb("#fff3cd"), radius: 2pt, stroke: 0.5pt + rgb("#c8873a"), text(size: 8pt)[
+  *Status: partially superseded (2026-09-05).* The algebra here — feasible pairs, content homogeneity, the anagram-unit partition — is unchanged and still the foundation; see `parallelism-in-the-fold.typ` for the canonical treatment. The execution mechanics changed since: bundles are now cut per unit under a single-phase direct-add sweep (no two-phase term/fan-in), balance by unit pair-weight, and the gating/ticket machinery is cached per exact operand supports. Numbers below are as of 2026-09-01.
+])
+
 #grid(columns: (auto, 1fr), column-gutter: 8pt,
   align(left)[*Your model is right for the partition.*],
   align(left)[The pairs to commute are grouped into #emph[anagram units], and units have no dependencies — sweeping them is embarrassingly parallel. What the "2t = ½ runtime" intuition misses is (a) the serial prologue and dispatch #emph[around] the sweep, and (b) the sweep's own parallel #emph[efficiency] — a memory-system property, not a dependency property.],

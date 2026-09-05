@@ -10,6 +10,10 @@
 
 == The one-dispatch fold: a class-partitioned execution plan for the BCH DAG
 
+#block(width: 100%, inset: 5pt, fill: rgb("#fff3cd"), radius: 2pt, stroke: 0.5pt + rgb("#c8873a"), text(size: 8pt)[
+  *Status: partially superseded (2026-09-05).* The fold-level schedule described here — plan every level up front, execute as one dispatch with dynamic pack claims and level counters — is still the shipped engine, and `parallelism-in-the-fold.typ` §5.3 is now its canonical description. The kernel internals it references have changed since: work is scheduled per *anagram unit* (whose word sets partition the write slots) with a single-phase direct-add sweep, not per write-access class with a two-phase term/fan-in kernel; cohorts and plan caches are described in the main document. Read this for the fold-scheduling argument, the main doc for the current kernel.
+])
+
 #cap(7pt)[lie-rs / signature-rs — design note, 2026-09-01. For readers who know the code *before* the class-contiguous work: `LieSeries`, the batch kernel (`commutator_coefficients_batch_with_cache`: gating prologue → (job, unit) bundles → parallel sweep), and the DAG fold's level-parallel `evaluate`. Everything newer is defined here.]
 
 === The fold today: one dispatch per dependency level
