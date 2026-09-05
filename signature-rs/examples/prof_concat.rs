@@ -1,7 +1,25 @@
-//! SCRATCH profiling driver (never commit): mimics the criterion benches
-//! with explicit phase counters. Usage:
-//!   prof_concat <d> <m> <threads> <concat|e2e> [iters]
-//! Prints lie_rs::lie_series::prof counters divided by iterations.
+//! Parallel concatenation and end-to-end build demo + profiling entry point.
+//!
+//! Demonstrates the two hot paths of `signature-rs` on a synthetic random
+//! walk:
+//!   * `LogSignature::concatenate_batch` — folding a batch of segment
+//!     signatures into one result (the parallel tournament reduction with
+//!     the SIMD-across-folds cohort engine),
+//!   * `LogSignatureBuilder::build_from_path` — the end-to-end path →
+//!     log-signature computation.
+//!
+//! Profiling: build with frame pointers and capture with `cargo flamegraph`
+//! (requires perf + inferno):
+//!
+//!   CARGO_PROFILE_BENCH_DEBUG=true RUSTFLAGS="-Cforce-frame-pointers=yes" \
+//!   cargo flamegraph --release -p signature-rs --example prof_concat \
+//!     -o /tmp/flame-concat.svg --deterministic \
+//!     -c "record -F 997 --call-graph fp -g" -- 3 8 8 concat
+//!
+//! Frame-pointer unwinding is required: the default dwarf call graphs fail
+//! to unwind the rayon worker stacks in this workload.
+//!
+//! Usage: prof_concat <d> <m> <threads> <concat|e2e> [iters]
 
 use ndarray::Array2;
 use ordered_float::NotNan;
@@ -10,7 +28,8 @@ use signature_rs::LogSignatureBuilder;
 
 type S = NotNan<f64>;
 
-const KERNEL_CALLS_PER_ITER: usize = 64;
+/// Segment signatures concatenated per timed `concat` iteration.
+const BATCH_SEGMENTS: usize = 64;
 
 fn synthetic_path(d: usize, n: usize) -> Array2<S> {
     let mut rng = StdRng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
@@ -23,17 +42,27 @@ fn synthetic_path(d: usize, n: usize) -> Array2<S> {
     path.mapv(|v| NotNan::new(v).expect("path contains NaN"))
 }
 
+fn die(msg: &str) -> ! {
+    eprintln!("error: {msg}");
+    std::process::exit(2);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
-        eprintln!("usage: prof_concat <d> <m> <threads> <concat|e2e> [iters]");
-        std::process::exit(2);
+        die("usage: prof_concat <d> <m> <threads> <concat|e2e> [iters]\n       example: prof_concat 3 8 8 concat");
     }
-    let d: usize = args[1].parse().unwrap();
-    let m: usize = args[2].parse().unwrap();
-    let threads: usize = args[3].parse().unwrap();
+    let d: usize = args[1].parse().unwrap_or_else(|_| die("d must be a usize"));
+    let m: usize = args[2].parse().unwrap_or_else(|_| die("m must be a usize"));
+    let threads: usize = args[3].parse().unwrap_or_else(|_| die("threads must be a usize"));
     let mode = args[4].clone();
-    let iters: usize = args.get(5).map(|v| v.parse().unwrap()).unwrap_or(5);
+    if mode != "concat" && mode != "e2e" {
+        die("mode must be 'concat' or 'e2e'");
+    }
+    let iters: usize = args
+        .get(5)
+        .map(|v| v.parse().unwrap_or_else(|_| die("iters must be a usize")))
+        .unwrap_or(5);
 
     let b = LogSignatureBuilder::<u8>::new()
         .with_num_dimensions(d)
@@ -54,7 +83,7 @@ fn main() {
                 b.build_from_path(&path.slice(ndarray::s![warm..=warm + 1, ..]).view())
             });
             let segs: Vec<_> = std::iter::repeat(seg.clone())
-                .take(KERNEL_CALLS_PER_ITER)
+                .take(BATCH_SEGMENTS)
                 .collect();
             for _ in 0..iters {
                 let mut acc = acc.clone();
@@ -77,7 +106,9 @@ fn main() {
                 std::hint::black_box(&sig);
             }
         }
-        other => panic!("unknown mode {other}"),
+        other => die(&format!(
+            "unknown mode {other} (expected 'concat' or 'e2e')"
+        )),
     }
 
     println!(
