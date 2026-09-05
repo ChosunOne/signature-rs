@@ -1,6 +1,6 @@
 [package]
 name = "lie-rs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["ChosunOne"]
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -13,8 +13,8 @@ keywords = ["lie", "bch", "algebra", "series", "baker"]
 categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 [dependencies]
-commutator-rs = {path = "../commutator-rs", version = "0.1.0"}
-lyndon-rs = {path = "../lyndon-rs", version = "0.1.0"}
+commutator-rs = {path = "../commutator-rs", version = "0.2.0"}
+lyndon-rs = {path = "../lyndon-rs", version = "0.2.0"}
 num-traits = "^0.2.19"
 ordered-float = "^5.5.0"
 rayon = "^1.12.0"
