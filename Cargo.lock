@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "commutator-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commutator-rs",
  "lyndon-rs",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "commutator-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lyndon-rs",
  "num-traits",
@@ -2499,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "lie-cl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commutator-rs",
  "cubecl",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "lie-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commutator-rs",
  "lie-rs",
@@ -2523,7 +2523,7 @@ dependencies = [
 
 [[package]]
 name = "lie-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commutator-rs",
  "criterion",
@@ -2581,7 +2581,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lyndon-cl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cubecl",
  "rstest",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "lyndon-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lyndon-rs",
  "pyo3",
@@ -2598,7 +2598,7 @@ dependencies = [
 
 [[package]]
 name = "lyndon-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rstest",
  "thiserror",
@@ -4607,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "signature-cl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commutator-rs",
  "cubecl",
@@ -4622,7 +4622,7 @@ dependencies = [
 
 [[package]]
 name = "signature-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commutator-rs",
  "lie-rs",
@@ -4636,7 +4636,7 @@ dependencies = [
 
 [[package]]
 name = "signature-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commutator-rs",
  "criterion",
@@ -4653,7 +4653,7 @@ dependencies = [
 
 [[package]]
 name = "signature-rs-bin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "commutator-rs",

@@ -2,6 +2,14 @@
 name = "signature-py"
 version = "0.2.0"
 edition = "2024"
+license = "AGPL-3.0-only"
+description = "High-performance log signature computation for paths and time series data"
+documentation = "https://docs.rs/signature-rs"
+homepage = "https://github.com/ChosunOne/signature-rs"
+repository = "https://github.com/ChosunOne/signature-rs"
+readme = "README.md"
+keywords = ["log", "signature", "lie", "paths", "series"]
+categories = ["data-structures", "mathematics", "science", "algorithms"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
