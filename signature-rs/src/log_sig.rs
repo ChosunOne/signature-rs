@@ -359,7 +359,7 @@ fn audit_coefficients_no_nan<U: PartialEq>(coefficients: &[U]) {
 /// (including the collecting rebuild whenever the atom supports differ from
 /// the dag's stored ones), same term accumulation, same NaN audit. The
 /// tournament's merge folds call this directly; a leaf's fold chain calls
-/// it through [`fold_batch_sequential`]'s warm-up phase.
+/// it through `fold_batch_sequential`'s warm-up phase.
 fn fold_one_displacement<T, U>(
     series: &mut LieSeries<T, U>,
     dag: &mut CommutatorDag<U>,
@@ -1174,6 +1174,25 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
     ///
     /// The resulting log signature has the proper basis structure but with
     /// all coefficients set to zero.
+    ///
+    /// # Caching
+    ///
+    /// The Lyndon basis, the structure-constant table, the BCH series and
+    /// the commutator-DAG template are pure functions of the builder
+    /// configuration (`T`, `U`, alphabet size, max degree), so they are
+    /// built once per process and shared across every subsequent build:
+    /// the first `build` for a configuration pays the (expensive) table
+    /// construction, later builds are cheap clones of the cached plan.
+    /// See [`LogSignature::concatenate_batch_coefficients`] for the fold
+    /// machinery that consumes the plan.
+    ///
+    /// # Why `'static`
+    ///
+    /// The plan caches are process-wide and keyed by [`TypeId`], which
+    /// requires `T: 'static` and `U: 'static`. All `Copy`/`Clone` numeric
+    /// coefficient types (f32, f64, `Ratio`, `NotNan`, ...) qualify.
+    ///
+    /// [`TypeId`]: core::any::TypeId
     #[must_use]
     pub fn build<
         U: Clone
@@ -1236,6 +1255,14 @@ impl<T: Debug + Clone + Eq + Hash + Ord + Generator + Send + Sync> LogSignatureB
     /// only on the number of displacements, never on the thread count — so
     /// f32/f64 rounding may differ by a few ulps from strictly sequential
     /// folding, while exact coefficient types remain bit-identical.
+    ///
+    /// Like [`Self::build`], this caches the compiled plan (basis +
+    /// structure-constant table + BCH/DAG template) process-wide per
+    /// configuration, so repeated calls on one builder are cheap after the
+    /// first; this is why `T` and `U` must be `'static` (the caches key on
+    /// [`TypeId`]).
+    ///
+    /// [`TypeId`]: core::any::TypeId
     #[must_use]
     pub fn build_from_path<
         D: Dimension + RemoveAxis,
@@ -1471,7 +1498,7 @@ impl<
     ///
     /// - **Cohort tournament** (cohort-capable coefficient types — raw
     ///   repr-transparent floats on AVX2 CPUs with the kill switch off,
-    ///   see [`cohort_capable`] — and at least 2 displacements): the
+    ///   see `cohort_capable` — and at least 2 displacements): the
     ///   balanced tournament below, with EVERY round's folds routed
     ///   through the SIMD-across-folds cohort engine so a fold costs a
     ///   fraction of a scalar walk — 2-4 folds share one plan walk and
@@ -1496,7 +1523,7 @@ impl<
     ///   for the whole batch, turning the per-fold gather/accumulate
     ///   phases into parallel in-graph stages. This path is bit-identical
     ///   to folding each displacement with
-    ///   [`Self::concatenate_assign_coefficients`].
+    ///   `Self::concatenate_assign_coefficients`.
     ///
     /// Rounding caveat: f32/f64 accumulation is not associative, so any
     /// tournament's reassociated tree is NOT bit-identical to the
@@ -1516,7 +1543,7 @@ impl<
     /// path.
     ///
     /// No nested-recursion guard is needed: the tournament's leaves call
-    /// the free [`fold_batch_sequential`] engine directly — the engine
+    /// the free `fold_batch_sequential` engine directly — the engine
     /// contains no driver-selection logic, so it cannot re-enter this
     /// method — and neither it nor `concatenate_assign_coefficients`
     /// re-enters this driver.
@@ -1708,17 +1735,6 @@ impl<
             })
             .collect();
 
-        if std::env::var_os("SIG_DUMP_LEVELS").is_some() {
-            for (li, lv) in level.iter().enumerate() {
-                let mut h: u64 = 0xcbf29ce484222325;
-                for c in lv {
-                    h ^= unsafe { *(c as *const U as *const u64) };
-                    h = h.wrapping_mul(0x100000001b3);
-                }
-                eprintln!("LEVEL leaf-round[{li}] hash={h:016x}");
-            }
-        }
-
         // Merge rounds: pairwise folds over adjacent results. A single
         // left-over result passes through to the next round; the clone
         // (at most one basis-length copy per round) keeps the parallel map
@@ -1776,16 +1792,6 @@ impl<
             };
             if let Some(single) = passthrough {
                 level.push(single);
-            }
-            if std::env::var_os("SIG_DUMP_LEVELS").is_some() {
-                for (li, lv) in level.iter().enumerate() {
-                    let mut h: u64 = 0xcbf29ce484222325;
-                    for c in lv {
-                        h ^= unsafe { *(c as *const U as *const u64) };
-                        h = h.wrapping_mul(0x100000001b3);
-                    }
-                    eprintln!("LEVEL merge-round[{li}] hash={h:016x}");
-                }
             }
         }
 

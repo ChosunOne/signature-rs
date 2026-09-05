@@ -142,12 +142,10 @@ mod raw_ops {
 /// fold's cohort-vs-scalar oracle test).
 ///
 /// The kernel is gated to the repr-transparent raw-float coefficient types
-/// ([`cohort_supported`]): the lane vectors reinterpret the coefficient
-/// slots through the primitive type exactly like the [raw-float fast path]
-/// (see `raw_ops`' NaN policy — overflowing inputs may produce NaN/Inf in
+/// (`cohort_supported`): the lane vectors reinterpret the coefficient
+/// slots through the primitive type exactly like the raw-float fast path
+/// (`raw_ops`' NaN policy — overflowing inputs may produce NaN/Inf in
 /// the slots; callers audit).
-///
-/// [raw-float fast path]: raw_ops
 pub mod cohort {
     use super::*;
     use ordered_float::NotNan;
@@ -1178,11 +1176,14 @@ impl ScatterLayout for ClassInternalLayout {
     }
 }
 
-/// Parallel two-phase sweep: phase 1 (term chunks — entry-atomic, streamed
-/// in table order) fills the per-job term buffers; phase 2 (word-class
-/// bundles — write-atomic, one single-writer store per word) fans the
-/// contributions in. Two sequential rayon dispatches; the join between
-/// them is the phase barrier. `L` selects the entry table layout — public
+/// Parallel single-phase per-unit sweep: each bundle's units are visited
+/// independently — one term per active entry, its row contributions added
+/// straight into the result buffer (no intermediate term buffers, no phase
+/// barrier). Units are atomic and their word sets partition the write
+/// slots, so concurrent bundles never touch the same word; each word's
+/// adds happen inside its one unit in table-entry order, which is the
+/// per-word float summation sequence the serial sweep produces, so the
+/// bits are unchanged. `L` selects the entry table layout — public
 /// order into the job's result buffer, or class-contiguous order into a
 /// class-ordered result buffer.
 fn sweep_bundles_parallel<L: ScatterLayout, T, U>(
@@ -1305,7 +1306,7 @@ where
 
 /// One independent commutation: operand slices plus the destination buffer.
 ///
-/// SAFETY contract for [`LieSeries::commutator_coefficients_batch`]: the
+/// SAFETY contract for `LieSeries::commutator_coefficients_batch`: the
 /// `result` buffers of the jobs passed to one batch call must be pairwise
 /// disjoint (in a fold these are distinct DAG-node buffers). Within a job,
 /// the anagram partition makes the units conflict-free.
@@ -1344,7 +1345,7 @@ pub struct KernelJob<'a, U> {
     /// Compact-layout address shifts, indexed by Lyndon degree (tables must
     /// have at least `max_degree + 1` entries). Class position `x` of degree
     /// `d` lives at `x - shift[d]` in the corresponding buffer; a full-d
-    /// buffer uses the all-zero [`Self::IDENTITY_SHIFTS`] table. The batch
+    /// buffer uses the all-zero `IDENTITY_SHIFTS` table. The batch
     /// fold's per-node buffers store only the degree slices the node's
     /// sweep writes (4-6x smaller than full-d for deep DAGs), so every
     /// operand/result access subtracts the hoisted per-degree shift.
@@ -1978,21 +1979,7 @@ impl<'a, U> ClassBatchStage<'a, U> {
     }
 }
 
-/// Optional write-dump sink (set once when BATCH_DEBUG=1): every sweep
-/// scatter appends one record for race debugging. Race-debugging only —
-/// not part of the public API surface.
-pub static DEBUG_WRITES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
-    std::sync::OnceLock::new();
-pub static CKS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// DEBUG (BATCH_CKS): the class-space working buffers' location, set by
-/// `fold_batch` for the duration of its dispatch (cleared after the walk
-/// joins) so the per-stage snapshots can hash `acc_cls`/`b_cls` too —
-/// the two buffers the sweeps READ that no job-result snapshot covers.
-/// (ptr as usize; 0 = not set.)
-pub static DEBUG_AB_ACC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static DEBUG_AB_B: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static DEBUG_AB_D: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 
 /// A park/wake gate for one stage boundary. Waiters poll the stage
@@ -2065,103 +2052,14 @@ impl FutexGate {
     }
 }
 
-/// DEBUG: snapshot every job's result buffer of stage `s`. Called only
-/// between the last publishing add and the gate signal, so the stage's
-/// writes are complete and no other thread has been woken.
-fn debug_snapshot_stage<U>(walk: &FoldWalk<'_, U>, s: usize) {
-    if !CKS_ON.get().copied().unwrap_or(false) {
-        return;
-    }
-    let Some(buf) = DEBUG_WRITES.get() else {
-        return;
-    };
-    let stage = walk.stages[s];
-    // Chain layout: [0] = Z+BG(0); per fold: BG(f), S0, S1, S2, C(f) —
-    // five positions per fold after the leading stage.
-    let f = if s == 0 { 0 } else { (s - 1) / 5 };
-    for (ji, job) in stage.jobs.iter().enumerate() {
-        // FNV over the raw bytes of the buffer (works for any
-        // plain-old-data coefficient type; debug-only).
-        let mut h: u64 = 0xcbf29ce484222325;
-        for v in unsafe { std::slice::from_raw_parts(job.result as *const u64, job.result_len) } {
-            h ^= v
-                .to_ne_bytes()
-                .iter()
-                .fold(0u64, |a, b| (a << 8) | *b as u64);
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        // Full-buffer dump for the first jobs (race localization: shows the
-        // exact word contents, not just the hash).
-        if ji < 2 {
-            let words: Vec<String> =
-                unsafe { std::slice::from_raw_parts(job.result as *const u64, job.result_len) }
-                    .iter()
-                    .map(|v| format!("{v:016x}"))
-                    .collect();
-            buf.lock()
-                .unwrap()
-                .push(format!("CKD s={s} fold={f} j={ji} [{}]", words.join(",")));
-        }
-        buf.lock()
-            .unwrap()
-            .push(format!("CKS s={s} fold={f} j={ji} h={h:016x}"));
-    }
-    // The class-space working buffers at the stage's end: the sweeps read
-    // acc_cls/b_cls as operands, so a corrupting write into either shows up
-    // here even when every job's own result buffer matches.
-    let (ap, bp, dn) = (
-        DEBUG_AB_ACC.load(std::sync::atomic::Ordering::Relaxed),
-        DEBUG_AB_B.load(std::sync::atomic::Ordering::Relaxed),
-        DEBUG_AB_D.load(std::sync::atomic::Ordering::Relaxed),
-    );
-    if ap != 0 && bp != 0 && dn > 0 {
-        let hh = |ptr: *const u64, len: usize| {
-            let mut h: u64 = 0xcbf29ce484222325;
-            for k in 0..len {
-                // SAFETY: debug read of the live class-space buffers, taken
-                // between the last publishing add and the gate signal (the
-                // pointers are valid for the whole dispatch — see fold_batch).
-                let bits = unsafe { (*ptr.add(k)).to_ne_bytes() };
-                h ^= bits.iter().fold(0u64, |a, b| (a << 8) | *b as u64);
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            h
-        };
-        let (ha, hb) = (hh(ap as *const u64, dn), hh(bp as *const u64, dn));
-        buf.lock().unwrap().push(format!(
-            "CKB s={s} fold={f} nj={} np={} blk={} acc={ha:016x} b={hb:016x}",
-            stage.jobs.len(),
-            stage.packs.len(),
-            stage.block.is_some()
-        ));
-    }
-}
-
 /// Publishes one completed pack of `target`; the finisher that completes
 /// the stage signals its gate. Returns true iff this call was the last
 /// publisher.
-///
-/// DEBUG SNAPSHOTS (`BATCH_CKS`): `on_last` runs when the *work* counter
-/// completes — i.e. every pack has finished its sweep/block — and, crucially,
-/// BEFORE this pack publishes `done`. Waiters proceed the instant `done`
-/// reaches `target`, so any snapshot taken *after* the publishing add races
-/// with the next stage's early packs (the next stage writes these very
-/// buffers). The work counter closes that window: the snapshot is complete
-/// before `done` can possibly reach `target`.
 #[inline]
-fn finish_pack(
-    done: &AtomicUsize,
-    work: &AtomicUsize,
-    gate: &FutexGate,
-    target: usize,
-    on_last: &dyn Fn(),
-) -> bool {
-    if CKS_ON.get().copied().unwrap_or(false) && work.fetch_add(1, Ordering::AcqRel) + 1 == target {
-        on_last();
-    }
+fn finish_pack(done: &AtomicUsize, gate: &FutexGate, target: usize) -> bool {
     // AcqRel: the read half acquires the earlier finishers' releases (so
-    // the last finisher's `on_last` observes the completed stage), and the
-    // write half releases this pack's writes to the next stage's readers.
+    // the last finisher's completion observes the completed stage), and
+    // the write half releases this pack's writes to the next stage's readers.
     done.fetch_add(1, Ordering::AcqRel) + 1 == target && {
         gate.finish();
         true
@@ -2209,21 +2107,11 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
         if pack >= stage.packs.len() {
             return false;
         }
-        // DEBUG: claim trace (one record per claimed pack — near-zero cost).
-        if CKS_ON.get().copied().unwrap_or(false)
-            && let Some(buf) = DEBUG_WRITES.get()
-        {
-            let (r0, r1) = stage.packs[pack];
-            buf.lock().unwrap().push(format!(
-                "CLM s={s} p={pack} r={r0}-{r1} t={:?}",
-                rayon::current_thread_index()
-            ));
-        }
         match stage.block {
             // Block stage: pack `p` runs block `p` (one task per pack).
             Some(task) => task(stage.tasks[pack].0 as usize, stage.fold),
-            None if stage.cohort => self.cohort_sweep_pack_range(s, stage, pack),
-            None => self.sweep_pack_range(s, stage, pack),
+            None if stage.cohort => self.cohort_sweep_pack_range(stage, pack),
+            None => self.sweep_pack_range(stage, pack),
         }
         true
     }
@@ -2234,7 +2122,7 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
     /// split a unit — so the per-word accumulation order is exactly the
     /// serial sweep's regardless of which slot claims which pack.
     #[inline]
-    fn sweep_pack_range(&self, s: usize, stage: &ClassBatchStage<'a, U>, pack: usize) {
+    fn sweep_pack_range(&self, stage: &ClassBatchStage<'a, U>, pack: usize) {
         let (start, end) = stage.packs[pack];
         let jobs = stage.jobs;
         let mut t = start;
@@ -2264,15 +2152,6 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
             for &(ji_task, ui) in &stage.tasks[t..e] {
                 let _ = ji_task;
                 let unit = &gating.units[ui as usize];
-                // DEBUG: unit-completion trace (coverage check).
-                if CKS_ON.get().copied().unwrap_or(false)
-                    && let Some(buf) = DEBUG_WRITES.get()
-                {
-                    buf.lock().unwrap().push(format!(
-                        "UCT s={s} j={ji} u={ui} pairs={} p={pack}",
-                        unit.pairs
-                    ));
-                }
                 let td = unit.td as usize;
                 // The unit's degree-`td` slice starts at `rs` in the
                 // working layout; the job's compact buffer stores the
@@ -2347,7 +2226,7 @@ impl<'a, U: Clone + Neg<Output = U> + Mul<Output = U> + AddAssign + std::hash::H
     /// gateways, support lists) is lane-invariant — see the `cohort`
     /// module's docs for the layout and the bit-exactness argument.
     #[inline]
-    fn cohort_sweep_pack_range(&self, _s: usize, stage: &ClassBatchStage<'a, U>, pack: usize) {
+    fn cohort_sweep_pack_range(&self, stage: &ClassBatchStage<'a, U>, pack: usize) {
         cohort::sweep_pack_range(
             self.entries,
             self.degrees,
@@ -2673,12 +2552,6 @@ pub fn run_class_batch_with_work<T, U>(
     // The walk is fully internal for sweep stages: relabeled entries gate
     // the presence tests and index the class-ordered operands. Results are
     // written per job through the job's own buffer (see `sweep_pack_range`).
-    // BATCH_CKS enables the debug snapshot/trace records (CKS/CKB/CKC/CLM/UNT)
-    // written to DEBUG_WRITES; see `debug_snapshot_stage`.
-    if std::env::var_os("BATCH_CKS").is_some() {
-        let _ = DEBUG_WRITES.set(std::sync::Mutex::new(Vec::new()));
-        let _ = CKS_ON.set(true);
-    }
     let walk = FoldWalk {
         stages,
         entries: order.entries_cls(),
@@ -2706,12 +2579,6 @@ pub fn run_class_batch_with_work<T, U>(
         .iter()
         .map(|_| Pad(AtomicUsize::new(0)))
         .collect();
-    // DEBUG (BATCH_CKS): per-stage work counters — the snapshot phase that
-    // must complete before the stage's `done` publish (see finish_pack).
-    let work: Vec<Pad> = stage_pack_counts
-        .iter()
-        .map(|_| Pad(AtomicUsize::new(0)))
-        .collect();
     let claims: Vec<Pad> = stage_pack_counts
         .iter()
         .map(|_| Pad(AtomicUsize::new(0)))
@@ -2736,7 +2603,6 @@ pub fn run_class_batch_with_work<T, U>(
         // never resized during the walk, so shared references hoisted once
         // per slot are equivalent.
         let stage_done: Vec<&AtomicUsize> = done.iter().map(|p| &p.0).collect();
-        let stage_work: Vec<&AtomicUsize> = work.iter().map(|p| &p.0).collect();
         let stage_claims: Vec<&AtomicUsize> = claims.iter().map(|p| &p.0).collect();
         let stage_gates: Vec<&FutexGate> = gates.iter().collect();
         for s in 0..stages.len() {
@@ -2754,20 +2620,14 @@ pub fn run_class_batch_with_work<T, U>(
                 // this point every remaining pack is in flight, so the
                 // wait is bounded by real work.
                 let need = stage_pack_counts[s - 1];
-                let (prev_done, prev_work, prev_gate, prev_claim) = (
-                    stage_done[s - 1],
-                    stage_work[s - 1],
-                    stage_gates[s - 1],
-                    stage_claims[s - 1],
-                );
+                let (prev_done, prev_gate, prev_claim) =
+                    (stage_done[s - 1], stage_gates[s - 1], stage_claims[s - 1]);
                 // Drain once on arrival: after this the cursor is exhausted
                 // — every pack is claimed-and-in-flight — so parking is
                 // safe (no pack waits on this slot). The cursor never
                 // grows back, so no re-drain is ever needed.
                 while walk.claim_and_run_pack(s - 1, prev_claim) {
-                    finish_pack(prev_done, prev_work, prev_gate, need, &|| {
-                        debug_snapshot_stage(&walk, s - 1);
-                    });
+                    finish_pack(prev_done, prev_gate, need);
                 }
                 // Poll briefly (most gates open within microseconds —
                 // polling costs the finisher nothing), then YIELD instead
@@ -2803,17 +2663,11 @@ pub fn run_class_batch_with_work<T, U>(
             // claimed it. (A slot that finds the cursor drained reports
             // nothing, or the stage would appear complete before its work
             // is done.)
-            let (this_done, this_work, this_gate, this_claim) = (
-                stage_done[s],
-                stage_work[s],
-                stage_gates[s],
-                stage_claims[s],
-            );
+            let (this_done, this_gate, this_claim) =
+                (stage_done[s], stage_gates[s], stage_claims[s]);
             let this_need = stage_pack_counts[s];
             while walk.claim_and_run_pack(s, this_claim) {
-                finish_pack(this_done, this_work, this_gate, this_need, &|| {
-                    debug_snapshot_stage(&walk, s);
-                });
+                finish_pack(this_done, this_gate, this_need);
             }
         }
     };

@@ -16,6 +16,23 @@
 //!     .with_max_degree(3);
 //! let log_sig = builder.build_from_path(&path.view());
 //! ```
+//!
+//! # Plans and caching
+//!
+//! The Lyndon basis, the structure-constant table, the BCH series and the
+//! commutator DAG are pure functions of the builder configuration, so they
+//! are built once per process and shared across every subsequent
+//! [`LogSignatureBuilder::build`] / [`LogSignatureBuilder::build_from_path`]
+//! call: the first build for a configuration pays the expensive table
+//! construction, later builds are cheap clones of the cached plan (this is
+//! why the coefficient and generator types must be `'static` — the caches
+//! key on [`core::any::TypeId`]).
+//!
+//! # Environment diagnostics
+//!
+//! `SIG_NO_COHORT=1` disables the 4-lane SIMD-across-folds cohort engine
+//! for debugging/A-B (scalar batch engine instead; bit-identical results,
+//! see `lie-rs`'s crate docs for the full list of diagnostic switches).
 
 pub(crate) mod commutator_dag;
 pub mod log_sig;

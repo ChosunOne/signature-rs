@@ -56,16 +56,9 @@ struct SendRaw<T>(*mut T);
 unsafe impl<T> Send for SendRaw<T> {}
 unsafe impl<T> Sync for SendRaw<T> {}
 
-/// The node buffers' `(pointer, length)` table for the batch's block
-/// closures: the pointers are raw, so the table itself needs the Send/Sync
-/// promise (same argument as [`SendRaw`]).
-struct SendBufPtrs<U>(Vec<(*mut U, usize)>);
-unsafe impl<U> Send for SendBufPtrs<U> {}
-unsafe impl<U> Sync for SendBufPtrs<U> {}
-
 /// The per-fold displacement `(pointer, length)` table for the batch's
 /// gather task: the task reads fold `f`'s slice through it (raw-pointer
-/// bearing, same Send/Sync argument as [`SendBufPtrs`]: the pointers
+/// bearing, same Send/Sync argument as [`SendRaw`]: the pointers
 /// target the caller's displacement storage, read-only for the whole
 /// dispatch).
 struct SendRhsTable<U>(Vec<(*const U, usize)>);
@@ -194,10 +187,6 @@ pub(crate) struct CommutatorDag<U> {
     /// the (a-mask, b-mask) keys — and hence the active-unit lists — repeat
     /// fold after fold. Built for this DAG's own series/table only.
     gating_cache: GatingCache,
-    /// Reusable two-phase term buffers (one set per level per lane
-    /// count). Pure scratch: NOT copied by `clone_shallow` — concurrent
-    /// folds run on independent clones and must never share buffers (a
-    /// shared buffer's term phase would race the other dispatch's reads).
     /// The basis' class-contiguous ordering, created on the first fold and
     /// shared by every kernel call of every fold through this DAG (and by
     /// `clone_shallow` copies): the O(basis) planning is paid once.
@@ -1329,12 +1318,6 @@ where
                 .map(|r| (r.as_ptr(), r.len()))
                 .collect(),
         );
-        // Per-fold snapshot counters (BATCH_CKS): one per fold, shared by
-        // that fold's accumulate blocks (the last to finish snapshots).
-        // One small allocation per batch, debug-only readers.
-        let dbg_ctrs: Arc<[std::sync::atomic::AtomicUsize]> = (0..rhss.len())
-            .map(|_| std::sync::atomic::AtomicUsize::new(0))
-            .collect();
         let gather_task: Box<dyn Fn(usize, usize) + Send + Sync> = {
             let work = SendBlockWork(Arc::clone(&work_shared.0));
             let b = SendRaw(b_data);
@@ -1377,12 +1360,10 @@ where
         let accum_task: Box<dyn Fn(usize, usize) + Send + Sync> = {
             let structure = Arc::clone(&self.structure);
             let acc = SendRaw(acc_data);
-            let b = SendRaw(b_data);
             let work = SendBlockWork(Arc::clone(&work_shared.0));
-            let ranges = Arc::clone(&ranges);
-            Box::new(move |bi: usize, fold: usize| {
+            Box::new(move |bi: usize, _fold: usize| {
                 // Whole-value captures (see the gather task above).
-                let (work, acc, b, structure, ranges) = (&work, &acc, &b, &structure, &ranges);
+                let (work, acc, structure) = (&work, &acc, &structure);
                 let terms = &structure.terms;
                 unsafe {
                     // This block's intersecting runs only, in the
@@ -1433,37 +1414,6 @@ where
                         }
                     }
                 }
-                // DEBUG (BATCH_CKS): the last task of this stage
-                // snapshots acc+b_cls (all ranges' accumulate/zero/gather
-                // are ordered by the AcqRel counter RMWs; the snapshot
-                // runs before this task's publish, so the waiters — who
-                // proceed on the counter — cannot overtake it).
-                if lie_rs::CKS_ON.get().copied().unwrap_or(false)
-                    && let Some(sink) = lie_rs::DEBUG_WRITES.get()
-                {
-                    use std::sync::atomic::Ordering as O;
-                    let n = dbg_ctrs[fold].fetch_add(1, O::AcqRel) + 1;
-                    if n == ranges.len() {
-                        let hh = |ptr: *const U, len: usize| {
-                            let mut h: u64 = 0xcbf29ce484222325;
-                            for k in 0..len {
-                                // SAFETY: debug read of the live
-                                // buffers, ordered by the AcqRel
-                                // counter above.
-                                let bits =
-                                    unsafe { (*(ptr.add(k) as *const u64)).to_ne_bytes() };
-                                h ^= bits.iter().fold(0u64, |a, b| (a << 8) | *b as u64);
-                                h = h.wrapping_mul(0x100000001b3);
-                            }
-                            h
-                        };
-                        let ha = hh(acc.0, ranges.last().map(|r| r.1 as usize).unwrap_or(0));
-                        let hb = hh(b.0, ranges.last().map(|r| r.1 as usize).unwrap_or(0));
-                        sink.lock()
-                            .unwrap()
-                            .push(format!("CKC fold={fold} acc={ha:016x} b={hb:016x}"));
-                    }
-                }
             })
         };
 
@@ -1489,22 +1439,11 @@ where
             stages.push(&block_stages[2 + 2 * f]);
         }
 
-        // DEBUG (BATCH_CKS): publish the class-space working buffers for the
-        // per-stage snapshots; cleared after the walk joins so a later
-        // per-fold dispatch (which has no such buffers) never hashes stale
-        // pointers.
-        use std::sync::atomic::Ordering as DbgO;
-        lie_rs::DEBUG_AB_ACC.store(acc_data as usize, DbgO::Relaxed);
-        lie_rs::DEBUG_AB_B.store(b_data as usize, DbgO::Relaxed);
-        lie_rs::DEBUG_AB_D.store(d, DbgO::Relaxed);
         // Fold units for the slot policy: the stage chain repeats its
         // gather/sweep/accumulate sub-chain once per displacement (plus
         // one leading zero stage), so each unit's barrier cost is paid
         // per fold — the policy normalizes by the unit count.
         run_class_batch(series, order, &stages, rhss.len().max(1));
-        lie_rs::DEBUG_AB_ACC.store(0, DbgO::Relaxed);
-        lie_rs::DEBUG_AB_B.store(0, DbgO::Relaxed);
-        lie_rs::DEBUG_AB_D.store(0, DbgO::Relaxed);
 
         // Epilogue: the class-space accumulator back to public basis order
         // (assignment — it holds the full sum).

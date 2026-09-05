@@ -113,12 +113,26 @@ pub(crate) const TICKET_INDEX_MASK: u32 = 0x3fff_ffff;
 pub(crate) const TICKET_P_ACTIVE: u32 = 1 << 31;
 pub(crate) const TICKET_Q_ACTIVE: u32 = 1 << 30;
 
+/// The structure-constant table of a Lyndon basis: for every feasible
+/// commutator pair `(i, j)` (basis words with `i < j` whose degrees sum to
+/// at most the table's max degree) it stores the pair's decomposition into
+/// basis terms — the data the commutation kernel sweeps per fold.
+///
+/// The table is a pure function of the basis (plus the coefficient type's
+/// arithmetic), it is read-only after construction, and it is safe to
+/// share: every consumer over one basis can hold the same
+/// `Arc<FeasibleDecompositions<U>>` (see
+/// [`crate::lie_series::LieSeries::build_feasible_decompositions`] and
+/// [`crate::lie_series::LieSeries::with_feasible_decompositions`]). Most users never touch
+/// this type directly — [`crate::lie_series::LieSeries::new`] builds it — but
+/// sharing one table across many series over the same basis avoids
+/// re-paying the O(basis²) structure-constant pass.
+///
 /// Coefficient type is generic; decomposition indices are stored as `u32`.
 #[derive(Clone)]
-// `#[doc(hidden)] pub`: the DAG crate's level-parallel collecting rebuild
-// captures this table (basis-derived integer data, no letter type) — see
+// The DAG crate's level-parallel collecting rebuild captures this table
+// (basis-derived integer data, no letter type) — see
 // `LieSeries::class_collect_kernel`. Every other use stays in-crate.
-#[doc(hidden)]
 pub struct FeasibleDecompositions<U> {
     /// Per basis word: its Lyndon degree. The basis is degree-grouped, so
     /// this array is non-decreasing.

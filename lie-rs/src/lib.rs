@@ -20,12 +20,27 @@
 //!   computations.
 //! - `tracing`: instruments the potentially expensive operations (basis
 //!   factorization, Goldberg and BCH coefficient generation, Lie series
-//!   construction, and commutator evaluation) with [`tracing`] spans, so
+//!   construction, and commutator evaluation) with `tracing` spans, so
 //!   timings flow into any subscriber configured by the consuming binary.
 //!
 //! To see the instrumentation in test output, run e.g.
 //! `cargo test -p lie-rs --features tracing -- --nocapture`
 //! (respects `RUST_LOG`, defaults to `lie_rs=debug`).
+//!
+//! # Environment diagnostics
+//!
+//! A few opt-in environment switches exist for tuning and ops work; all
+//! are off by default and do not change numeric results:
+//!
+//! - `FOLD_ENGINE=0`: routes the class-ordered fold through the per-level
+//!   dispatch instead of the default one-dispatch pack-slot walk (A/B
+//!   comparison; results are bit-identical either way).
+//! - `SLOT_POLICY_DEBUG=1`: one stderr line per walk dispatch with the
+//!   slot policy's inputs and decision.
+//! - `SIG_NO_COHORT=1` (consumed by `signature-rs`): disables the
+//!   4-lane SIMD-across-folds cohort engine, forcing the scalar batch
+//!   engine (bit-identical results; the kill switch behind
+//!   `cohort_supported`-gated dispatch).
 
 mod bch;
 pub mod bch_series_generator;
@@ -40,9 +55,8 @@ use std::ops::{Div, MulAssign};
 pub use bch_series_generator::{BchSeriesGenerator, Matrix2x2, MatrixTree};
 pub use feasible_decompositions::FeasibleDecompositions;
 pub use lie_series::{
-    CKS_ON, BlockShape, ClassBatchStage, ClassOrder, ClassOrderedCommutation, DEBUG_AB_ACC,
-    DEBUG_AB_B, DEBUG_AB_D, DEBUG_WRITES, GatingCache, KernelJob, LieSeries, raw_add_assign,
-    raw_add_assign_ptr, raw_mul, commutator_coefficients_batch,
+    BlockShape, ClassBatchStage, ClassOrder, ClassOrderedCommutation, GatingCache, KernelJob,
+    LieSeries, raw_add_assign, raw_add_assign_ptr, raw_mul, commutator_coefficients_batch,
     commutator_coefficients_batch_with_cache, commutator_coefficients_class_batch_with_cache,
     commutator_coefficients_class_fold_with_cache, plan_class_sweep_stages, run_class_batch,
     run_class_batch_with_work, planned_sweep_entries, work_adaptive_slots, IDENTITY_SHIFTS,
