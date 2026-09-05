@@ -28,6 +28,9 @@ file_type = "^0.8.9"
 
 [dev-dependencies]
 
+[hints.polars]
+mostly-unused = true
+
 [profile.release]
 lto = true
 codegen-units = 1
